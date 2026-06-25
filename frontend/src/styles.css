@@ -1,0 +1,157 @@
+:root {
+  color: #111827;
+  background: #f4f7fb;
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+}
+
+button {
+  font: inherit;
+}
+
+.app-shell {
+  width: min(960px, calc(100vw - 32px));
+  margin: 0 auto;
+  padding: 28px 0;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+
+.topbar h1 {
+  margin: 0;
+  font-size: clamp(2rem, 6vw, 4rem);
+  line-height: 1;
+}
+
+.topbar p {
+  margin: 8px 0 0;
+  color: #4b5563;
+  font-size: 1rem;
+}
+
+.topbar button,
+.column-controls button {
+  border: 1px solid #cbd5e1;
+  background: #ffffff;
+  color: #111827;
+  border-radius: 8px;
+  cursor: pointer;
+  min-height: 44px;
+}
+
+.topbar button {
+  min-width: 96px;
+  padding: 0 18px;
+}
+
+.topbar button:disabled,
+.column-controls button:disabled,
+.cell:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
+.game-area {
+  display: grid;
+  gap: 10px;
+}
+
+.column-controls {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 8px;
+}
+
+.board {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: clamp(5px, 1.2vw, 10px);
+  padding: clamp(8px, 2vw, 18px);
+  background: #075985;
+  border: 1px solid #0c4a6e;
+  border-radius: 8px;
+  aspect-ratio: 7 / 6;
+}
+
+.cell {
+  display: grid;
+  place-items: center;
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.cell span {
+  display: block;
+  width: 100%;
+  aspect-ratio: 1;
+  border-radius: 50%;
+  background: #f8fafc;
+  box-shadow: inset 0 4px 10px rgb(15 23 42 / 0.35);
+}
+
+.cell.player-1 span {
+  background: #facc15;
+}
+
+.cell.player-2 span {
+  background: #dc2626;
+}
+
+.status-panel {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.status-panel div {
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 14px;
+}
+
+.status-panel span {
+  display: block;
+  color: #6b7280;
+  font-size: 0.85rem;
+  margin-bottom: 4px;
+}
+
+.status-panel strong {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 560px) {
+  .app-shell {
+    width: min(100vw - 18px, 960px);
+    padding: 14px 0;
+  }
+
+  .topbar {
+    align-items: flex-start;
+  }
+
+  .status-panel {
+    grid-template-columns: 1fr;
+  }
+}
