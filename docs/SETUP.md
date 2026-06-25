@@ -20,23 +20,23 @@ http://localhost:5000
 
 ## Backend
 
-From the project root:
+From the backend folder:
 
 ```powershell
-cd C:\Users\micha\OneDrive\Desktop\VSC\Connect-4
+cd C:\Users\micha\OneDrive\Desktop\VSC\Connect-4\backend
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-python backend\app.py
+python app.py
 ```
 
-If `python` is not on PATH, use the installed Python executable directly:
+If `python` is not on PATH, use your installed Python executable directly:
 
 ```powershell
-& 'C:\Users\micha\AppData\Local\Programs\Python\Python312\python.exe' -m venv .venv
+& 'C:\path\to\python.exe' -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-python backend\app.py
+python app.py
 ```
 
 ## Frontend
@@ -57,4 +57,3 @@ Vite opens the browser at `http://localhost:5173`.
 cd C:\Users\micha\OneDrive\Desktop\VSC\Connect-4\frontend
 npm run build
 ```
-

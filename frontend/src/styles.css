@@ -11,6 +11,8 @@
 body {
   margin: 0;
   min-width: 320px;
+  min-height: 100vh;
+  overflow: hidden;
 }
 
 button {
@@ -18,9 +20,13 @@ button {
 }
 
 .app-shell {
-  width: min(960px, calc(100vw - 32px));
+  width: min(1040px, calc(100vw - 24px));
+  height: 100vh;
   margin: 0 auto;
-  padding: 28px 0;
+  padding: 12px 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 10px;
 }
 
 .topbar {
@@ -28,12 +34,11 @@ button {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  margin-bottom: 20px;
 }
 
 .topbar h1 {
   margin: 0;
-  font-size: clamp(2rem, 6vw, 4rem);
+  font-size: clamp(1.75rem, 4vw, 2.75rem);
   line-height: 1;
 }
 
@@ -59,15 +64,35 @@ button {
 }
 
 .topbar button:disabled,
-.column-controls button:disabled,
-.cell:disabled {
+.column-controls button:disabled {
   cursor: not-allowed;
   opacity: 0.65;
 }
 
+.cell:disabled {
+  cursor: not-allowed;
+}
+
 .game-area {
   display: grid;
-  gap: 10px;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 8px;
+  min-height: 0;
+}
+
+.play-layout {
+  display: grid;
+  grid-template-columns: minmax(72px, 110px) minmax(0, 1fr) minmax(72px, 110px);
+  align-items: start;
+  gap: 12px;
+  min-height: 0;
+}
+
+.board-area {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 8px;
+  min-width: 0;
 }
 
 .column-controls {
@@ -79,12 +104,16 @@ button {
 .board {
   display: grid;
   grid-template-columns: repeat(7, 1fr);
-  gap: clamp(5px, 1.2vw, 10px);
-  padding: clamp(8px, 2vw, 18px);
+  gap: clamp(4px, 1vw, 8px);
+  width: min(100%, calc((100vh - 166px) * 7 / 6));
+  max-height: calc(100vh - 166px);
+  margin: 0 auto;
+  padding: clamp(7px, 1.4vw, 12px);
   background: #075985;
   border: 1px solid #0c4a6e;
   border-radius: 8px;
   aspect-ratio: 7 / 6;
+  overflow: hidden;
 }
 
 .cell {
@@ -115,25 +144,50 @@ button {
   background: #dc2626;
 }
 
-.status-panel {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
-  margin-top: 16px;
+.cell.dropping span {
+  animation: drop-piece 420ms cubic-bezier(0.2, 0.9, 0.25, 1.08);
 }
 
-.status-panel div {
+.cell.winning span {
+  outline: 4px solid #ffffff;
+  outline-offset: -4px;
+  box-shadow:
+    0 0 0 4px rgb(255 255 255 / 0.5),
+    0 0 16px rgb(255 255 255 / 0.8),
+    inset 0 4px 10px rgb(15 23 42 / 0.35);
+}
+
+@keyframes drop-piece {
+  0% {
+    transform: translateY(var(--drop-start)) scale(0.96);
+  }
+
+  78% {
+    transform: translateY(4%);
+  }
+
+  100% {
+    transform: translateY(0) scale(1);
+  }
+}
+
+.status-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.status-panel > div {
   border: 1px solid #d1d5db;
   border-radius: 8px;
   background: #ffffff;
-  padding: 14px;
+  padding: 10px 12px;
 }
 
 .status-panel span {
   display: block;
   color: #6b7280;
-  font-size: 0.85rem;
-  margin-bottom: 4px;
+  font-size: 0.8rem;
+  margin-bottom: 2px;
 }
 
 .status-panel strong {
@@ -141,10 +195,39 @@ button {
   overflow-wrap: anywhere;
 }
 
+.move-column {
+  display: grid;
+  grid-template-columns: 1fr;
+  align-content: start;
+  justify-items: center;
+  gap: 6px;
+  max-height: calc(100vh - 166px);
+  overflow: hidden;
+  padding-top: 52px;
+}
+
+.move-column span {
+  color: #6b7280;
+  font-size: 0.85rem;
+}
+
+.move-column strong {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  min-height: 32px;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #111827;
+  font-size: 0.95rem;
+}
+
 @media (max-width: 560px) {
   .app-shell {
-    width: min(100vw - 18px, 960px);
-    padding: 14px 0;
+    width: min(100vw - 12px, 1040px);
+    padding: 8px 0;
+    gap: 8px;
   }
 
   .topbar {
@@ -153,5 +236,31 @@ button {
 
   .status-panel {
     grid-template-columns: 1fr;
+    gap: 6px;
+  }
+
+  .status-panel > div {
+    padding: 7px 9px;
+  }
+
+  .play-layout {
+    grid-template-columns: 46px minmax(0, 1fr) 46px;
+    gap: 6px;
+  }
+
+  .move-column {
+    max-height: calc(100vh - 202px);
+    padding-top: 46px;
+  }
+
+  .move-column strong {
+    width: 30px;
+    min-height: 28px;
+    font-size: 0.85rem;
+  }
+
+  .board {
+    width: min(100%, calc((100vh - 202px) * 7 / 6));
+    max-height: calc(100vh - 202px);
   }
 }
