@@ -1,13 +1,6 @@
-from pathlib import Path
-import sys
-
 import numpy as np
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-
-ROOT_DIR = Path(__file__).resolve().parents[1]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
 
 from ai.minimax import get_best_move
 from game.board import COLS, ROWS, check_win, create_board, drop_piece, is_valid_move
