@@ -1,6 +1,6 @@
 # Connect 4 Webapp
 
-React frontend with a Flask backend for Human vs Minimax AI Connect 4.
+React frontend with a Flask backend for Human vs. Minimax AI Connect 4.
 
 ## Docs
 
@@ -11,11 +11,11 @@ React frontend with a Flask backend for Human vs Minimax AI Connect 4.
 ## Backend
 
 ```powershell
-cd C:\Users\micha\OneDrive\Desktop\VSC\Connect-4\backend
+cd C:\Users\micha\OneDrive\Desktop\VSC\Connect-4
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-python app.py
+python backend\app.py
 ```
 
 Flask runs on:
@@ -46,7 +46,9 @@ POST /api/new-game
 POST /api/move
 ```
 
-`POST /api/move` accepts:
+### `POST /api/move`
+
+Request body:
 
 ```json
 {
@@ -61,3 +63,7 @@ POST /api/move
   "column": 3
 }
 ```
+
+## Status
+
+Currently supports Human vs. AI locally. PvP and account-based game history are planned but not yet implemented.
