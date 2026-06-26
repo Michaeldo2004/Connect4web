@@ -36,7 +36,9 @@ Response:
   ],
   "status": "playing",
   "aiMove": null,
-  "message": "New game started"
+  "message": "New game started",
+  "difficulty": "medium",
+  "transpositionTable": {}
 }
 ```
 
@@ -56,7 +58,9 @@ Request:
     [0, 0, 0, 0, 0, 0, 0],
     [0, 0, 0, 0, 0, 0, 0]
   ],
-  "column": 3
+  "column": 3,
+  "difficulty": "medium",
+  "transpositionTable": {}
 }
 ```
 
@@ -74,8 +78,18 @@ Response:
   ],
   "status": "playing",
   "aiMove": 4,
-  "message": "Your turn"
+  "message": "Your turn",
+  "difficulty": "medium",
+  "transpositionTable": {}
 }
+```
+
+## Difficulty Values
+
+```text
+easy = depth 3, 3s
+medium = depth 5, 3s
+hard = depth 7, 5s
 ```
 
 ## Board Values
@@ -97,4 +111,3 @@ invalid_move
 ```
 
 Invalid move responses return HTTP `400`.
-

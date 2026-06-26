@@ -1,6 +1,6 @@
 # Connect 4 Webapp
 
-React frontend with a Flask backend for Human vs. Minimax AI Connect 4.
+React frontend with a Flask backend for Human vs. Minimax AI Connect 4 using minimax alpha-beta pruning with iterative deepening.
 
 ## Docs
 
@@ -60,9 +60,15 @@ Request body:
     [0, 0, 0, 0, 0, 0, 0],
     [0, 0, 0, 0, 0, 0, 0]
   ],
-  "column": 3
+  "column": 3,
+  "difficulty": "medium",
+  "transpositionTable": {}
 }
 ```
+
+## Limitations
+
+- using free backend hosting plan: no load balancer for horizontally scaling application
 
 ## Status
 
