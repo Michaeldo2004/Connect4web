@@ -87,7 +87,8 @@ Response:
 ## Difficulty Values
 
 ```text
-easy = depth 3, 3s
+very_easy = depth 1, 3s
+easy = depth 2, 3s
 medium = depth 5, 3s
 hard = depth 7, 5s
 ```

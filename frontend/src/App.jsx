@@ -7,8 +7,10 @@ const COLS = 7;
 const PLAYER = 1;
 const AI = 2;
 const DEFAULT_DIFFICULTY = "medium";
+const MIN_AI_RESPONSE_MS = 2000;
 const DIFFICULTIES = [
-  { key: "easy", label: "Easy", depth: 3, timeLimit: "3s" },
+  { key: "very_easy", label: "Very Easy", depth: 1, timeLimit: "3s" },
+  { key: "easy", label: "Easy", depth: 2, timeLimit: "3s" },
   { key: "medium", label: "Medium", depth: 5, timeLimit: "3s" },
   { key: "hard", label: "Hard", depth: 7, timeLimit: "5s" },
 ];
@@ -101,6 +103,12 @@ function applyLocalMove(currentBoard, column, piece) {
   return currentBoard;
 }
 
+function wait(ms) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
 function App() {
   const [board, setBoard] = useState(emptyBoard);
   const [status, setStatus] = useState("setup");
@@ -171,6 +179,7 @@ function App() {
 
     setBusy(true);
     setMessage("AI is thinking...");
+    const aiStartedAt = Date.now();
     const playerBoard = applyLocalMove(board, column, PLAYER);
     const playerPieces = findChangedPieces(board, playerBoard);
     setAnimatedPieces(playerPieces);
@@ -190,6 +199,10 @@ function App() {
         }),
       });
       const data = await response.json();
+      const elapsed = Date.now() - aiStartedAt;
+      if (elapsed < MIN_AI_RESPONSE_MS) {
+        await wait(MIN_AI_RESPONSE_MS - elapsed);
+      }
       const changedPieces = findChangedPieces(playerBoard, data.board);
       const aiColumn = findMoveColumn(playerBoard, data.board, AI);
       const winningLine = findWinningPieces(data.board);

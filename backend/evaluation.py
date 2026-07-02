@@ -1,4 +1,6 @@
 import argparse
+import json
+from pathlib import Path
 
 import numpy as np
 
@@ -7,10 +9,55 @@ from ai.online_ai import OnlineAI
 from game.board import check_win, create_board, drop_piece, get_board_str, is_valid_move
 
 DIFFICULTIES = {
-    "easy": {"depth": 3, "time_limit": 3},
+    "very_easy": {"depth": 1, "time_limit": 3},
+    "easy": {"depth": 2, "time_limit": 3},
     "medium": {"depth": 5, "time_limit": 3},
     "hard": {"depth": 7, "time_limit": 5},
 }
+RESULT_KEYS = ["games", "minimax_wins", "online_wins", "ties"]
+DEFAULT_RESULTS_FILE = Path(__file__).with_name("evaluation_results.json")
+
+
+def empty_results():
+    return {
+        difficulty: {key: 0 for key in RESULT_KEYS}
+        for difficulty in DIFFICULTIES
+    }
+
+
+def load_results(results_file):
+    if not results_file.exists():
+        return empty_results()
+
+    try:
+        data = json.loads(results_file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return empty_results()
+
+    cumulative = data.get("cumulative", data)
+    results = empty_results()
+    for difficulty in DIFFICULTIES:
+        source = cumulative.get(difficulty, {})
+        for key in RESULT_KEYS:
+            value = source.get(key, 0)
+            if isinstance(value, int) and value >= 0:
+                results[difficulty][key] = value
+
+    return results
+
+
+def save_results(results_file, latest_run, cumulative):
+    data = {
+        "latest_run": latest_run,
+        "cumulative": cumulative,
+    }
+    results_file.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def add_results(cumulative, latest_run):
+    for difficulty in DIFFICULTIES:
+        for key in RESULT_KEYS:
+            cumulative[difficulty][key] += latest_run[difficulty][key]
 
 
 def play_single_game(first_player_ai, difficulty):
@@ -50,11 +97,19 @@ def play_single_game(first_player_ai, difficulty):
         turn += 1
 
 
-def evaluate(rounds):
-    results = {
-        difficulty: {"minimax_wins": 0, "online_wins": 0, "ties": 0}
-        for difficulty in DIFFICULTIES
-    }
+def print_results(title, results):
+    print(f"\n=== {title} ===")
+    for difficulty, result in results.items():
+        print(f"\n{difficulty.title()}")
+        print(f"Games: {result['games']}")
+        print(f"Minimax AI Wins: {result['minimax_wins']}")
+        print(f"Online AI Wins: {result['online_wins']}")
+        print(f"Ties: {result['ties']}")
+
+
+def evaluate(rounds, results_file):
+    latest_run = empty_results()
+    cumulative = load_results(results_file)
 
     for i in range(rounds):
         first_player = "minimax" if i % 2 == 0 else "online"
@@ -63,20 +118,20 @@ def evaluate(rounds):
         for difficulty in DIFFICULTIES:
             print(f"  Testing {difficulty}...")
             winner = play_single_game(first_player, difficulty)
+            latest_run[difficulty]["games"] += 1
 
             if winner == 0:
-                results[difficulty]["ties"] += 1
+                latest_run[difficulty]["ties"] += 1
             elif (winner == 1 and first_player == "minimax") or (winner == 2 and first_player == "online"):
-                results[difficulty]["minimax_wins"] += 1
+                latest_run[difficulty]["minimax_wins"] += 1
             else:
-                results[difficulty]["online_wins"] += 1
+                latest_run[difficulty]["online_wins"] += 1
 
-    print("\n=== Final Results ===")
-    for difficulty, result in results.items():
-        print(f"\n{difficulty.title()}")
-        print(f"Minimax AI Wins: {result['minimax_wins']}")
-        print(f"Online AI Wins: {result['online_wins']}")
-        print(f"Ties: {result['ties']}")
+    add_results(cumulative, latest_run)
+    save_results(results_file, latest_run, cumulative)
+    print_results("Final Results", latest_run)
+    print_results("Cumulative Results", cumulative)
+    print(f"\nSaved results to {results_file}")
 
 
 def parse_args():
@@ -85,11 +140,17 @@ def parse_args():
         "--rounds",
         type=int,
         default=10,
-        help="Number of loops to run. Each loop tests easy, medium, and hard.",
+        help="Number of loops to run. Each loop tests every difficulty.",
+    )
+    parser.add_argument(
+        "--results-file",
+        type=Path,
+        default=DEFAULT_RESULTS_FILE,
+        help="JSON file used to store cumulative evaluation results.",
     )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    evaluate(args.rounds)
+    evaluate(args.rounds, args.results_file)

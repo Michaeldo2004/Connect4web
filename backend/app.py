@@ -8,7 +8,8 @@ from game.board import COLS, ROWS, check_win, create_board, drop_piece, is_valid
 HUMAN = 1
 AI = 2
 DIFFICULTIES = {
-    "easy": {"depth": 3, "time_limit": 3},
+    "very_easy": {"depth": 1, "time_limit": 3},
+    "easy": {"depth": 2, "time_limit": 3},
     "medium": {"depth": 5, "time_limit": 3},
     "hard": {"depth": 7, "time_limit": 5},
 }

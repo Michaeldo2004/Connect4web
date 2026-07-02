@@ -91,9 +91,9 @@ button {
 
 .difficulty-tabs {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 12px;
-  width: min(100%, 760px);
+  width: min(100%, 880px);
 }
 
 .difficulty-tab {
@@ -123,6 +123,16 @@ button {
 .play-button:disabled {
   cursor: not-allowed;
   opacity: 0.65;
+}
+
+.difficulty-very_easy {
+  border-color: #22c55e;
+  background: #f0fdf4;
+}
+
+.difficulty-very_easy.selected {
+  background: #22c55e;
+  color: #ffffff;
 }
 
 .difficulty-easy {
