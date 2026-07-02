@@ -1,6 +1,6 @@
 # Connect 4 Webapp
 
-React frontend with a Flask backend for Human vs. Minimax AI Connect 4 using minimax alpha-beta pruning with iterative deepening.
+React frontend with a Flask-SocketIO backend for Human vs. Minimax AI Connect 4 using minimax alpha-beta pruning with iterative deepening.
 
 ## Docs
 
@@ -24,6 +24,8 @@ Flask runs on:
 http://localhost:5000
 ```
 
+Gameplay uses Socket.IO on the backend port. `GET /api/health` remains available for health checks.
+
 ## Frontend
 
 ```powershell
@@ -38,33 +40,29 @@ React runs on:
 http://localhost:5173
 ```
 
-## API
+## API / Socket.IO
 
 ```text
 GET  /api/health
-POST /api/new-game
-POST /api/move
+Socket.IO create_game
+Socket.IO join_game
+Socket.IO player_move
+Socket.IO reset_game
 ```
 
-### `POST /api/move`
+### `player_move`
 
-Request body:
+Socket.IO payload:
 
 ```json
 {
-  "board": [
-    [0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0]
-  ],
-  "column": 3,
-  "difficulty": "medium",
-  "transpositionTable": {}
+  "gameId": "generated-game-id",
+  "playerId": "generated-player-id",
+  "column": 3
 }
 ```
+
+The backend stores each board in memory by `gameId`; the browser stores `gameId/playerId` locally so refresh can rejoin the same game while the backend is running.
 
 ## Limitations
 

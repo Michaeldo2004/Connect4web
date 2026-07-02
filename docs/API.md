@@ -1,14 +1,16 @@
 # API
 
-Base URL:
+Base backend URL:
 
 ```text
-http://localhost:5000/api
+http://localhost:5000
 ```
 
-## GET /health
+## Health
 
-Returns backend status.
+```text
+GET /api/health
+```
 
 Response:
 
@@ -18,38 +20,51 @@ Response:
 }
 ```
 
-## POST /new-game
+## Socket.IO Gameplay
 
-Starts a clean game.
+Gameplay uses Socket.IO at:
 
-Response:
-
-```json
-{
-  "board": [
-    [0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0]
-  ],
-  "status": "playing",
-  "aiMove": null,
-  "message": "New game started",
-  "difficulty": "medium",
-  "transpositionTable": {}
-}
+```text
+http://localhost:5000
 ```
 
-## POST /move
+The backend stores each active board in memory by `gameId`. The browser stores the returned `playerId` with the `gameId` in `localStorage` so a refresh can rejoin the same board while the backend is still running.
 
-Makes a human move, then makes the AI move if the game is still active.
+### Client Events
+
+```text
+create_game { difficulty }
+join_game { gameId, playerId }
+player_move { gameId, playerId, column }
+reset_game { gameId, playerId, difficulty }
+```
+
+### Server Events
+
+```text
+game_created { gameId, playerId, board, status, message, difficulty }
+game_joined { gameId, board, status, message, difficulty }
+board_updated { gameId, board, status, message, aiMove, difficulty }
+invalid_move { gameId, board, status, message, difficulty }
+join_rejected { gameId, message }
+```
+
+### `create_game`
 
 Request:
 
 ```json
 {
+  "difficulty": "medium"
+}
+```
+
+Response event: `game_created`
+
+```json
+{
+  "gameId": "generated-game-id",
+  "playerId": "generated-player-id",
   "board": [
     [0, 0, 0, 0, 0, 0, 0],
     [0, 0, 0, 0, 0, 0, 0],
@@ -58,30 +73,67 @@ Request:
     [0, 0, 0, 0, 0, 0, 0],
     [0, 0, 0, 0, 0, 0, 0]
   ],
-  "column": 3,
-  "difficulty": "medium",
-  "transpositionTable": {}
+  "status": "playing",
+  "message": "New game started",
+  "aiMove": null,
+  "difficulty": "medium"
 }
 ```
 
-Response:
+### `join_game`
+
+Request:
 
 ```json
 {
+  "gameId": "generated-game-id",
+  "playerId": "generated-player-id"
+}
+```
+
+If the `playerId` matches the game, the server emits `game_joined`. If it does not match, the server emits `join_rejected`.
+
+### `player_move`
+
+Request:
+
+```json
+{
+  "gameId": "generated-game-id",
+  "playerId": "generated-player-id",
+  "column": 3
+}
+```
+
+Response event: `board_updated`
+
+```json
+{
+  "gameId": "generated-game-id",
   "board": [
     [0, 0, 0, 0, 0, 0, 0],
     [0, 0, 0, 0, 0, 0, 0],
     [0, 0, 0, 0, 0, 0, 0],
     [0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 2, 0, 0],
+    [0, 0, 0, 2, 0, 0, 0],
     [0, 0, 0, 1, 0, 0, 0]
   ],
   "status": "playing",
-  "aiMove": 4,
   "message": "Your turn",
-  "difficulty": "medium",
-  "transpositionTable": {}
+  "aiMove": 3,
+  "difficulty": "medium"
 }
+```
+
+Invalid moves emit `invalid_move`.
+
+## REST Fallback
+
+These endpoints are still present as fallback compatibility paths, but React gameplay uses Socket.IO.
+
+```text
+POST /api/new-game
+POST /api/move
 ```
 
 ## Difficulty Values
@@ -110,5 +162,3 @@ ai_win
 draw
 invalid_move
 ```
-
-Invalid move responses return HTTP `400`.

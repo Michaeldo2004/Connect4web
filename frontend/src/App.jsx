@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { io } from "socket.io-client";
 
-const API_URL = "http://localhost:5000/api";
+const SOCKET_URL = "http://localhost:5000";
+const STORAGE_KEY = "connect4_game_session";
 const ROWS = 6;
 const COLS = 7;
 
@@ -109,6 +111,31 @@ function wait(ms) {
   });
 }
 
+function saveSession(gameId, playerId) {
+  window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ gameId, playerId }));
+}
+
+function loadSession() {
+  try {
+    const storedSession = JSON.parse(window.localStorage.getItem(STORAGE_KEY));
+    if (storedSession?.gameId && storedSession?.playerId) {
+      return storedSession;
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+function clearSession() {
+  window.localStorage.removeItem(STORAGE_KEY);
+}
+
+function formatDifficulty(difficulty) {
+  return difficulty.replace("_", " ");
+}
+
 function App() {
   const [board, setBoard] = useState(emptyBoard);
   const [status, setStatus] = useState("setup");
@@ -116,43 +143,173 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [gameStarted, setGameStarted] = useState(false);
   const [selectedDifficulty, setSelectedDifficulty] = useState(DEFAULT_DIFFICULTY);
-  const [transpositionTable, setTranspositionTable] = useState({});
   const [animatedPieces, setAnimatedPieces] = useState([]);
   const [animationRun, setAnimationRun] = useState(0);
   const [playerMoves, setPlayerMoves] = useState([]);
   const [aiMoves, setAiMoves] = useState([]);
   const [winningPieces, setWinningPieces] = useState([]);
+  const [socketClient, setSocketClient] = useState(null);
+  const [gameId, setGameId] = useState(null);
+  const [playerId, setPlayerId] = useState(null);
+
+  const boardRef = useRef(board);
+  const pendingMoveRef = useRef(null);
 
   const gameOver = useMemo(() => {
     return ["human_win", "ai_win", "draw"].includes(status);
   }, [status]);
 
-  async function requestNewGame() {
-    setBusy(true);
+  useEffect(() => {
+    boardRef.current = board;
+  }, [board]);
+
+  const clearLocalGame = useCallback(() => {
+    pendingMoveRef.current = null;
+    setAnimatedPieces([]);
+    setWinningPieces([]);
+    setBoard(emptyBoard());
+    setStatus("setup");
+    setMessage("Choose difficulty");
+    setPlayerMoves([]);
+    setAiMoves([]);
+    setGameId(null);
+    setPlayerId(null);
+    setBusy(false);
+  }, []);
+
+  const applyServerBoard = useCallback(async (data) => {
+    const pendingMove = pendingMoveRef.current;
+    if (pendingMove) {
+      const elapsed = Date.now() - pendingMove.startedAt;
+      if (elapsed < MIN_AI_RESPONSE_MS) {
+        await wait(MIN_AI_RESPONSE_MS - elapsed);
+      }
+    }
+
+    const previousBoard = pendingMove?.board || boardRef.current;
+    const changedPieces = findChangedPieces(previousBoard, data.board);
+    const aiColumn = findMoveColumn(previousBoard, data.board, AI);
+    const winningLine = findWinningPieces(data.board);
+
+    pendingMoveRef.current = null;
+    setAnimatedPieces(changedPieces);
+    setWinningPieces(winningLine);
+    setAnimationRun((currentRun) => currentRun + 1);
+    setBoard(data.board);
+    setStatus(data.status);
+    setMessage(data.message);
+    setSelectedDifficulty(data.difficulty || DEFAULT_DIFFICULTY);
     setGameStarted(true);
-    setTranspositionTable({});
-    try {
-      const response = await fetch(`${API_URL}/new-game`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ difficulty: selectedDifficulty }),
-      });
-      const data = await response.json();
+    setBusy(false);
+
+    if (aiColumn !== null) {
+      setAiMoves((currentMoves) => [aiColumn, ...currentMoves]);
+    }
+  }, []);
+
+  useEffect(() => {
+    const nextSocket = io(SOCKET_URL, { transports: ["websocket"] });
+    setSocketClient(nextSocket);
+
+    function handleConnect() {
+      const storedSession = loadSession();
+      if (storedSession) {
+        nextSocket.emit("join_game", storedSession);
+      }
+    }
+
+    function handleGameCreated(data) {
+      saveSession(data.gameId, data.playerId);
+      setGameId(data.gameId);
+      setPlayerId(data.playerId);
       setAnimatedPieces([]);
       setWinningPieces([]);
       setBoard(data.board);
       setStatus(data.status);
       setMessage(data.message);
-      setSelectedDifficulty(data.difficulty || selectedDifficulty);
-      setTranspositionTable(data.transpositionTable || {});
+      setSelectedDifficulty(data.difficulty || DEFAULT_DIFFICULTY);
       setPlayerMoves([]);
       setAiMoves([]);
-    } catch {
-      setStatus("error");
-      setMessage("Flask is not responding on localhost:5000");
-    } finally {
+      setGameStarted(true);
       setBusy(false);
     }
+
+    function handleGameJoined(data) {
+      const storedSession = loadSession();
+      setGameId(data.gameId);
+      setPlayerId(storedSession?.playerId || null);
+      setAnimatedPieces([]);
+      setWinningPieces(findWinningPieces(data.board));
+      setBoard(data.board);
+      setStatus(data.status);
+      setMessage(data.message);
+      setSelectedDifficulty(data.difficulty || DEFAULT_DIFFICULTY);
+      setPlayerMoves([]);
+      setAiMoves([]);
+      setGameStarted(true);
+      setBusy(false);
+    }
+
+    function handleJoinRejected(data) {
+      clearSession();
+      clearLocalGame();
+      setMessage(data?.message || "Game not found");
+    }
+
+    async function handleBoardUpdated(data) {
+      await applyServerBoard(data);
+    }
+
+    function handleInvalidMove(data) {
+      const hadPendingMove = Boolean(pendingMoveRef.current);
+      pendingMoveRef.current = null;
+      setAnimatedPieces([]);
+      setWinningPieces(findWinningPieces(data.board));
+      setBoard(data.board);
+      setStatus(data.status);
+      setMessage(data.message);
+      setBusy(false);
+      if (hadPendingMove) {
+        setPlayerMoves((currentMoves) => currentMoves.slice(1));
+      }
+    }
+
+    nextSocket.on("connect", handleConnect);
+    nextSocket.on("game_created", handleGameCreated);
+    nextSocket.on("game_joined", handleGameJoined);
+    nextSocket.on("join_rejected", handleJoinRejected);
+    nextSocket.on("board_updated", handleBoardUpdated);
+    nextSocket.on("invalid_move", handleInvalidMove);
+    nextSocket.on("connect_error", () => {
+      setStatus("error");
+      setMessage("Flask SocketIO is not responding on localhost:5000");
+      setBusy(false);
+    });
+
+    return () => {
+      nextSocket.disconnect();
+    };
+  }, [applyServerBoard, clearLocalGame]);
+
+  function requestNewGame() {
+    if (!socketClient?.connected) {
+      setStatus("error");
+      setMessage("Flask SocketIO is not responding on localhost:5000");
+      return;
+    }
+
+    setBusy(true);
+    setAnimatedPieces([]);
+    setWinningPieces([]);
+    setPlayerMoves([]);
+    setAiMoves([]);
+
+    if (gameStarted && gameId && playerId) {
+      socketClient.emit("reset_game", { gameId, playerId, difficulty: selectedDifficulty });
+      return;
+    }
+
+    socketClient.emit("create_game", { difficulty: selectedDifficulty });
   }
 
   function chooseDifficulty(difficulty) {
@@ -160,74 +317,30 @@ function App() {
       return;
     }
 
+    clearSession();
+    clearLocalGame();
     setSelectedDifficulty(difficulty);
-    setGameStarted(false);
-    setBoard(emptyBoard());
-    setStatus("setup");
-    setMessage("Choose difficulty");
-    setAnimatedPieces([]);
-    setWinningPieces([]);
-    setPlayerMoves([]);
-    setAiMoves([]);
-    setTranspositionTable({});
   }
 
-  const playColumn = useCallback(async (column) => {
-    if (!gameStarted || busy || gameOver || status !== "playing") {
+  const playColumn = useCallback((column) => {
+    if (!socketClient?.connected || !gameId || !playerId || !gameStarted || busy || gameOver || status !== "playing") {
       return;
     }
 
     setBusy(true);
     setMessage("AI is thinking...");
-    const aiStartedAt = Date.now();
     const playerBoard = applyLocalMove(board, column, PLAYER);
     const playerPieces = findChangedPieces(board, playerBoard);
+    pendingMoveRef.current = {
+      board: playerBoard,
+      startedAt: Date.now(),
+    };
     setAnimatedPieces(playerPieces);
     setAnimationRun((currentRun) => currentRun + 1);
     setBoard(playerBoard);
     setPlayerMoves((currentMoves) => [column, ...currentMoves]);
-
-    try {
-      const response = await fetch(`${API_URL}/move`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          board,
-          column,
-          difficulty: selectedDifficulty,
-          transpositionTable,
-        }),
-      });
-      const data = await response.json();
-      const elapsed = Date.now() - aiStartedAt;
-      if (elapsed < MIN_AI_RESPONSE_MS) {
-        await wait(MIN_AI_RESPONSE_MS - elapsed);
-      }
-      const changedPieces = findChangedPieces(playerBoard, data.board);
-      const aiColumn = findMoveColumn(playerBoard, data.board, AI);
-      const winningLine = findWinningPieces(data.board);
-      setAnimatedPieces(changedPieces);
-      setWinningPieces(winningLine);
-      setAnimationRun((currentRun) => currentRun + 1);
-      setBoard(data.board);
-      setStatus(data.status);
-      setMessage(data.message);
-      setSelectedDifficulty(data.difficulty || selectedDifficulty);
-      setTranspositionTable(data.transpositionTable || {});
-      if (aiColumn !== null) {
-        setAiMoves((currentMoves) => [aiColumn, ...currentMoves]);
-      }
-    } catch {
-      setBoard(board);
-      setAnimatedPieces([]);
-      setWinningPieces([]);
-      setPlayerMoves((currentMoves) => currentMoves.slice(1));
-      setStatus("error");
-      setMessage("Flask is not responding on localhost:5000");
-    } finally {
-      setBusy(false);
-    }
-  }, [board, busy, gameOver, gameStarted, selectedDifficulty, status, transpositionTable]);
+    socketClient.emit("player_move", { gameId, playerId, column });
+  }, [board, busy, gameId, gameOver, gameStarted, playerId, socketClient, status]);
 
   useEffect(() => {
     function handleKeyDown(event) {
@@ -292,7 +405,7 @@ function App() {
               </div>
               <div>
                 <span>Game Mode</span>
-                <strong>AI - {selectedDifficulty}</strong>
+                <strong>AI - {formatDifficulty(selectedDifficulty)}</strong>
               </div>
             </section>
 

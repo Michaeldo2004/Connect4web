@@ -18,6 +18,8 @@ The backend runs on:
 http://localhost:5000
 ```
 
+Gameplay uses Socket.IO on the same backend port.
+
 ## Backend
 
 From the backend folder:
@@ -57,3 +59,12 @@ Vite opens the browser at `http://localhost:5173`.
 cd C:\Users\micha\OneDrive\Desktop\VSC\Connect-4\frontend
 npm run build
 ```
+
+## Backend Tests
+
+```powershell
+cd C:\Users\micha\OneDrive\Desktop\VSC\Connect-4\backend
+.\.venv\Scripts\python.exe -m unittest discover -s tests
+```
+
+These tests use Flask-SocketIO's in-process test client and do not require the backend server to be running.

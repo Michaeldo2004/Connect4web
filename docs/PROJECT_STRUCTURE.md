@@ -11,9 +11,13 @@ Connect-4/
 |   |   `-- game_loop.py
 |   |-- gui/
 |   |   `-- gui.py
+|   |-- tests/
+|   |   |-- __init__.py
+|   |   `-- test_socket_game.py
 |   |-- app.py
 |   |-- connect4.py
 |   |-- evaluation.py
+|   |-- evaluation_results.json
 |   |-- main.py
 |   `-- requirements.txt
 |-- docs/
@@ -35,6 +39,6 @@ Connect-4/
 
 ## Runtime Split
 
-`frontend/` renders the Connect 4 board and sends moves to Flask.
+`frontend/` renders the Connect 4 board and sends gameplay events to Flask-SocketIO.
 
-`backend/` owns the Flask API, board rules, AI logic, CLI files, and Python dependencies.
+`backend/` owns the Flask health API, Socket.IO game rooms, board rules, AI logic, CLI evaluation files, tests, and Python dependencies.
