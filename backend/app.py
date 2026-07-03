@@ -1,3 +1,5 @@
+import random
+import time
 import uuid
 
 import numpy as np
@@ -10,6 +12,7 @@ from game.board import COLS, ROWS, check_win, create_board, drop_piece, is_valid
 
 HUMAN = 1
 AI = 2
+DISCONNECT_GRACE_SECONDS = 15
 DIFFICULTIES = {
     "very_easy": {"depth": 1, "time_limit": 3},
     "easy": {"depth": 2, "time_limit": 3},
@@ -81,17 +84,41 @@ def invalid_move(board, message, difficulty="medium", transposition_table=None):
 
 def create_game_state(difficulty, player_id=None):
     return {
+        "mode": "ai",
         "player_id": player_id or uuid.uuid4().hex,
         "socket_id": request.sid if request else None,
         "board": create_board(),
         "difficulty": difficulty,
         "status": "playing",
-        "message": "New game started",
+        "message": "Your turn",
+        "current_player": random.choice([HUMAN, AI]),
         "transposition_table": {},
     }
 
 
-def serialize_game(game_id, game, ai_move=None, include_player_id=False):
+def create_multiplayer_game_state(player_id=None):
+    player_id = player_id or uuid.uuid4().hex
+    return {
+        "mode": "multiplayer",
+        "players": {
+            player_id: {
+                "piece": HUMAN,
+                "socket_id": request.sid if request else None,
+                "connected": True,
+                "disconnect_token": None,
+            },
+        },
+        "board": create_board(),
+        "difficulty": "multiplayer",
+        "status": "waiting",
+        "message": "Waiting for Player 2",
+        "current_player": random.choice([HUMAN, AI]),
+        "disconnect_deadline": None,
+        "rematch_requests": set(),
+    }
+
+
+def serialize_game(game_id, game, ai_move=None, include_player_id=False, player_id=None):
     payload = {
         "gameId": game_id,
         "board": board_to_list(game["board"]),
@@ -99,12 +126,69 @@ def serialize_game(game_id, game, ai_move=None, include_player_id=False):
         "message": game["message"],
         "aiMove": ai_move,
         "difficulty": game["difficulty"],
+        "mode": game.get("mode", "ai"),
     }
+
+    if "current_player" in game:
+        payload["currentPlayer"] = game["current_player"]
 
     if include_player_id:
         payload["playerId"] = game["player_id"]
 
+    if game.get("mode") == "multiplayer":
+        payload["currentPlayer"] = game["current_player"]
+        payload["playersConnected"] = sum(1 for player in game["players"].values() if player.get("connected"))
+        payload["disconnectDeadline"] = game.get("disconnect_deadline")
+        payload["playAgainAccepted"] = len(game.get("rematch_requests", set()))
+        if player_id in game["players"]:
+            payload["playerId"] = player_id
+            payload["playerNumber"] = game["players"][player_id]["piece"]
+
     return payload
+
+
+def apply_ai_turn(game):
+    board = game["board"]
+    difficulty = game["difficulty"]
+    transposition_table = normalize_transposition_table(game.get("transposition_table"))
+    settings = DIFFICULTIES[difficulty]
+    ai_move, transposition_table = get_best_move(
+        board,
+        AI,
+        max_depth=settings["depth"],
+        time_limit=settings["time_limit"],
+        transposition_table=transposition_table,
+        return_table=True,
+    )
+
+    if ai_move is None or not is_valid_move(board, int(ai_move)):
+        game["transposition_table"] = transposition_table
+        return None, "AI returned an invalid move"
+
+    ai_move = int(ai_move)
+    drop_piece(board, ai_move, AI)
+    game["transposition_table"] = transposition_table
+
+    if check_win(board, AI):
+        game["status"] = "ai_win"
+        game["message"] = "AI wins"
+    elif is_draw(board):
+        game["status"] = "draw"
+        game["message"] = "Draw"
+    else:
+        game["status"] = "playing"
+        game["current_player"] = HUMAN
+        game["message"] = "Your turn"
+
+    return ai_move, None
+
+
+def start_ai_game_if_needed(game):
+    if game.get("current_player") != AI:
+        game["message"] = "Your turn"
+        return None, None
+
+    return apply_ai_turn(game)
 
 
 def make_socket_error(game_id, game, message):
@@ -132,6 +216,11 @@ def get_authorized_game(data):
     if game is None:
         return game_id, None, "Game not found"
 
+    if game.get("mode") == "multiplayer":
+        if player_id not in game["players"]:
+            return game_id, game, "Player does not have access to this game"
+        return game_id, game, None
+
     if game["player_id"] != player_id:
         return game_id, game, "Player does not have access to this game"
 
@@ -152,6 +241,9 @@ def apply_human_and_ai_move(game, column):
     if game["status"] in {"human_win", "ai_win", "draw"} or check_win(board, HUMAN) or check_win(board, AI) or is_draw(board):
         return None, "Game is already over"
 
+    if game.get("current_player") != HUMAN:
+        return None, "Not your turn"
+
     if not is_valid_move(board, column):
         return None, "Column is full"
 
@@ -169,35 +261,115 @@ def apply_human_and_ai_move(game, column):
         game["transposition_table"] = transposition_table
         return None, None
 
-    settings = DIFFICULTIES[difficulty]
-    ai_move, transposition_table = get_best_move(
-        board,
-        AI,
-        max_depth=settings["depth"],
-        time_limit=settings["time_limit"],
-        transposition_table=transposition_table,
-        return_table=True,
-    )
+    game["current_player"] = AI
+    return apply_ai_turn(game)
 
-    if ai_move is None or not is_valid_move(board, int(ai_move)):
-        game["transposition_table"] = transposition_table
-        return None, "AI returned an invalid move"
 
-    ai_move = int(ai_move)
-    drop_piece(board, ai_move, AI)
-    game["transposition_table"] = transposition_table
+def apply_multiplayer_move(game, player_id, column):
+    board = game["board"]
+    player = game["players"].get(player_id)
 
-    if check_win(board, AI):
-        game["status"] = "ai_win"
-        game["message"] = "AI wins"
-    elif is_draw(board):
+    if player is None:
+        return "Player does not have access to this game"
+
+    if len(game["players"]) < 2:
+        return "Waiting for Player 2"
+
+    if not isinstance(column, int):
+        return "Invalid column"
+
+    if column < 0 or column >= COLS:
+        return "Column out of range"
+
+    if game["status"] in {"player1_win", "player2_win", "draw"} or check_win(board, HUMAN) or check_win(board, AI) or is_draw(board):
+        return "Game is already over"
+
+    if any(not current_player.get("connected") for current_player in game["players"].values()):
+        return "Waiting for disconnected player"
+
+    if player["piece"] != game["current_player"]:
+        return "Not your turn"
+
+    if not is_valid_move(board, column):
+        return "Column is full"
+
+    drop_piece(board, column, player["piece"])
+
+    if check_win(board, player["piece"]):
+        game["status"] = "player1_win" if player["piece"] == HUMAN else "player2_win"
+        game["message"] = f"Player {player['piece']} wins"
+        return None
+
+    if is_draw(board):
         game["status"] = "draw"
         game["message"] = "Draw"
-    else:
-        game["status"] = "playing"
-        game["message"] = "Your turn"
+        return None
 
-    return ai_move, None
+    game["current_player"] = AI if player["piece"] == HUMAN else HUMAN
+    game["status"] = "playing"
+    game["message"] = f"Player {game['current_player']} turn"
+    return None
+
+
+def find_multiplayer_player_by_sid(socket_id):
+    for game_id, game in games.items():
+        if game.get("mode") != "multiplayer":
+            continue
+
+        for player_id, player in game["players"].items():
+            if player.get("socket_id") == socket_id:
+                return game_id, game, player_id, player
+
+    return None, None, None, None
+
+
+def mark_multiplayer_player_connected(game_id, game, player_id):
+    player = game["players"][player_id]
+    player["socket_id"] = request.sid
+    player["connected"] = True
+    player["disconnect_token"] = None
+    if all(current_player.get("connected") for current_player in game["players"].values()):
+        game["disconnect_deadline"] = None
+        if game["status"] == "playing":
+            game["message"] = f"Player {game['current_player']} turn"
+    print(f"Player {player['piece']} connected to game {game_id}")
+
+
+def start_multiplayer_disconnect_timer(game_id, player_id, disconnect_token):
+    socketio.sleep(DISCONNECT_GRACE_SECONDS)
+    game = games.get(game_id)
+    if game is None or game.get("mode") != "multiplayer":
+        return
+
+    player = game["players"].get(player_id)
+    if player is None or player.get("connected") or player.get("disconnect_token") != disconnect_token:
+        return
+
+    if game["status"] in {"player1_win", "player2_win", "draw"}:
+        return
+
+    other_players = [other for other in game["players"].values() if other["piece"] != player["piece"]]
+    if not other_players:
+        return
+
+    winning_piece = other_players[0]["piece"]
+    game["status"] = "player1_win" if winning_piece == HUMAN else "player2_win"
+    game["message"] = f"Player {winning_piece} wins by default"
+    game["disconnect_deadline"] = None
+    socketio.emit("board_updated", serialize_game(game_id, game), to=game_id)
+
+
+def is_multiplayer_finished(game):
+    return game["status"] in {"player1_win", "player2_win", "draw"}
+
+
+def reset_multiplayer_game(game):
+    game["board"] = create_board()
+    game["status"] = "playing" if len(game["players"]) == 2 else "waiting"
+    game["current_player"] = random.choice([HUMAN, AI])
+    game["message"] = f"Player {game['current_player']} turn" if len(game["players"]) == 2 else "Waiting for Player 2"
+    game["disconnect_deadline"] = None
+    game["rematch_requests"] = set()
 
 
 @app.get("/api/health")
@@ -247,9 +419,14 @@ def socket_create_game(data):
     difficulty = parse_difficulty(data or {})
     game_id = uuid.uuid4().hex
     game = create_game_state(difficulty)
+    ai_move, error = start_ai_game_if_needed(game)
+    if error:
+        emit("invalid_move", make_socket_error(game_id, game, error))
+        return
+
     games[game_id] = game
     join_room(game_id)
-    emit("game_created", serialize_game(game_id, game, include_player_id=True))
+    emit("game_created", serialize_game(game_id, game, ai_move=ai_move, include_player_id=True))
 
 
 @socketio.on("join_game")
@@ -257,6 +434,17 @@ def socket_join_game(data):
     game_id = data.get("gameId") if isinstance(data, dict) else None
     player_id = data.get("playerId") if isinstance(data, dict) else None
     game = games.get(game_id)
+
+    if game is not None and game.get("mode") == "multiplayer":
+        if player_id not in game["players"]:
+            emit("join_rejected", {"gameId": game_id, "message": "Game not found or player does not match"})
+            return
+
+        mark_multiplayer_player_connected(game_id, game, player_id)
+        join_room(game_id)
+        emit("game_joined", serialize_game(game_id, game, player_id=player_id))
+        emit("board_updated", serialize_game(game_id, game), to=game_id)
+        return
 
     if game is None or game["player_id"] != player_id:
         emit("join_rejected", {"gameId": game_id, "message": "Game not found or player does not match"})
@@ -267,11 +455,146 @@ def socket_join_game(data):
     emit("game_joined", serialize_game(game_id, game))
 
 
+@socketio.on("create_multiplayer_game")
+def socket_create_multiplayer_game():
+    game_id = uuid.uuid4().hex
+    player_id = uuid.uuid4().hex
+    game = create_multiplayer_game_state(player_id)
+    games[game_id] = game
+    join_room(game_id)
+    print(f"Player 1 connected to game {game_id}")
+    emit("multiplayer_game_created", serialize_game(game_id, game, player_id=player_id))
+
+
+@socketio.on("join_multiplayer_game")
+def socket_join_multiplayer_game(data):
+    game_id = data.get("gameId") if isinstance(data, dict) else None
+    player_id = data.get("playerId") if isinstance(data, dict) else None
+    game = games.get(game_id)
+
+    if game is None or game.get("mode") != "multiplayer":
+        emit("join_rejected", {"gameId": game_id, "message": "Multiplayer game not found"})
+        return
+
+    if player_id in game["players"]:
+        mark_multiplayer_player_connected(game_id, game, player_id)
+        join_room(game_id)
+        emit("multiplayer_game_joined", serialize_game(game_id, game, player_id=player_id))
+        emit("board_updated", serialize_game(game_id, game), to=game_id)
+        return
+
+    if len(game["players"]) >= 2:
+        emit("join_rejected", {"gameId": game_id, "message": "Multiplayer game is full"})
+        return
+
+    player_id = uuid.uuid4().hex
+    game["players"][player_id] = {
+        "piece": AI,
+        "socket_id": request.sid,
+        "connected": True,
+        "disconnect_token": None,
+    }
+    game["status"] = "playing"
+    game["message"] = f"Player {game['current_player']} turn"
+    join_room(game_id)
+    print(f"Player 2 connected to game {game_id}")
+    emit("multiplayer_game_joined", serialize_game(game_id, game, player_id=player_id))
+    emit("board_updated", serialize_game(game_id, game), to=game_id)
+
+
+@socketio.on("disconnect")
+def socket_disconnect():
+    game_id, game, player_id, player = find_multiplayer_player_by_sid(request.sid)
+    if game is None:
+        return
+
+    player["connected"] = False
+    player["socket_id"] = None
+    player["disconnect_token"] = uuid.uuid4().hex
+    print(f"Player {player['piece']} disconnected from game {game_id}")
+
+    if len(game["players"]) < 2 or game["status"] in {"player1_win", "player2_win", "draw"}:
+        return
+
+    game["disconnect_deadline"] = int((time.time() + DISCONNECT_GRACE_SECONDS) * 1000)
+    game["message"] = f"Player {player['piece']} disconnected."
+    socketio.emit("board_updated", serialize_game(game_id, game), to=game_id)
+    socketio.start_background_task(start_multiplayer_disconnect_timer, game_id, player_id, player["disconnect_token"])
+
+
+@socketio.on("leave_game")
+def socket_leave_game(data):
+    game_id, game, error = get_authorized_game(data or {})
+    if error:
+        emit("invalid_move", make_socket_error(game_id, game, error))
+        return
+
+    if game.get("mode") != "multiplayer":
+        games.pop(game_id, None)
+        emit("game_left", {"gameId": game_id})
+        return
+
+    player_id = data.get("playerId")
+    player = game["players"].get(player_id)
+    if player is None:
+        emit("invalid_move", make_socket_error(game_id, game, "Player does not have access to this game"))
+        return
+
+    if game["status"] == "waiting" and len(game["players"]) == 1:
+        games.pop(game_id, None)
+        emit("game_left", {"gameId": game_id})
+        return
+
+    if is_multiplayer_finished(game):
+        socketio.emit(
+            "player_left",
+            {"gameId": game_id, "message": f"Player {player['piece']} left the room"},
+            to=game_id,
+            skip_sid=request.sid,
+        )
+        games.pop(game_id, None)
+        emit("game_left", {"gameId": game_id})
+        return
+
+    emit("invalid_move", make_socket_error(game_id, game, "Cannot leave during an active multiplayer game"))
+
+
+@socketio.on("play_again")
+def socket_play_again(data):
+    game_id, game, error = get_authorized_game(data or {})
+    if error:
+        emit("invalid_move", make_socket_error(game_id, game, error))
+        return
+
+    if game.get("mode") != "multiplayer" or not is_multiplayer_finished(game):
+        emit("invalid_move", make_socket_error(game_id, game, "Play again is only available after a multiplayer match"))
+        return
+
+    player_id = data.get("playerId")
+    game["rematch_requests"].add(player_id)
+
+    if len(game["rematch_requests"]) == 2 and all(player.get("connected") for player in game["players"].values()):
+        reset_multiplayer_game(game)
+        socketio.emit("board_updated", serialize_game(game_id, game), to=game_id)
+        return
+
+    socketio.emit("play_again_updated", serialize_game(game_id, game), to=game_id)
+
+
 @socketio.on("player_move")
 def socket_player_move(data):
     game_id, game, error = get_authorized_game(data or {})
     if error:
         emit("invalid_move", make_socket_error(game_id, game, error))
+        return
+
+    if game.get("mode") == "multiplayer":
+        error = apply_multiplayer_move(game, data.get("playerId"), data.get("column"))
+        if error:
+            emit("invalid_move", make_socket_error(game_id, game, error))
+            return
+
+        emit("board_updated", serialize_game(game_id, game), to=game_id)
         return
 
     ai_move, error = apply_human_and_ai_move(game, data.get("column"))
@@ -289,14 +612,25 @@ def socket_reset_game(data):
         emit("invalid_move", make_socket_error(game_id, game, error))
         return
 
+    if game.get("mode") == "multiplayer":
+        reset_multiplayer_game(game)
+        emit("board_updated", serialize_game(game_id, game), to=game_id)
+        return
+
     difficulty = parse_difficulty(data or {})
     game["board"] = create_board()
     game["difficulty"] = difficulty
     game["status"] = "playing"
-    game["message"] = "New game started"
+    game["current_player"] = random.choice([HUMAN, AI])
+    game["message"] = "Your turn"
     game["transposition_table"] = {}
     game["socket_id"] = request.sid
-    emit("board_updated", serialize_game(game_id, game), to=game_id)
+    ai_move, error = start_ai_game_if_needed(game)
+    if error:
+        emit("invalid_move", make_socket_error(game_id, game, error))
+        return
+
+    emit("board_updated", serialize_game(game_id, game, ai_move=ai_move), to=game_id)
 
 
 if __name__ == "__main__":

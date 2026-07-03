@@ -39,6 +39,6 @@ Connect-4/
 
 ## Runtime Split
 
-`frontend/` renders the Connect 4 board and sends gameplay events to Flask-SocketIO.
+`frontend/` renders setup at `/`, redirects selected games to `/game`, and sends gameplay events to Flask-SocketIO.
 
-`backend/` owns the Flask health API, Socket.IO game rooms, board rules, AI logic, CLI evaluation files, tests, and Python dependencies.
+`backend/` owns the Flask health API, Socket.IO AI games, two-player rooms, disconnect timers, rematch voting, leave-room events, board rules, AI logic, CLI evaluation files, tests, and Python dependencies.

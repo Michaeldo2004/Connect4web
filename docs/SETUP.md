@@ -12,6 +12,18 @@ The frontend runs on:
 http://localhost:5173
 ```
 
+Setup screen:
+
+```text
+http://localhost:5173/
+```
+
+Game screen:
+
+```text
+http://localhost:5173/game
+```
+
 The backend runs on:
 
 ```text
@@ -51,7 +63,7 @@ npm install
 npm run dev
 ```
 
-Vite opens the browser at `http://localhost:5173`.
+Vite opens the browser at `http://localhost:5173`. Pick a difficulty or `Vs Player`, then click `Play` to redirect to `/game`.
 
 ## Build Check
 
@@ -68,3 +80,12 @@ cd C:\Users\micha\OneDrive\Desktop\VSC\Connect-4\backend
 ```
 
 These tests use Flask-SocketIO's in-process test client and do not require the backend server to be running.
+
+Current expected result:
+
+```text
+Ran 23 tests
+OK
+```
+
+The tests cover AI websocket gameplay, randomized starting players, two-player websocket rooms, turn enforcement, reset, reconnect, rematch voting, leave-room behavior, and the 15-second disconnect default-win rule.
