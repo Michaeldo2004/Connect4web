@@ -56,6 +56,7 @@ player_left { gameId, message }
 game_left { gameId }
 invalid_move { gameId, board, status, message, difficulty, mode }
 join_rejected { gameId, message }
+create_rejected { message }
 ```
 
 ### `create_game`
@@ -226,7 +227,7 @@ The rematch starting player is randomized.
 
 ### `leave_game`
 
-AI mode leave is handled on the frontend by clearing local session state and returning to `/`.
+AI mode leave removes the server-side game and returns `game_left`.
 
 Multiplayer leave is accepted by the backend only when:
 
@@ -278,14 +279,9 @@ Response event: `board_updated`
 
 Invalid moves emit `invalid_move`.
 
-## REST Fallback
+## REST
 
-These endpoints are still present as fallback compatibility paths, but React gameplay uses Socket.IO.
-
-```text
-POST /api/new-game
-POST /api/move
-```
+React gameplay uses Socket.IO. REST only exposes `GET /api/health` and `POST /api/new-game`.
 
 ## Difficulty Values
 

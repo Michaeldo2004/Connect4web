@@ -446,6 +446,14 @@ function App() {
       redirectTo(SETUP_PATH, true);
     }
 
+    function handleCreateRejected(data) {
+      clearSession();
+      clearMultiplayerSession();
+      clearLocalGame();
+      setMessage(data?.message || "Could not create game");
+      redirectTo(SETUP_PATH, true);
+    }
+
     async function handleBoardUpdated(data) {
       await applyServerBoard(data);
     }
@@ -489,6 +497,7 @@ function App() {
     nextSocket.on("multiplayer_game_created", handleMultiplayerGameStarted);
     nextSocket.on("multiplayer_game_joined", handleMultiplayerGameStarted);
     nextSocket.on("join_rejected", handleJoinRejected);
+    nextSocket.on("create_rejected", handleCreateRejected);
     nextSocket.on("board_updated", handleBoardUpdated);
     nextSocket.on("play_again_updated", handlePlayAgainUpdated);
     nextSocket.on("player_left", handlePlayerLeft);
@@ -700,6 +709,9 @@ function App() {
 
   function leaveGame() {
     if (gameMode !== GAME_MODE_MULTIPLAYER) {
+      if (socketClient?.connected && gameId && playerId) {
+        socketClient.emit("leave_game", { gameId, playerId });
+      }
       returnToMainMenu();
       return;
     }

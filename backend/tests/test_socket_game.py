@@ -19,13 +19,18 @@ def find_events(client, event_name):
 class SocketGameTests(unittest.TestCase):
     def setUp(self):
         app_module.DISCONNECT_GRACE_SECONDS = 0.01
+        app.config["AI_SEARCH_INLINE"] = True
         games.clear()
+        app_module.create_attempts.clear()
         self.client = socketio.test_client(app)
 
     def tearDown(self):
-        self.client.disconnect()
+        if self.client.is_connected():
+            self.client.disconnect()
         socketio.sleep(0.02)
         games.clear()
+        app_module.create_attempts.clear()
+        app.config["AI_SEARCH_INLINE"] = False
         app_module.DISCONNECT_GRACE_SECONDS = 15
 
     def create_game(self, difficulty="very_easy"):
@@ -36,6 +41,13 @@ class SocketGameTests(unittest.TestCase):
 
     def test_socket_connects(self):
         self.assertTrue(self.client.is_connected())
+
+    def test_api_move_endpoint_is_removed(self):
+        response = app.test_client().post("/api/move", json={
+            "board": [[0, 0, 0, 0, 0, 0, 0] for _ in range(6)],
+            "column": 3,
+        })
+        self.assertEqual(response.status_code, 404)
 
     def test_create_game_returns_game_and_player_ids(self):
         payload = self.create_game()
@@ -148,6 +160,22 @@ class SocketGameTests(unittest.TestCase):
         self.assertIsNotNone(invalid)
         self.assertEqual(invalid["status"], "invalid_move")
         self.assertEqual(invalid["message"], "Column out of range")
+
+    def test_ai_leave_removes_game(self):
+        created = self.create_game()
+        self.client.emit("leave_game", {
+            "gameId": created["gameId"],
+            "playerId": created["playerId"],
+        })
+        left = find_event(self.client, "game_left")
+        self.assertIsNotNone(left)
+        self.assertNotIn(created["gameId"], games)
+
+    def test_ai_disconnect_removes_game(self):
+        created = self.create_game()
+        self.client.disconnect()
+        socketio.sleep(0.02)
+        self.assertNotIn(created["gameId"], games)
 
     def test_reset_game_clears_board(self):
         created = self.create_game()
@@ -306,6 +334,22 @@ class SocketGameTests(unittest.TestCase):
         self.assertEqual(updates[-1]["status"], "player1_win")
         self.assertEqual(updates[-1]["message"], "Player 1 wins by default")
         self.assertEqual(updates[-1]["playersConnected"], 1)
+
+    def test_multiplayer_both_disconnects_abandons_game(self):
+        self.client.emit("create_multiplayer_game")
+        created = find_event(self.client, "multiplayer_game_created")
+        second_client = socketio.test_client(app)
+        second_client.emit("join_multiplayer_game", {"gameId": created["gameId"]})
+        find_event(second_client, "multiplayer_game_joined")
+
+        self.client.disconnect()
+        second_client.disconnect()
+        socketio.sleep(0.03)
+
+        game = games[created["gameId"]]
+        self.assertEqual(game["status"], "draw")
+        self.assertEqual(game["message"], "Game abandoned")
+        self.assertEqual(sum(1 for player in game["players"].values() if player["connected"]), 0)
 
     def test_multiplayer_reconnect_cancels_default_win(self):
         self.client.emit("create_multiplayer_game")
