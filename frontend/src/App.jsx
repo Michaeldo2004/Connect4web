@@ -8,6 +8,9 @@ const PENDING_GAME_KEY = "connect4_pending_game";
 const PENDING_MULTIPLAYER_JOIN_KEY = "connect4_pending_multiplayer_join";
 const SETUP_PATH = "/";
 const GAME_PATH = "/game";
+const TOS_PATH = "/tos";
+const PRIVACY_POLICY_PATH = "/privacypolicy";
+const APP_PATHS = new Set([SETUP_PATH, GAME_PATH, TOS_PATH, PRIVACY_POLICY_PATH]);
 const ROWS = 6;
 const COLS = 7;
 
@@ -23,9 +26,33 @@ const DIFFICULTIES = [
   { key: "medium", label: "Medium", depth: 5, timeLimit: "3s" },
   { key: "hard", label: "Hard", depth: 7, timeLimit: "5s" },
 ];
+const USERNAME_MAX_LENGTH = 32;
+const EMAIL_MAX_LENGTH = 254;
+const PASSWORD_MAX_LENGTH = 128;
 
 function emptyBoard() {
   return Array.from({ length: ROWS }, () => Array(COLS).fill(0));
+}
+
+function sanitizeRoomIdInput(value) {
+  return value.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
+}
+
+function sanitizeUsernameInput(value) {
+  return value.replace(/[^A-Za-z0-9_]/g, "").slice(0, USERNAME_MAX_LENGTH);
+}
+
+function sanitizeEmailInput(value) {
+  return value.replace(/[\s<>"]/g, "").slice(0, EMAIL_MAX_LENGTH);
+}
+
+function sanitizePasswordInput(value) {
+  return value.replace(/[\r\n]/g, "").slice(0, PASSWORD_MAX_LENGTH);
+}
+
+function isTextEntryTarget(target) {
+  const tagName = target?.tagName?.toLowerCase();
+  return tagName === "input" || tagName === "textarea" || tagName === "select" || target?.isContentEditable;
 }
 
 function findChangedPieces(previousBoard, nextBoard) {
@@ -201,7 +228,7 @@ function formatDifficulty(difficulty) {
 }
 
 function getCurrentPath() {
-  return window.location.pathname === GAME_PATH ? GAME_PATH : SETUP_PATH;
+  return APP_PATHS.has(window.location.pathname) ? window.location.pathname : SETUP_PATH;
 }
 
 function App() {
@@ -231,6 +258,13 @@ function App() {
   const [playAgainAccepted, setPlayAgainAccepted] = useState(0);
   const [playAgainRequested, setPlayAgainRequested] = useState(false);
   const [otherPlayerLeftMessage, setOtherPlayerLeftMessage] = useState("");
+  const [authOpen, setAuthOpen] = useState(false);
+  const [authMode, setAuthMode] = useState("login");
+  const [authFields, setAuthFields] = useState({
+    username: "",
+    email: "",
+    password: "",
+  });
 
   const boardRef = useRef(board);
   const pendingMoveRef = useRef(null);
@@ -664,6 +698,10 @@ function App() {
 
   useEffect(() => {
     function handleKeyDown(event) {
+      if (isTextEntryTarget(event.target)) {
+        return;
+      }
+
       const numberRowMatch = event.code.match(/^Digit([1-7])$/);
       const numpadMatch = event.code.match(/^Numpad([1-7])$/);
       const columnKey = numberRowMatch?.[1] || numpadMatch?.[1];
@@ -734,13 +772,41 @@ function App() {
     socketClient.emit("play_again", { gameId, playerId });
   }
 
+  function openAuthModal(mode = "login") {
+    setAuthMode(mode);
+    setAuthOpen(true);
+  }
+
+  function closeAuthModal() {
+    setAuthOpen(false);
+  }
+
+  function submitAuthPlaceholder(event) {
+    event.preventDefault();
+  }
+
+  function updateAuthField(fieldName, value) {
+    const sanitizers = {
+      username: sanitizeUsernameInput,
+      email: sanitizeEmailInput,
+      password: sanitizePasswordInput,
+    };
+    const sanitizeValue = sanitizers[fieldName] || ((currentValue) => currentValue);
+    setAuthFields((currentFields) => ({
+      ...currentFields,
+      [fieldName]: sanitizeValue(value),
+    }));
+  }
+
   const canDropPiece =
     gameStarted &&
     !busy &&
     !gameOver &&
     status === "playing" &&
     (gameMode !== GAME_MODE_MULTIPLAYER || (playerNumber === currentPlayer && playersConnected === 2));
-  const showingSetup = routePath !== GAME_PATH;
+  const showingSetup = routePath === SETUP_PATH;
+  const showingGame = routePath === GAME_PATH;
+  const showingLegalPage = routePath === TOS_PATH || routePath === PRIVACY_POLICY_PATH;
   let displayMessage = message;
   if (!gameOver && canDropPiece) {
     displayMessage = "Your turn";
@@ -757,7 +823,7 @@ function App() {
   const statusClassName = !gameOver && canDropPiece ? "turn-status your-turn" : "turn-status waiting-turn";
   const canLeaveGame =
     gameStarted &&
-    !showingSetup &&
+    showingGame &&
     (gameMode !== GAME_MODE_MULTIPLAYER || (status === "waiting" && playersConnected === 1) || gameOver);
   const canRequestPlayAgain = gameStarted && gameMode === GAME_MODE_MULTIPLAYER && gameOver;
   const playerMoveLabel = gameMode === GAME_MODE_MULTIPLAYER ? "Your moves" : "Your moves";
@@ -794,7 +860,7 @@ function App() {
         <input
           type="text"
           value={joinGameId}
-          onChange={(event) => setJoinGameId(event.target.value)}
+          onChange={(event) => setJoinGameId(sanitizeRoomIdInput(event.target.value))}
           placeholder="Room ID"
           aria-label="Room ID"
           disabled={busy}
@@ -892,35 +958,135 @@ function App() {
       </section>
     </>
   );
+  const actionBar = gameStarted && showingGame ? (
+    <section className="game-actionbar" aria-label="Game actions">
+      {gameMode !== GAME_MODE_MULTIPLAYER ? (
+        <button type="button" onClick={requestNewGame} disabled={busy}>
+          Reset
+        </button>
+      ) : null}
+      {canRequestPlayAgain ? (
+        <button type="button" onClick={requestPlayAgain} disabled={busy || playAgainRequested}>
+          Play again {playAgainAccepted}/2
+        </button>
+      ) : null}
+      {canLeaveGame ? (
+        <button type="button" onClick={leaveGame} disabled={busy}>
+          Leave
+        </button>
+      ) : null}
+    </section>
+  ) : null;
+  const legalView = <section className="blank-page" aria-label={routePath === TOS_PATH ? "Terms of Service" : "Privacy Policy"} />;
+  let pageView = setupView;
+  if (showingGame) {
+    pageView = gameStarted ? gameView : loadingView;
+  } else if (showingLegalPage) {
+    pageView = legalView;
+  }
 
   return (
-    <main className="app-shell">
-      <section className="topbar">
-        <div>
-          <h1>Connect 4</h1>
-        </div>
-        <div className="topbar-actions">
-          {gameStarted && gameMode !== GAME_MODE_MULTIPLAYER ? (
-            <button type="button" onClick={requestNewGame} disabled={busy}>
-              Reset
-            </button>
-          ) : null}
-          {canRequestPlayAgain ? (
-            <button type="button" onClick={requestPlayAgain} disabled={busy || playAgainRequested}>
-              Play again {playAgainAccepted}/2
-            </button>
-          ) : null}
-          {canLeaveGame ? (
-            <button type="button" onClick={leaveGame} disabled={busy}>
-              Leave
-            </button>
-          ) : null}
-        </div>
-      </section>
+    <div className="app-shell">
+      <header className="site-nav">
+        <a className="brand-mark" href={SETUP_PATH}>
+          CONNECT 4
+        </a>
+        <button className="auth-open-button" type="button" onClick={() => openAuthModal("login")}>
+          Sign up / Login
+        </button>
+      </header>
 
-      <section className="game-area">
-        {showingSetup ? setupView : gameStarted ? gameView : loadingView}
-      </section>
+      <main className="page-shell">
+        {actionBar}
+        <section className="game-area">{pageView}</section>
+      </main>
+
+      <footer className="site-footer">
+        <nav aria-label="Footer">
+          <a href={PRIVACY_POLICY_PATH}>Privacy Policy</a>
+          <a href={TOS_PATH}>Terms of Service</a>
+          <span>Contact</span>
+          <span>About</span>
+        </nav>
+        <span>Version 0.1</span>
+      </footer>
+
+      {authOpen ? (
+        <div className="modal-backdrop" role="presentation">
+          <section className="auth-modal" role="dialog" aria-modal="true" aria-labelledby="auth-modal-title">
+            <div className="auth-modal-header">
+              <h2 id="auth-modal-title">{authMode === "signup" ? "Create account" : "Login"}</h2>
+              <button className="modal-close-button" type="button" onClick={closeAuthModal} aria-label="Close auth popup">
+                X
+              </button>
+            </div>
+            <div className="auth-mode-tabs" role="tablist" aria-label="Auth mode">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={authMode === "login"}
+                className={authMode === "login" ? "selected" : ""}
+                onClick={() => setAuthMode("login")}
+              >
+                Login
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={authMode === "signup"}
+                className={authMode === "signup" ? "selected" : ""}
+                onClick={() => setAuthMode("signup")}
+              >
+                Sign up
+              </button>
+            </div>
+            <form className="auth-form" onSubmit={submitAuthPlaceholder}>
+              {authMode === "signup" ? (
+                <label>
+                  Username
+                  <input
+                    type="text"
+                    name="username"
+                    autoComplete="username"
+                    placeholder="connect4player"
+                    value={authFields.username}
+                    onChange={(event) => updateAuthField("username", event.target.value)}
+                    maxLength={USERNAME_MAX_LENGTH}
+                    inputMode="text"
+                  />
+                </label>
+              ) : null}
+              <label>
+                Email
+                <input
+                  type="email"
+                  name="email"
+                  autoComplete="email"
+                  placeholder="you@example.com"
+                  value={authFields.email}
+                  onChange={(event) => updateAuthField("email", event.target.value)}
+                  maxLength={EMAIL_MAX_LENGTH}
+                />
+              </label>
+              <label>
+                Password
+                <input
+                  type="password"
+                  name="password"
+                  autoComplete={authMode === "signup" ? "new-password" : "current-password"}
+                  placeholder="Password"
+                  value={authFields.password}
+                  onChange={(event) => updateAuthField("password", event.target.value)}
+                  maxLength={PASSWORD_MAX_LENGTH}
+                />
+              </label>
+              <button className="auth-submit-button" type="submit">
+                {authMode === "signup" ? "Create account" : "Login"}
+              </button>
+            </form>
+          </section>
+        </div>
+      ) : null}
       {otherPlayerLeftMessage ? (
         <div className="modal-backdrop" role="presentation">
           <section className="leave-modal" role="dialog" aria-modal="true" aria-labelledby="leave-modal-title">
@@ -932,7 +1098,7 @@ function App() {
           </section>
         </div>
       ) : null}
-    </main>
+    </div>
   );
 }
 

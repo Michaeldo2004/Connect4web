@@ -7,6 +7,7 @@ React frontend with a Flask-SocketIO backend for Human vs. Minimax AI Connect 4 
 - [Setup](docs/SETUP.md)
 - [API](docs/API.md)
 - [Project Structure](docs/PROJECT_STRUCTURE.md)
+- [Supabase Schema Draft](docs/supabase_schema.sql)
 
 ## Backend
 
@@ -46,7 +47,26 @@ Setup is at `/`. The active board is at:
 http://localhost:5173/game
 ```
 
+Placeholder legal pages are available at:
+
+```text
+http://localhost:5173/tos
+http://localhost:5173/privacypolicy
+```
+
 The player picks an AI difficulty or `Vs Player`, then `Play` redirects to `/game`.
+
+The frontend has a Connect 4 themed shell with a top nav, footer, responsive layout, and a placeholder signup/login popup. Auth is not wired to Supabase yet. Placeholder auth fields sanitize input locally; usernames allow letters, numbers, and underscores.
+
+## Database Draft
+
+The Supabase schema draft is in:
+
+```text
+docs/supabase_schema.sql
+```
+
+It defines profiles, games, game players, move history, lazy post-game move analysis, player stats, indexes, triggers, and RLS read policies. Gameplay still uses in-memory backend state.
 
 ## API / Socket.IO
 
@@ -84,7 +104,8 @@ Every new game randomizes the starting side. Status is green only for `Your turn
 
 ## Limitations
 
-- No database persistence.
+- Database persistence is not wired into gameplay yet.
+- Signup/login UI is placeholder-only.
 - Rejoin only works while the backend process stays alive.
 - Free backend hosting has no load balancer for horizontally scaling websocket rooms.
 - In-memory Socket.IO rooms are not safe for horizontal scaling without a message queue or shared store.
