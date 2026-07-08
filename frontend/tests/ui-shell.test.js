@@ -6,15 +6,29 @@ import { join } from "node:path";
 const appSource = readFileSync(join(import.meta.dirname, "..", "src", "App.jsx"), "utf8");
 const cssSource = readFileSync(join(import.meta.dirname, "..", "src", "styles.css"), "utf8");
 
-test("manual routes include game and placeholder legal pages", () => {
-  assert.match(appSource, /const SETUP_PATH = "\/";/);
-  assert.match(appSource, /const GAME_PATH = "\/game";/);
-  assert.match(appSource, /const TOS_PATH = "\/tos";/);
-  assert.match(appSource, /const PRIVACY_POLICY_PATH = "\/privacypolicy";/);
+test("manual routes are env-backed with local defaults", () => {
+  assert.match(appSource, /function getEnvString\(name, fallback\)/);
+  assert.match(appSource, /function getEnvRoute\(name, fallback\)/);
+  assert.match(appSource, /const SOCKET_URL = getEnvString\("VITE_BACKEND_URL", "http:\/\/localhost:5000"\)/);
+  assert.match(appSource, /const SETUP_PATH = getEnvRoute\("VITE_SETUP_PATH", "\/"\);/);
+  assert.match(appSource, /const GAME_PATH = getEnvRoute\("VITE_GAME_PATH", "\/game"\);/);
+  assert.match(appSource, /const LOGIN_PATH = getEnvRoute\("VITE_LOGIN_PATH", "\/login"\);/);
+  assert.match(appSource, /const SIGNUP_PATH = getEnvRoute\("VITE_SIGNUP_PATH", "\/signup"\);/);
+  assert.match(appSource, /const TOS_PATH = getEnvRoute\("VITE_TOS_PATH", "\/tos"\);/);
+  assert.match(appSource, /const PRIVACY_POLICY_PATH = getEnvRoute\("VITE_PRIVACY_POLICY_PATH", "\/privacypolicy"\);/);
   assert.match(appSource, /APP_PATHS\.has\(window\.location\.pathname\)/);
 });
 
-test("nav shell includes brand and placeholder auth button", () => {
+test("supabase auth client and jwt payload are wired", () => {
+  assert.match(appSource, /import \{ createClient \} from "@supabase\/supabase-js";/);
+  assert.match(appSource, /const supabaseClient = createAuthClient\(\);/);
+  assert.match(appSource, /supabaseClient\.auth\.signUp/);
+  assert.match(appSource, /supabaseClient\.auth\.signInWithPassword/);
+  assert.match(appSource, /supabaseClient\.auth\.signOut/);
+  assert.match(appSource, /accessToken: authSession\?\.access_token \|\| ""/);
+});
+
+test("nav shell includes brand and auth entry points", () => {
   assert.match(appSource, /className="site-nav"/);
   assert.match(appSource, /className="brand-mark"/);
   assert.match(appSource, />\s*CONNECT 4\s*</);
@@ -26,12 +40,13 @@ test("auth modal supports login, signup, and close states", () => {
   assert.match(appSource, /const \[authOpen, setAuthOpen\] = useState\(false\);/);
   assert.match(appSource, /const \[authMode, setAuthMode\] = useState\("login"\);/);
   assert.match(appSource, /const \[authFields, setAuthFields\] = useState/);
+  assert.match(appSource, /const \[authSession, setAuthSession\] = useState\(null\);/);
   assert.match(appSource, /role="dialog"/);
   assert.match(appSource, /aria-label="Close auth popup"/);
   assert.match(appSource, /name="username"/);
   assert.match(appSource, /name="email"/);
   assert.match(appSource, /name="password"/);
-  assert.match(appSource, /submitAuthPlaceholder/);
+  assert.match(appSource, /submitAuthForm/);
 });
 
 test("input sanitizers preserve valid username numbers and strip unsafe characters", () => {

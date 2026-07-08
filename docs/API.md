@@ -30,17 +30,27 @@ http://localhost:5000
 
 The backend stores each active board in memory by `gameId`. AI game sessions use `localStorage`. Multiplayer sessions use per-tab `sessionStorage` so two browser tabs do not share the same `playerId`.
 
+When `AUTH_REQUIRED=true`, gameplay Socket.IO payloads must include a Supabase JWT access token:
+
+```json
+{
+  "accessToken": "supabase-access-token"
+}
+```
+
+Create, join, move, reset, leave, and rematch events reject missing or invalid tokens.
+
 ### Client Events
 
 ```text
-create_game { difficulty }
-join_game { gameId, playerId }
-create_multiplayer_game
-join_multiplayer_game { gameId, playerId? }
-player_move { gameId, playerId, column }
-reset_game { gameId, playerId, difficulty? }
-play_again { gameId, playerId }
-leave_game { gameId, playerId }
+create_game { difficulty, accessToken }
+join_game { gameId, playerId, accessToken }
+create_multiplayer_game { accessToken }
+join_multiplayer_game { gameId, playerId?, accessToken }
+player_move { gameId, playerId, column, accessToken }
+reset_game { gameId, playerId, difficulty?, accessToken }
+play_again { gameId, playerId, accessToken }
+leave_game { gameId, playerId, accessToken }
 ```
 
 ### Server Events
@@ -65,7 +75,8 @@ Request:
 
 ```json
 {
-  "difficulty": "medium"
+  "difficulty": "medium",
+  "accessToken": "supabase-access-token"
 }
 ```
 
@@ -101,7 +112,8 @@ Request:
 ```json
 {
   "gameId": "generated-game-id",
-  "playerId": "generated-player-id"
+  "playerId": "generated-player-id",
+  "accessToken": "supabase-access-token"
 }
 ```
 
@@ -111,7 +123,13 @@ If the `playerId` matches the game, the server emits `game_joined`. If it does n
 
 ### `create_multiplayer_game`
 
-Request: no payload.
+Request:
+
+```json
+{
+  "accessToken": "supabase-access-token"
+}
+```
 
 Response event: `multiplayer_game_created`
 
@@ -146,7 +164,8 @@ Player 2 joins with only the room ID:
 
 ```json
 {
-  "gameId": "generated-game-id"
+  "gameId": "generated-game-id",
+  "accessToken": "supabase-access-token"
 }
 ```
 
@@ -155,7 +174,8 @@ Reconnect uses the saved player ID:
 ```json
 {
   "gameId": "generated-game-id",
-  "playerId": "existing-player-id"
+  "playerId": "existing-player-id",
+  "accessToken": "supabase-access-token"
 }
 ```
 
@@ -195,7 +215,8 @@ Request:
 ```json
 {
   "gameId": "generated-game-id",
-  "playerId": "generated-player-id"
+  "playerId": "generated-player-id",
+  "accessToken": "supabase-access-token"
 }
 ```
 
@@ -253,7 +274,8 @@ Request:
 {
   "gameId": "generated-game-id",
   "playerId": "generated-player-id",
-  "column": 3
+  "column": 3,
+  "accessToken": "supabase-access-token"
 }
 ```
 

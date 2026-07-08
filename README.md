@@ -12,7 +12,7 @@ React frontend with a Flask-SocketIO backend for Human vs. Minimax AI Connect 4 
 ## Backend
 
 ```powershell
-cd C:\Users\micha\OneDrive\Desktop\VSC\Connect-4\backend
+cd backend
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
@@ -30,7 +30,7 @@ Gameplay uses Socket.IO on the backend port. `GET /api/health` remains available
 ## Frontend
 
 ```powershell
-cd C:\Users\micha\OneDrive\Desktop\VSC\Connect-4\frontend
+cd frontend
 npm install
 npm run dev
 ```
@@ -56,7 +56,7 @@ http://localhost:5173/privacypolicy
 
 The player picks an AI difficulty or `Vs Player`, then `Play` redirects to `/game`.
 
-The frontend has a Connect 4 themed shell with a top nav, footer, responsive layout, and a placeholder signup/login popup. Auth is not wired to Supabase yet. Placeholder auth fields sanitize input locally; usernames allow letters, numbers, and underscores.
+The frontend has a Connect 4 themed shell with a top nav, footer, responsive layout, `/login` and `/signup` routes, and a signup/login popup. Auth uses Supabase Auth. Usernames allow letters, numbers, and underscores.
 
 ## Database Draft
 
@@ -66,7 +66,25 @@ The Supabase schema draft is in:
 docs/supabase_schema.sql
 ```
 
-It defines profiles, games, game players, move history, lazy post-game move analysis, player stats, indexes, triggers, and RLS read policies. Gameplay still uses in-memory backend state.
+It defines profiles, games, game players, move history, lazy post-game move analysis, player stats, indexes, triggers, and RLS read policies.
+
+Backend Supabase sync is enabled only when these backend environment variables are set:
+
+```text
+SUPABASE_URL
+SUPABASE_SECRET_KEY
+```
+
+Runtime URLs and app paths are configured through `.env` files:
+
+```text
+backend/.env: FRONTEND_ORIGIN, CORS_ALLOWED_ORIGINS, BACKEND_HOST, BACKEND_PORT, SUPABASE_JWT_SECRET, AUTH_REQUIRED
+frontend/.env: VITE_BACKEND_URL, VITE_SETUP_PATH, VITE_GAME_PATH, VITE_LOGIN_PATH, VITE_SIGNUP_PATH, VITE_TOS_PATH, VITE_PRIVACY_POLICY_PATH
+```
+
+Gameplay socket events require a Supabase access token when `AUTH_REQUIRED=true`.
+
+When configured, the backend writes game rows, player rows, valid moves, and final game status to Supabase. The live websocket game state still runs in memory.
 
 ## API / Socket.IO
 
@@ -104,8 +122,8 @@ Every new game randomizes the starting side. Status is green only for `Your turn
 
 ## Limitations
 
-- Database persistence is not wired into gameplay yet.
-- Signup/login UI is placeholder-only.
+- Database persistence is backend-only and optional. If Supabase env vars are missing, gameplay still works without saving.
+- Auth requires Supabase env vars on the frontend and `SUPABASE_JWT_SECRET` on the backend.
 - Rejoin only works while the backend process stays alive.
 - Free backend hosting has no load balancer for horizontally scaling websocket rooms.
 - In-memory Socket.IO rooms are not safe for horizontal scaling without a message queue or shared store.

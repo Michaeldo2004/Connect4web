@@ -13,14 +13,18 @@ Connect-4/
 |   |   `-- gui.py
 |   |-- tests/
 |   |   |-- __init__.py
+|   |   |-- test_auth_layer.py
+|   |   |-- test_backend_config.py
 |   |   |-- test_socket_game.py
+|   |   |-- test_supabase_store.py
 |   |   `-- test_supabase_schema.py
 |   |-- app.py
 |   |-- connect4.py
 |   |-- evaluation.py
 |   |-- evaluation_results.json
 |   |-- main.py
-|   `-- requirements.txt
+|   |-- requirements.txt
+|   `-- supabase_store.py
 |-- docs/
 |   |-- API.md
 |   |-- PROJECT_STRUCTURE.md
@@ -43,8 +47,8 @@ Connect-4/
 
 ## Runtime Split
 
-`frontend/` renders setup at `/`, redirects selected games to `/game`, renders placeholder blank pages at `/tos` and `/privacypolicy`, shows the placeholder auth popup, and sends gameplay events to Flask-SocketIO.
+`frontend/` renders setup at `/` by default, redirects selected games to `/game` by default, renders auth pages at `/login` and `/signup` by default, renders placeholder blank pages at `/tos` and `/privacypolicy` by default, shows the auth popup, and sends gameplay events to the env-configured Flask-SocketIO URL with the Supabase access token.
 
-`backend/` owns the Flask health API, Socket.IO AI games, two-player rooms, disconnect timers, rematch voting, leave-room events, board rules, AI logic, CLI evaluation files, tests, and Python dependencies.
+`backend/` owns the Flask health API, Socket.IO AI games, two-player rooms, disconnect timers, rematch voting, leave-room events, board rules, AI logic, optional Supabase persistence, CLI evaluation files, tests, and Python dependencies.
 
-`docs/supabase_schema.sql` is the database draft for future Supabase auth/profile game history and lazy post-game move analysis. It is not wired into runtime gameplay yet.
+`docs/supabase_schema.sql` is the database draft for Supabase auth/profile game history and lazy post-game move analysis. Runtime sync is backend-only and no-ops when Supabase env vars are missing.

@@ -20,6 +20,7 @@ class SocketGameTests(unittest.TestCase):
     def setUp(self):
         app_module.DISCONNECT_GRACE_SECONDS = 0.01
         app.config["AI_SEARCH_INLINE"] = True
+        app.config["AUTH_REQUIRED"] = False
         games.clear()
         app_module.create_attempts.clear()
         self.client = socketio.test_client(app)
@@ -31,6 +32,7 @@ class SocketGameTests(unittest.TestCase):
         games.clear()
         app_module.create_attempts.clear()
         app.config["AI_SEARCH_INLINE"] = False
+        app.config.pop("AUTH_REQUIRED", None)
         app_module.DISCONNECT_GRACE_SECONDS = 15
 
     def create_game(self, difficulty="very_easy"):

@@ -96,6 +96,33 @@ a {
   white-space: nowrap;
 }
 
+.account-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  min-width: 0;
+}
+
+.account-actions span {
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #dbeafe;
+  font-size: 0.92rem;
+}
+
+.auth-route-link {
+  color: #ffffff;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.auth-route-link:hover {
+  text-decoration: underline;
+}
+
 .page-shell {
   width: min(1120px, calc(100% - 24px));
   margin: 0 auto;
@@ -474,6 +501,22 @@ a {
   box-shadow: 0 24px 60px rgb(15 23 42 / 0.24);
 }
 
+.auth-page {
+  min-height: min(620px, calc(100vh - 190px));
+  display: grid;
+  place-items: center;
+  padding: 16px 0;
+}
+
+.auth-route-panel {
+  align-self: center;
+}
+
+.auth-route-panel h2 {
+  margin: 0 0 14px;
+  font-size: 1.35rem;
+}
+
 .auth-modal-header {
   display: flex;
   align-items: center;
@@ -533,6 +576,44 @@ a {
   color: #ffffff;
 }
 
+.auth-submit-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
+.auth-error {
+  color: var(--brand-red);
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
+}
+
+.auth-required-panel strong {
+  font-size: 1.2rem;
+}
+
+.auth-required-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.auth-required-actions button {
+  min-width: 120px;
+  border: 1px solid var(--brand-blue);
+  border-radius: 8px;
+  background: var(--brand-blue);
+  color: #ffffff;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.auth-required-actions button + button {
+  border-color: var(--brand-red);
+  background: var(--brand-red);
+}
+
 .leave-modal p {
   margin: 8px 0 16px;
   color: #374151;
@@ -553,6 +634,10 @@ a {
 
   .auth-open-button {
     padding: 0 12px;
+  }
+
+  .account-actions span {
+    display: none;
   }
 
   .page-shell {

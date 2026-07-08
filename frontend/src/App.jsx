@@ -1,16 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createClient } from "@supabase/supabase-js";
 import { io } from "socket.io-client";
 
-const SOCKET_URL = "http://localhost:5000";
 const STORAGE_KEY = "connect4_game_session";
 const MULTIPLAYER_STORAGE_KEY = "connect4_multiplayer_session";
 const PENDING_GAME_KEY = "connect4_pending_game";
 const PENDING_MULTIPLAYER_JOIN_KEY = "connect4_pending_multiplayer_join";
-const SETUP_PATH = "/";
-const GAME_PATH = "/game";
-const TOS_PATH = "/tos";
-const PRIVACY_POLICY_PATH = "/privacypolicy";
-const APP_PATHS = new Set([SETUP_PATH, GAME_PATH, TOS_PATH, PRIVACY_POLICY_PATH]);
+const SOCKET_URL = getEnvString("VITE_BACKEND_URL", "http://localhost:5000").replace(/\/+$/, "");
+const SETUP_PATH = getEnvRoute("VITE_SETUP_PATH", "/");
+const GAME_PATH = getEnvRoute("VITE_GAME_PATH", "/game");
+const LOGIN_PATH = getEnvRoute("VITE_LOGIN_PATH", "/login");
+const SIGNUP_PATH = getEnvRoute("VITE_SIGNUP_PATH", "/signup");
+const TOS_PATH = getEnvRoute("VITE_TOS_PATH", "/tos");
+const PRIVACY_POLICY_PATH = getEnvRoute("VITE_PRIVACY_POLICY_PATH", "/privacypolicy");
+const APP_PATHS = new Set([SETUP_PATH, GAME_PATH, LOGIN_PATH, SIGNUP_PATH, TOS_PATH, PRIVACY_POLICY_PATH]);
 const ROWS = 6;
 const COLS = 7;
 
@@ -29,6 +32,36 @@ const DIFFICULTIES = [
 const USERNAME_MAX_LENGTH = 32;
 const EMAIL_MAX_LENGTH = 254;
 const PASSWORD_MAX_LENGTH = 128;
+const SUPABASE_URL = getEnvString("VITE_SUPABASE_URL", "");
+const SUPABASE_PUBLISHABLE_KEY = getEnvString("VITE_SUPABASE_PUBLISHABLE_KEY", "");
+const supabaseClient = createAuthClient();
+
+function getEnvString(name, fallback) {
+  const value = import.meta.env[name];
+  if (typeof value !== "string" || value.trim() === "") {
+    return fallback;
+  }
+
+  return value.trim();
+}
+
+function getEnvRoute(name, fallback) {
+  const value = getEnvString(name, fallback);
+  const path = value.startsWith("/") ? value : `/${value}`;
+  if (path === "/") {
+    return path;
+  }
+
+  return path.replace(/\/+$/, "");
+}
+
+function createAuthClient() {
+  if (!SUPABASE_URL || !SUPABASE_PUBLISHABLE_KEY) {
+    return null;
+  }
+
+  return createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
+}
 
 function emptyBoard() {
   return Array.from({ length: ROWS }, () => Array(COLS).fill(0));
@@ -265,6 +298,10 @@ function App() {
     email: "",
     password: "",
   });
+  const [authSession, setAuthSession] = useState(null);
+  const [authReady, setAuthReady] = useState(!supabaseClient);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authError, setAuthError] = useState("");
 
   const boardRef = useRef(board);
   const pendingMoveRef = useRef(null);
@@ -276,6 +313,32 @@ function App() {
   useEffect(() => {
     boardRef.current = board;
   }, [board]);
+
+  useEffect(() => {
+    if (!supabaseClient) {
+      setAuthReady(true);
+      return undefined;
+    }
+
+    let mounted = true;
+    supabaseClient.auth.getSession().then(({ data }) => {
+      if (!mounted) {
+        return;
+      }
+      setAuthSession(data.session || null);
+      setAuthReady(true);
+    });
+
+    const { data: listener } = supabaseClient.auth.onAuthStateChange((_event, session) => {
+      setAuthSession(session || null);
+      setAuthReady(true);
+    });
+
+    return () => {
+      mounted = false;
+      listener.subscription.unsubscribe();
+    };
+  }, []);
 
   const redirectTo = useCallback((path, replace = false) => {
     if (window.location.pathname !== path) {
@@ -296,6 +359,14 @@ function App() {
       window.removeEventListener("popstate", handlePopState);
     };
   }, []);
+
+  useEffect(() => {
+    if (routePath === LOGIN_PATH) {
+      setAuthMode("login");
+    } else if (routePath === SIGNUP_PATH) {
+      setAuthMode("signup");
+    }
+  }, [routePath]);
 
   const clearLocalGame = useCallback(() => {
     pendingMoveRef.current = null;
@@ -364,21 +435,32 @@ function App() {
     }
   }, []);
 
+  const authPayload = useCallback((payload = {}) => {
+    return {
+      ...payload,
+      accessToken: authSession?.access_token || "",
+    };
+  }, [authSession]);
+
   useEffect(() => {
     const nextSocket = io(SOCKET_URL, { transports: ["websocket"] });
     setSocketClient(nextSocket);
 
     function handleConnect() {
+      if (!authSession) {
+        return;
+      }
+
       const pendingGame = takePendingGame();
       if (pendingGame) {
         clearSession();
         clearMultiplayerSession();
         if (pendingGame.mode === GAME_MODE_MULTIPLAYER) {
-          nextSocket.emit("create_multiplayer_game");
+          nextSocket.emit("create_multiplayer_game", authPayload());
           return;
         }
 
-        nextSocket.emit("create_game", { difficulty: pendingGame.difficulty || DEFAULT_DIFFICULTY });
+        nextSocket.emit("create_game", authPayload({ difficulty: pendingGame.difficulty || DEFAULT_DIFFICULTY }));
         return;
       }
 
@@ -386,19 +468,19 @@ function App() {
       if (pendingMultiplayerJoin) {
         clearSession();
         clearMultiplayerSession();
-        nextSocket.emit("join_multiplayer_game", { gameId: pendingMultiplayerJoin.gameId });
+        nextSocket.emit("join_multiplayer_game", authPayload({ gameId: pendingMultiplayerJoin.gameId }));
         return;
       }
 
       const multiplayerSession = loadMultiplayerSession();
       if (multiplayerSession) {
-        nextSocket.emit("join_multiplayer_game", multiplayerSession);
+        nextSocket.emit("join_multiplayer_game", authPayload(multiplayerSession));
         return;
       }
 
       const storedSession = loadSession();
       if (storedSession) {
-        nextSocket.emit("join_game", storedSession);
+        nextSocket.emit("join_game", authPayload(storedSession));
       }
     }
 
@@ -539,19 +621,24 @@ function App() {
     nextSocket.on("invalid_move", handleInvalidMove);
     nextSocket.on("connect_error", () => {
       setStatus("error");
-      setMessage("Flask SocketIO is not responding on localhost:5000");
+      setMessage(`Flask SocketIO is not responding at ${SOCKET_URL}`);
       setBusy(false);
     });
 
     return () => {
       nextSocket.disconnect();
     };
-  }, [applyServerBoard, clearLocalGame, redirectTo]);
+  }, [applyServerBoard, authPayload, clearLocalGame, redirectTo]);
 
   function startMultiplayerGame() {
+    if (!authSession) {
+      redirectTo(LOGIN_PATH);
+      return;
+    }
+
     if (!socketClient?.connected) {
       setStatus("error");
-      setMessage("Flask SocketIO is not responding on localhost:5000");
+      setMessage(`Flask SocketIO is not responding at ${SOCKET_URL}`);
       return;
     }
 
@@ -572,14 +659,19 @@ function App() {
     setMessage("Creating multiplayer room...");
     setGameStarted(false);
     setBusy(true);
-    socketClient.emit("create_multiplayer_game");
+    socketClient.emit("create_multiplayer_game", authPayload());
   }
 
   function joinMultiplayerGame() {
+    if (!authSession) {
+      redirectTo(LOGIN_PATH);
+      return;
+    }
+
     const requestedGameId = joinGameId.trim();
     if (!requestedGameId || !socketClient?.connected) {
       setStatus("error");
-      setMessage(!requestedGameId ? "Enter a room ID" : "Flask SocketIO is not responding on localhost:5000");
+      setMessage(!requestedGameId ? "Enter a room ID" : `Flask SocketIO is not responding at ${SOCKET_URL}`);
       return;
     }
 
@@ -590,6 +682,11 @@ function App() {
   }
 
   function requestNewGame() {
+    if (!authSession) {
+      redirectTo(LOGIN_PATH);
+      return;
+    }
+
     if (gameMode === GAME_MODE_MULTIPLAYER) {
       if (gameId && playerId) {
         setBusy(true);
@@ -597,7 +694,7 @@ function App() {
         setWinningPieces([]);
         setPlayerMoves([]);
         setAiMoves([]);
-        socketClient.emit("reset_game", { gameId, playerId });
+        socketClient.emit("reset_game", authPayload({ gameId, playerId }));
       }
       return;
     }
@@ -616,7 +713,7 @@ function App() {
 
     if (!socketClient?.connected) {
       setStatus("error");
-      setMessage("Flask SocketIO is not responding on localhost:5000");
+      setMessage(`Flask SocketIO is not responding at ${SOCKET_URL}`);
       return;
     }
 
@@ -626,7 +723,7 @@ function App() {
       setWinningPieces([]);
       setPlayerMoves([]);
       setAiMoves([]);
-      socketClient.emit("reset_game", { gameId, playerId, difficulty: selectedDifficulty });
+      socketClient.emit("reset_game", authPayload({ gameId, playerId, difficulty: selectedDifficulty }));
       return;
     }
 
@@ -635,7 +732,7 @@ function App() {
     setWinningPieces([]);
     setPlayerMoves([]);
     setAiMoves([]);
-    socketClient.emit("create_game", { difficulty: selectedDifficulty });
+    socketClient.emit("create_game", authPayload({ difficulty: selectedDifficulty }));
   }
 
   function chooseDifficulty(difficulty) {
@@ -673,16 +770,16 @@ function App() {
 
       setBusy(true);
       setMessage("Waiting for server...");
-      socketClient.emit("player_move", { gameId, playerId, column });
+      socketClient.emit("player_move", authPayload({ gameId, playerId, column }));
       return;
     }
 
-    if (!socketClient?.connected || !gameId || !playerId) {
-      return;
-    }
+      if (!socketClient?.connected || !gameId || !playerId) {
+        return;
+      }
 
-    setBusy(true);
-    setMessage("AI is thinking...");
+      setBusy(true);
+      setMessage("AI is thinking...");
     const playerBoard = applyLocalMove(board, column, PLAYER);
     const playerPieces = findChangedPieces(board, playerBoard);
     pendingMoveRef.current = {
@@ -693,8 +790,8 @@ function App() {
     setAnimationRun((currentRun) => currentRun + 1);
     setBoard(playerBoard);
     setPlayerMoves((currentMoves) => [column, ...currentMoves]);
-    socketClient.emit("player_move", { gameId, playerId, column });
-  }, [board, busy, currentPlayer, gameId, gameMode, gameOver, gameStarted, playerId, playerNumber, socketClient, status]);
+    socketClient.emit("player_move", authPayload({ gameId, playerId, column }));
+  }, [authPayload, board, busy, currentPlayer, gameId, gameMode, gameOver, gameStarted, playerId, playerNumber, socketClient, status]);
 
   useEffect(() => {
     function handleKeyDown(event) {
@@ -748,7 +845,7 @@ function App() {
   function leaveGame() {
     if (gameMode !== GAME_MODE_MULTIPLAYER) {
       if (socketClient?.connected && gameId && playerId) {
-        socketClient.emit("leave_game", { gameId, playerId });
+        socketClient.emit("leave_game", authPayload({ gameId, playerId }));
       }
       returnToMainMenu();
       return;
@@ -760,7 +857,7 @@ function App() {
     }
 
     setBusy(true);
-    socketClient.emit("leave_game", { gameId, playerId });
+    socketClient.emit("leave_game", authPayload({ gameId, playerId }));
   }
 
   function requestPlayAgain() {
@@ -769,7 +866,7 @@ function App() {
     }
 
     setPlayAgainRequested(true);
-    socketClient.emit("play_again", { gameId, playerId });
+    socketClient.emit("play_again", authPayload({ gameId, playerId }));
   }
 
   function openAuthModal(mode = "login") {
@@ -779,10 +876,85 @@ function App() {
 
   function closeAuthModal() {
     setAuthOpen(false);
+    setAuthError("");
   }
 
-  function submitAuthPlaceholder(event) {
+  async function submitAuthForm(event) {
     event.preventDefault();
+    setAuthError("");
+
+    if (!supabaseClient) {
+      setAuthError("Supabase auth is not configured");
+      return;
+    }
+
+    setAuthBusy(true);
+    const email = authFields.email.trim();
+    const password = authFields.password;
+    const username = authFields.username.trim();
+
+    try {
+      if (authMode === "signup") {
+        if (!username) {
+          setAuthError("Username is required");
+          return;
+        }
+
+        const { data, error } = await supabaseClient.auth.signUp({
+          email,
+          password,
+          options: {
+            data: { username },
+          },
+        });
+        if (error) {
+          setAuthError(error.message);
+          return;
+        }
+
+        if (data.session && data.user) {
+          await supabaseClient.from("profiles").upsert({
+            id: data.user.id,
+            username,
+            display_name: username,
+          });
+          setAuthSession(data.session);
+          setAuthOpen(false);
+          if (routePath === LOGIN_PATH || routePath === SIGNUP_PATH) {
+            redirectTo(SETUP_PATH, true);
+          }
+          return;
+        }
+
+        setAuthError("Check your email to finish signup");
+        return;
+      }
+
+      const { data, error } = await supabaseClient.auth.signInWithPassword({ email, password });
+      if (error) {
+        setAuthError(error.message);
+        return;
+      }
+
+      setAuthSession(data.session || null);
+      setAuthOpen(false);
+      if (routePath === LOGIN_PATH || routePath === SIGNUP_PATH) {
+        redirectTo(SETUP_PATH, true);
+      }
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function logout() {
+    if (supabaseClient) {
+      await supabaseClient.auth.signOut();
+    }
+    clearSession();
+    clearMultiplayerSession();
+    clearLocalGame();
+    setAuthSession(null);
+    redirectTo(LOGIN_PATH, true);
   }
 
   function updateAuthField(fieldName, value) {
@@ -828,7 +1000,96 @@ function App() {
   const canRequestPlayAgain = gameStarted && gameMode === GAME_MODE_MULTIPLAYER && gameOver;
   const playerMoveLabel = gameMode === GAME_MODE_MULTIPLAYER ? "Your moves" : "Your moves";
   const opponentMoveLabel = gameMode === GAME_MODE_MULTIPLAYER ? "Other player's moves" : "AI moves";
-  const setupView = (
+  const isAuthenticated = Boolean(authSession);
+  const authForm = (
+    <>
+      <div className="auth-mode-tabs" role="tablist" aria-label="Auth mode">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={authMode === "login"}
+          className={authMode === "login" ? "selected" : ""}
+          onClick={() => setAuthMode("login")}
+        >
+          Login
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={authMode === "signup"}
+          className={authMode === "signup" ? "selected" : ""}
+          onClick={() => setAuthMode("signup")}
+        >
+          Sign up
+        </button>
+      </div>
+      <form className="auth-form" onSubmit={submitAuthForm}>
+        {authMode === "signup" ? (
+          <label>
+            Username
+            <input
+              type="text"
+              name="username"
+              autoComplete="username"
+              placeholder="connect4player"
+              value={authFields.username}
+              onChange={(event) => updateAuthField("username", event.target.value)}
+              maxLength={USERNAME_MAX_LENGTH}
+              inputMode="text"
+            />
+          </label>
+        ) : null}
+        <label>
+          Email
+          <input
+            type="email"
+            name="email"
+            autoComplete="email"
+            placeholder="you@example.com"
+            value={authFields.email}
+            onChange={(event) => updateAuthField("email", event.target.value)}
+            maxLength={EMAIL_MAX_LENGTH}
+          />
+        </label>
+        <label>
+          Password
+          <input
+            type="password"
+            name="password"
+            autoComplete={authMode === "signup" ? "new-password" : "current-password"}
+            placeholder="Password"
+            value={authFields.password}
+            onChange={(event) => updateAuthField("password", event.target.value)}
+            maxLength={PASSWORD_MAX_LENGTH}
+          />
+        </label>
+        {authError ? <strong className="auth-error">{authError}</strong> : null}
+        <button className="auth-submit-button" type="submit" disabled={authBusy}>
+          {authMode === "signup" ? "Create account" : "Login"}
+        </button>
+      </form>
+    </>
+  );
+  const authRequiredView = (
+    <section className="difficulty-panel auth-required-panel">
+      <strong>Login required</strong>
+      <div className="auth-required-actions">
+        <button type="button" onClick={() => redirectTo(LOGIN_PATH)}>
+          Login
+        </button>
+        <button type="button" onClick={() => redirectTo(SIGNUP_PATH)}>
+          Sign up
+        </button>
+      </div>
+    </section>
+  );
+  const setupView = !authReady ? (
+    <section className="difficulty-panel">
+      <strong>Loading account...</strong>
+    </section>
+  ) : !isAuthenticated ? (
+    authRequiredView
+  ) : (
     <section className="difficulty-panel">
       <div className="difficulty-tabs" role="tablist" aria-label="Difficulty">
         {DIFFICULTIES.map((difficulty) => (
@@ -869,6 +1130,14 @@ function App() {
           Join
         </button>
       </div>
+    </section>
+  );
+  const authPageView = (
+    <section className="auth-page">
+      <section className="auth-modal auth-route-panel" aria-labelledby="auth-route-title">
+        <h2 id="auth-route-title">{authMode === "signup" ? "Create account" : "Login"}</h2>
+        {authForm}
+      </section>
     </section>
   );
   const loadingView = (
@@ -979,7 +1248,13 @@ function App() {
   ) : null;
   const legalView = <section className="blank-page" aria-label={routePath === TOS_PATH ? "Terms of Service" : "Privacy Policy"} />;
   let pageView = setupView;
-  if (showingGame) {
+  if (!authReady && (showingSetup || showingGame)) {
+    pageView = loadingView;
+  } else if (routePath === LOGIN_PATH || routePath === SIGNUP_PATH) {
+    pageView = authPageView;
+  } else if (showingGame && !isAuthenticated) {
+    pageView = authRequiredView;
+  } else if (showingGame) {
     pageView = gameStarted ? gameView : loadingView;
   } else if (showingLegalPage) {
     pageView = legalView;
@@ -991,9 +1266,23 @@ function App() {
         <a className="brand-mark" href={SETUP_PATH}>
           CONNECT 4
         </a>
-        <button className="auth-open-button" type="button" onClick={() => openAuthModal("login")}>
-          Sign up / Login
-        </button>
+        {isAuthenticated ? (
+          <div className="account-actions">
+            <span>{authSession.user?.email || "Account"}</span>
+            <button className="auth-open-button" type="button" onClick={logout}>
+              Logout
+            </button>
+          </div>
+        ) : (
+          <div className="account-actions">
+            <a className="auth-route-link" href={LOGIN_PATH}>
+              Login
+            </a>
+            <button className="auth-open-button" type="button" onClick={() => openAuthModal("login")}>
+              Sign up / Login
+            </button>
+          </div>
+        )}
       </header>
 
       <main className="page-shell">
@@ -1020,70 +1309,7 @@ function App() {
                 X
               </button>
             </div>
-            <div className="auth-mode-tabs" role="tablist" aria-label="Auth mode">
-              <button
-                type="button"
-                role="tab"
-                aria-selected={authMode === "login"}
-                className={authMode === "login" ? "selected" : ""}
-                onClick={() => setAuthMode("login")}
-              >
-                Login
-              </button>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={authMode === "signup"}
-                className={authMode === "signup" ? "selected" : ""}
-                onClick={() => setAuthMode("signup")}
-              >
-                Sign up
-              </button>
-            </div>
-            <form className="auth-form" onSubmit={submitAuthPlaceholder}>
-              {authMode === "signup" ? (
-                <label>
-                  Username
-                  <input
-                    type="text"
-                    name="username"
-                    autoComplete="username"
-                    placeholder="connect4player"
-                    value={authFields.username}
-                    onChange={(event) => updateAuthField("username", event.target.value)}
-                    maxLength={USERNAME_MAX_LENGTH}
-                    inputMode="text"
-                  />
-                </label>
-              ) : null}
-              <label>
-                Email
-                <input
-                  type="email"
-                  name="email"
-                  autoComplete="email"
-                  placeholder="you@example.com"
-                  value={authFields.email}
-                  onChange={(event) => updateAuthField("email", event.target.value)}
-                  maxLength={EMAIL_MAX_LENGTH}
-                />
-              </label>
-              <label>
-                Password
-                <input
-                  type="password"
-                  name="password"
-                  autoComplete={authMode === "signup" ? "new-password" : "current-password"}
-                  placeholder="Password"
-                  value={authFields.password}
-                  onChange={(event) => updateAuthField("password", event.target.value)}
-                  maxLength={PASSWORD_MAX_LENGTH}
-                />
-              </label>
-              <button className="auth-submit-button" type="submit">
-                {authMode === "signup" ? "Create account" : "Login"}
-              </button>
-            </form>
+            {authForm}
           </section>
         </div>
       ) : null}
