@@ -16,6 +16,10 @@ def find_events(client, event_name):
     return [event["args"][0] for event in client.get_received() if event["name"] == event_name]
 
 
+def filter_events(events, event_name):
+    return [event["args"][0] for event in events if event["name"] == event_name]
+
+
 class SocketGameTests(unittest.TestCase):
     def setUp(self):
         app_module.DISCONNECT_GRACE_SECONDS = 0.01
@@ -23,6 +27,8 @@ class SocketGameTests(unittest.TestCase):
         app.config["AUTH_REQUIRED"] = False
         games.clear()
         app_module.create_attempts.clear()
+        self.supabase_execute_patch = patch.object(app_module.supabase_store, "execute_safely", return_value=False)
+        self.supabase_execute_patch.start()
         self.client = socketio.test_client(app)
 
     def tearDown(self):
@@ -34,6 +40,7 @@ class SocketGameTests(unittest.TestCase):
         app.config["AI_SEARCH_INLINE"] = False
         app.config.pop("AUTH_REQUIRED", None)
         app_module.DISCONNECT_GRACE_SECONDS = 15
+        self.supabase_execute_patch.stop()
 
     def create_game(self, difficulty="very_easy"):
         self.client.emit("create_game", {"difficulty": difficulty})
@@ -58,29 +65,50 @@ class SocketGameTests(unittest.TestCase):
         self.assertEqual(payload["status"], "playing")
         self.assertEqual(payload["difficulty"], "very_easy")
         self.assertIn(payload["currentPlayer"], [1, 2])
-        self.assertIn(sum(cell != 0 for row in payload["board"] for cell in row), [0, 1])
+        self.assertEqual(sum(cell != 0 for row in payload["board"] for cell in row), 0)
+        self.assertIsNone(payload["aiMove"])
 
-    def test_ai_game_current_player_matches_opening_board(self):
+    def test_ai_game_creation_enters_room_before_opening_ai_move(self):
         for starter in [1, 2]:
             games.clear()
             with patch("app.random.choice", return_value=starter):
-                payload = self.create_game()
-            pieces = sum(cell != 0 for row in payload["board"] for cell in row)
-            self.assertEqual(payload["currentPlayer"], 1)
-            self.assertEqual(pieces, 1 if starter == 2 else 0)
-            self.assertEqual(payload["message"], "Your turn")
-            self.assertEqual(payload["aiMove"] is not None, starter == 2)
+                self.client.emit("create_game", {"difficulty": "very_easy"})
+
+            events = self.client.get_received()
+            created = filter_events(events, "game_created")[0]
+            updates = filter_events(events, "board_updated")
+            self.assertEqual(created["currentPlayer"], starter)
+            self.assertEqual(sum(cell != 0 for row in created["board"] for cell in row), 0)
+            self.assertIsNone(created["aiMove"])
+
+            if starter == 1:
+                self.assertEqual(created["message"], "Your turn")
+                self.assertEqual(updates, [])
+            else:
+                self.assertEqual(created["message"], "AI is thinking")
+                self.assertEqual(len(updates), 1)
+                self.assertEqual(updates[0]["currentPlayer"], 1)
+                self.assertEqual(updates[0]["message"], "Your turn")
+                self.assertIsNotNone(updates[0]["aiMove"])
+                self.assertEqual(sum(cell != 0 for row in updates[0]["board"] for cell in row), 1)
+                self.assertEqual(games[created["gameId"]]["move_number"], 1)
 
     def test_ai_game_random_start_payload_stays_valid(self):
         for _ in range(8):
-            payload = self.create_game()
-            pieces = sum(cell != 0 for row in payload["board"] for cell in row)
-            self.assertEqual(payload["currentPlayer"], 1)
-            self.assertIn(pieces, [0, 1])
-            if pieces == 1:
-                self.assertEqual(payload["aiMove"], next(
+            self.client.emit("create_game", {"difficulty": "very_easy"})
+            events = self.client.get_received()
+            created = filter_events(events, "game_created")[0]
+            updates = filter_events(events, "board_updated")
+            self.assertIn(created["currentPlayer"], [1, 2])
+            self.assertEqual(sum(cell != 0 for row in created["board"] for cell in row), 0)
+            if created["currentPlayer"] == 1:
+                self.assertEqual(updates, [])
+            else:
+                self.assertEqual(len(updates), 1)
+                self.assertEqual(updates[0]["currentPlayer"], 1)
+                self.assertEqual(updates[0]["aiMove"], next(
                     column_index
-                    for row in payload["board"]
+                    for row in updates[0]["board"]
                     for column_index, cell in enumerate(row)
                     if cell == 2
                 ))
@@ -100,18 +128,33 @@ class SocketGameTests(unittest.TestCase):
 
     def test_ai_reset_current_player_matches_opening_board(self):
         created = self.create_game()
+        current_game_id = created["gameId"]
+        current_player_id = created["playerId"]
         for _ in range(8):
             self.client.emit("reset_game", {
-                "gameId": created["gameId"],
-                "playerId": created["playerId"],
+                "gameId": current_game_id,
+                "playerId": current_player_id,
                 "difficulty": "very_easy",
             })
-            reset = find_event(self.client, "board_updated")
+            updates = find_events(self.client, "board_updated")
+            reset = updates[0]
+            self.assertNotEqual(reset["gameId"], current_game_id)
+            self.assertEqual(reset["playerId"], current_player_id)
+            self.assertNotIn(current_game_id, games)
+            self.assertIn(reset["gameId"], games)
+            current_game_id = reset["gameId"]
             pieces = sum(cell != 0 for row in reset["board"] for cell in row)
-            self.assertEqual(reset["currentPlayer"], 1)
-            self.assertIn(pieces, [0, 1])
-            if pieces == 1:
-                self.assertIsNotNone(reset["aiMove"])
+            self.assertIn(reset["currentPlayer"], [1, 2])
+            self.assertEqual(pieces, 0)
+            self.assertIsNone(reset["aiMove"])
+            if reset["currentPlayer"] == 2:
+                self.assertEqual(reset["message"], "AI is thinking")
+                self.assertEqual(len(updates), 2)
+                self.assertEqual(updates[1]["currentPlayer"], 1)
+                self.assertIsNotNone(updates[1]["aiMove"])
+            else:
+                self.assertEqual(reset["message"], "Your turn")
+                self.assertEqual(len(updates), 1)
 
     def test_join_game_with_matching_player_id_succeeds(self):
         created = self.create_game()
@@ -195,6 +238,10 @@ class SocketGameTests(unittest.TestCase):
         })
         reset = find_event(self.client, "board_updated")
         self.assertIsNotNone(reset)
+        self.assertNotEqual(reset["gameId"], created["gameId"])
+        self.assertEqual(reset["playerId"], created["playerId"])
+        self.assertNotIn(created["gameId"], games)
+        self.assertIn(reset["gameId"], games)
         self.assertEqual(reset["status"], "playing")
         self.assertEqual(reset["difficulty"], "hard")
         self.assertIn(reset["currentPlayer"], [1, 2])
@@ -220,31 +267,33 @@ class SocketGameTests(unittest.TestCase):
             joined = find_event(second_client, "multiplayer_game_joined")
             self.assertIsNotNone(joined)
             self.assertEqual(joined["gameId"], created["gameId"])
-            self.assertEqual(joined["playerNumber"], 2)
+            self.assertIn(joined["playerNumber"], [1, 2])
             self.assertEqual(joined["playersConnected"], 2)
             self.assertEqual(joined["status"], "playing")
-            self.assertIn(joined["currentPlayer"], [1, 2])
-            self.assertEqual(joined["message"], f"Player {joined['currentPlayer']} turn")
+            self.assertEqual(joined["currentPlayer"], 1)
+            self.assertEqual(joined["message"], "Player 1 turn")
         finally:
             second_client.disconnect()
 
-    def test_multiplayer_randomized_start_payload_is_consistent(self):
-        for starter in [1, 2]:
+    def test_multiplayer_starter_is_assigned_yellow(self):
+        for starter_index in [0, 1]:
             games.clear()
             first_client = socketio.test_client(app)
             second_client = socketio.test_client(app)
             try:
-                with patch("app.random.choice", return_value=starter):
-                    first_client.emit("create_multiplayer_game")
+                first_client.emit("create_multiplayer_game")
                 created = find_event(first_client, "multiplayer_game_created")
-                self.assertEqual(created["currentPlayer"], starter)
-                second_client.emit("join_multiplayer_game", {"gameId": created["gameId"]})
+                with patch("app.random.choice", side_effect=lambda player_ids: player_ids[starter_index]):
+                    second_client.emit("join_multiplayer_game", {"gameId": created["gameId"]})
                 joined = find_event(second_client, "multiplayer_game_joined")
-                self.assertEqual(joined["currentPlayer"], starter)
-                self.assertEqual(joined["message"], f"Player {joined['currentPlayer']} turn")
+                self.assertEqual(joined["currentPlayer"], 1)
+                self.assertEqual(joined["message"], "Player 1 turn")
                 first_update = find_event(first_client, "board_updated")
+                self.assertEqual(first_update["currentPlayer"], 1)
                 self.assertEqual(first_update["currentPlayer"], joined["currentPlayer"])
                 self.assertEqual(first_update["message"], joined["message"])
+                self.assertEqual(first_update["playerNumber"], 1 if starter_index == 0 else 2)
+                self.assertEqual(joined["playerNumber"], 2 if starter_index == 0 else 1)
             finally:
                 first_client.disconnect()
                 second_client.disconnect()
@@ -259,8 +308,8 @@ class SocketGameTests(unittest.TestCase):
                 created = find_event(first_client, "multiplayer_game_created")
                 second_client.emit("join_multiplayer_game", {"gameId": created["gameId"]})
                 joined = find_event(second_client, "multiplayer_game_joined")
-                self.assertIn(joined["currentPlayer"], [1, 2])
-                self.assertEqual(joined["message"], f"Player {joined['currentPlayer']} turn")
+                self.assertEqual(joined["currentPlayer"], 1)
+                self.assertEqual(joined["message"], "Player 1 turn")
             finally:
                 first_client.disconnect()
                 second_client.disconnect()
@@ -270,7 +319,8 @@ class SocketGameTests(unittest.TestCase):
         created = find_event(self.client, "multiplayer_game_created")
         second_client = socketio.test_client(app)
         try:
-            second_client.emit("join_multiplayer_game", {"gameId": created["gameId"]})
+            with patch("app.random.choice", return_value=created["playerId"]):
+                second_client.emit("join_multiplayer_game", {"gameId": created["gameId"]})
             joined = find_event(second_client, "multiplayer_game_joined")
             games[created["gameId"]]["current_player"] = 1
             self.client.get_received()
@@ -306,7 +356,8 @@ class SocketGameTests(unittest.TestCase):
         created = find_event(self.client, "multiplayer_game_created")
         second_client = socketio.test_client(app)
         try:
-            second_client.emit("join_multiplayer_game", {"gameId": created["gameId"]})
+            with patch("app.random.choice", return_value=created["playerId"]):
+                second_client.emit("join_multiplayer_game", {"gameId": created["gameId"]})
             joined = find_event(second_client, "multiplayer_game_joined")
             games[created["gameId"]]["current_player"] = 1
             second_client.emit("player_move", {
@@ -324,7 +375,8 @@ class SocketGameTests(unittest.TestCase):
         self.client.emit("create_multiplayer_game")
         created = find_event(self.client, "multiplayer_game_created")
         second_client = socketio.test_client(app)
-        second_client.emit("join_multiplayer_game", {"gameId": created["gameId"]})
+        with patch("app.random.choice", return_value=created["playerId"]):
+            second_client.emit("join_multiplayer_game", {"gameId": created["gameId"]})
         find_event(second_client, "multiplayer_game_joined")
         self.client.get_received()
 
@@ -357,7 +409,8 @@ class SocketGameTests(unittest.TestCase):
         self.client.emit("create_multiplayer_game")
         created = find_event(self.client, "multiplayer_game_created")
         second_client = socketio.test_client(app)
-        second_client.emit("join_multiplayer_game", {"gameId": created["gameId"]})
+        with patch("app.random.choice", return_value=created["playerId"]):
+            second_client.emit("join_multiplayer_game", {"gameId": created["gameId"]})
         joined = find_event(second_client, "multiplayer_game_joined")
         self.client.get_received()
 
@@ -378,6 +431,32 @@ class SocketGameTests(unittest.TestCase):
             self.assertEqual(sum(1 for player in game["players"].values() if player["connected"]), 2)
         finally:
             reconnecting_client.disconnect()
+
+    def test_multiplayer_reconnect_preserves_reassigned_player_number(self):
+        self.client.emit("create_multiplayer_game")
+        created = find_event(self.client, "multiplayer_game_created")
+        second_client = socketio.test_client(app)
+        try:
+            with patch("app.random.choice", return_value=created["playerId"]):
+                second_client.emit("join_multiplayer_game", {"gameId": created["gameId"]})
+            joined = find_event(second_client, "multiplayer_game_joined")
+            self.assertEqual(joined["playerNumber"], 2)
+
+            second_client.disconnect()
+            reconnecting_client = socketio.test_client(app)
+            try:
+                reconnecting_client.emit("join_multiplayer_game", {
+                    "gameId": joined["gameId"],
+                    "playerId": joined["playerId"],
+                })
+                rejoined = find_event(reconnecting_client, "multiplayer_game_joined")
+                self.assertEqual(rejoined["playerNumber"], 2)
+                self.assertEqual(rejoined["currentPlayer"], 1)
+            finally:
+                reconnecting_client.disconnect()
+        finally:
+            if second_client.is_connected():
+                second_client.disconnect()
 
     def test_multiplayer_play_again_resets_after_both_players_accept(self):
         self.client.emit("create_multiplayer_game")
@@ -406,16 +485,19 @@ class SocketGameTests(unittest.TestCase):
             })
             reset = find_event(self.client, "board_updated")
             self.assertIsNotNone(reset)
+            self.assertNotEqual(reset["gameId"], created["gameId"])
+            self.assertNotIn(created["gameId"], games)
+            self.assertIn(reset["gameId"], games)
             self.assertEqual(reset["status"], "playing")
-            self.assertIn(reset["currentPlayer"], [1, 2])
-            self.assertEqual(reset["message"], f"Player {reset['currentPlayer']} turn")
+            self.assertEqual(reset["currentPlayer"], 1)
+            self.assertEqual(reset["message"], "Player 1 turn")
             self.assertEqual(reset["playAgainAccepted"], 0)
             self.assertEqual(sum(cell != 0 for row in reset["board"] for cell in row), 0)
         finally:
             second_client.disconnect()
 
-    def test_multiplayer_play_again_randomized_start_payload_is_consistent(self):
-        for starter in [1, 2]:
+    def test_multiplayer_play_again_reassigns_yellow_to_starter(self):
+        for starter_index in [0, 1]:
             games.clear()
             first_client = socketio.test_client(app)
             second_client = socketio.test_client(app)
@@ -435,14 +517,21 @@ class SocketGameTests(unittest.TestCase):
                     "playerId": created["playerId"],
                 })
                 find_event(first_client, "play_again_updated")
-                with patch("app.random.choice", return_value=starter):
+                with patch("app.random.choice", side_effect=lambda player_ids: player_ids[starter_index]):
                     second_client.emit("play_again", {
                         "gameId": joined["gameId"],
                         "playerId": joined["playerId"],
                     })
                 reset = find_event(first_client, "board_updated")
-                self.assertEqual(reset["currentPlayer"], starter)
-                self.assertEqual(reset["message"], f"Player {starter} turn")
+                reset_second = find_event(second_client, "board_updated")
+                self.assertNotEqual(reset["gameId"], created["gameId"])
+                self.assertEqual(reset_second["gameId"], reset["gameId"])
+                self.assertNotIn(created["gameId"], games)
+                self.assertIn(reset["gameId"], games)
+                self.assertEqual(reset["currentPlayer"], 1)
+                self.assertEqual(reset["message"], "Player 1 turn")
+                self.assertEqual(reset["playerNumber"], 1 if starter_index == 0 else 2)
+                self.assertEqual(reset_second["playerNumber"], 2 if starter_index == 0 else 1)
                 self.assertEqual(sum(cell != 0 for row in reset["board"] for cell in row), 0)
             finally:
                 first_client.disconnect()
@@ -480,7 +569,7 @@ class SocketGameTests(unittest.TestCase):
             other_left = find_event(self.client, "player_left")
             self.assertIsNotNone(left)
             self.assertIsNotNone(other_left)
-            self.assertEqual(other_left["message"], "Player 2 left the room")
+            self.assertEqual(other_left["message"], f"Player {joined['playerNumber']} left the room")
             self.assertNotIn(created["gameId"], games)
         finally:
             second_client.disconnect()

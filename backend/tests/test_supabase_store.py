@@ -1,11 +1,72 @@
 import os
 import unittest
 import uuid
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
 
 import supabase_store
+
+
+class FakeQuery:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def select(self, *_args):
+        return self
+
+    def eq(self, *_args):
+        return self
+
+    def execute(self):
+        return SimpleNamespace(data=self.rows)
+
+
+class FakeClient:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def table(self, _table_name):
+        return FakeQuery(self.rows)
+
+
+class RecordingQuery:
+    def __init__(self, client, table_name):
+        self.client = client
+        self.table_name = table_name
+
+    def insert(self, payload):
+        self.client.operations.append({"table": self.table_name, "action": "insert", "payload": payload})
+        return self
+
+    def upsert(self, payload, **kwargs):
+        self.client.operations.append({
+            "table": self.table_name,
+            "action": "upsert",
+            "payload": payload,
+            "kwargs": kwargs,
+        })
+        return self
+
+    def update(self, payload):
+        self.client.operations.append({"table": self.table_name, "action": "update", "payload": payload})
+        return self
+
+    def eq(self, *args):
+        self.client.operations[-1]["eq"] = args
+        return self
+
+    def execute(self):
+        return SimpleNamespace(data=[])
+
+
+class RecordingClient:
+    def __init__(self):
+        self.operations = []
+
+    def table(self, table_name):
+        return RecordingQuery(self, table_name)
 
 
 class SupabaseStoreTests(unittest.TestCase):
@@ -55,6 +116,53 @@ class SupabaseStoreTests(unittest.TestCase):
         self.assertTrue(players[1]["is_ai"])
         self.assertEqual(players[1]["ai_difficulty"], "hard")
 
+    def test_create_game_record_inserts_ai_game_and_players(self):
+        game_id = uuid.uuid4().hex
+        game = {"mode": "ai", "difficulty": "hard", "profile_id": "profile-1", "status": "playing"}
+        client = RecordingClient()
+
+        with patch.object(supabase_store, "get_client", return_value=client):
+            saved = supabase_store.create_game_record(game_id, game)
+
+        self.assertTrue(saved)
+        self.assertEqual([(op["table"], op["action"]) for op in client.operations], [
+            ("games", "insert"),
+            ("game_players", "insert"),
+        ])
+        player_rows = client.operations[1]["payload"]
+        self.assertEqual(len(player_rows), 2)
+        self.assertEqual({row["player_number"] for row in player_rows}, {1, 2})
+        self.assertEqual(player_rows[0]["profile_id"], "profile-1")
+        self.assertTrue(player_rows[1]["is_ai"])
+        self.assertTrue(all(row["game_id"] == str(uuid.UUID(game_id)) for row in player_rows))
+
+    def test_add_game_player_records_upserts_multiplayer_players(self):
+        game_id = uuid.uuid4().hex
+        game = {
+            "mode": "multiplayer",
+            "difficulty": "multiplayer",
+            "status": "playing",
+            "players": {
+                "first-player": {"piece": 2, "profile_id": "profile-1"},
+                "second-player": {"piece": 1, "profile_id": "profile-2"},
+            },
+        }
+        client = RecordingClient()
+
+        with patch.object(supabase_store, "get_client", return_value=client):
+            saved = supabase_store.add_game_player_records(game_id, game)
+
+        self.assertTrue(saved)
+        self.assertEqual([(op["table"], op["action"]) for op in client.operations], [
+            ("game_players", "upsert"),
+            ("games", "update"),
+        ])
+        player_rows = client.operations[0]["payload"]
+        self.assertEqual(client.operations[0]["kwargs"], {"on_conflict": "game_id,player_number"})
+        self.assertEqual({row["player_number"] for row in player_rows}, {1, 2})
+        self.assertEqual({row["profile_id"] for row in player_rows}, {"profile-1", "profile-2"})
+        self.assertTrue(all(row["game_id"] == str(uuid.UUID(game_id)) for row in player_rows))
+
     def test_record_move_increments_move_number_even_when_disabled(self):
         game_id = uuid.uuid4().hex
         game = {"move_number": 0}
@@ -73,6 +181,81 @@ class SupabaseStoreTests(unittest.TestCase):
 
         self.assertFalse(saved)
         self.assertEqual(game["move_number"], 1)
+
+    def test_fetch_completed_games_filters_and_formats_profile_games(self):
+        finished_id = str(uuid.uuid4())
+        active_id = str(uuid.uuid4())
+        rows = [
+            {
+                "player_number": 1,
+                "games": {
+                    "id": active_id,
+                    "mode": "ai",
+                    "difficulty": "medium",
+                    "status": "playing",
+                    "winner_player_number": None,
+                    "started_at": "2026-01-01T00:00:00+00:00",
+                    "ended_at": None,
+                },
+            },
+            {
+                "player_number": 1,
+                "games": {
+                    "id": finished_id,
+                    "mode": "ai",
+                    "difficulty": "hard",
+                    "status": "human_win",
+                    "winner_player_number": 1,
+                    "started_at": "2026-01-01T00:00:00+00:00",
+                    "ended_at": "2026-01-01T00:10:00+00:00",
+                },
+            },
+        ]
+
+        with patch.object(supabase_store, "get_client", return_value=FakeClient(rows)):
+            games = supabase_store.fetch_completed_games("profile-1")
+
+        self.assertEqual(len(games), 1)
+        self.assertEqual(games[0]["id"], finished_id)
+        self.assertEqual(games[0]["result"], "Win")
+        self.assertEqual(games[0]["playerNumber"], 1)
+
+    def test_fetch_completed_games_formats_loss_draw_and_sorts_newest_first(self):
+        older_id = str(uuid.uuid4())
+        draw_id = str(uuid.uuid4())
+        rows = [
+            {
+                "player_number": 1,
+                "games": {
+                    "id": older_id,
+                    "mode": "multiplayer",
+                    "difficulty": "multiplayer",
+                    "status": "player2_win",
+                    "winner_player_number": 2,
+                    "started_at": "2026-01-01T00:00:00+00:00",
+                    "ended_at": "2026-01-01T00:10:00+00:00",
+                },
+            },
+            {
+                "player_number": 2,
+                "games": [{
+                    "id": draw_id,
+                    "mode": "multiplayer",
+                    "difficulty": "multiplayer",
+                    "status": "draw",
+                    "winner_player_number": None,
+                    "started_at": "2026-01-02T00:00:00+00:00",
+                    "ended_at": "2026-01-02T00:10:00+00:00",
+                }],
+            },
+        ]
+
+        with patch.object(supabase_store, "get_client", return_value=FakeClient(rows)):
+            games = supabase_store.fetch_completed_games("profile-1")
+
+        self.assertEqual([game["id"] for game in games], [draw_id, older_id])
+        self.assertEqual(games[0]["result"], "Draw")
+        self.assertEqual(games[1]["result"], "Loss")
 
 
 if __name__ == "__main__":

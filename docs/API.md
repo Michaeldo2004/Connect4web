@@ -20,6 +20,36 @@ Response:
 }
 ```
 
+## Profile Games
+
+```text
+GET /api/profile/games
+```
+
+Requires `Authorization: Bearer <supabase-access-token>`.
+
+Returns games that ended with a win or draw.
+
+Response:
+
+```json
+{
+  "games": [
+    {
+      "id": "game-id",
+      "mode": "ai",
+      "difficulty": "medium",
+      "status": "human_win",
+      "winnerPlayerNumber": 1,
+      "startedAt": "2026-01-01T00:00:00+00:00",
+      "endedAt": "2026-01-01T00:10:00+00:00",
+      "playerNumber": 1,
+      "result": "Win"
+    }
+  ]
+}
+```
+
 ## Socket.IO Gameplay
 
 Gameplay uses Socket.IO at:
@@ -60,7 +90,7 @@ game_created { gameId, playerId, board, status, message, difficulty, mode }
 game_joined { gameId, board, status, message, difficulty, mode }
 multiplayer_game_created { gameId, playerId, playerNumber, playersConnected, board, status, message, mode }
 multiplayer_game_joined { gameId, playerId, playerNumber, playersConnected, board, status, message, mode }
-board_updated { gameId, board, status, message, aiMove, difficulty, mode, currentPlayer?, playersConnected?, disconnectDeadline?, playAgainAccepted? }
+board_updated { gameId, playerId?, board, status, message, aiMove, difficulty, mode, currentPlayer?, playersConnected?, disconnectDeadline?, playAgainAccepted? }
 play_again_updated { gameId, board, status, message, difficulty, mode, currentPlayer, playersConnected, playAgainAccepted }
 player_left { gameId, message }
 game_left { gameId }
@@ -103,7 +133,7 @@ Response event: `game_created`
 }
 ```
 
-AI games randomize the starting side. If AI starts, `game_created` may include an AI opening move and a board with one AI piece already placed.
+AI games randomize the starting side. If AI starts, `game_created` returns the empty board with `currentPlayer: 2` and `message: "AI is thinking"`, then `board_updated` carries the recorded AI opening move.
 
 ### `join_game`
 
@@ -156,7 +186,7 @@ Response event: `multiplayer_game_created`
 }
 ```
 
-`currentPlayer` is randomized when the second player joins.
+The starter is randomized when the second player joins. The starter is assigned `playerNumber: 1`, which renders as yellow, and `currentPlayer` starts at `1`.
 
 ### `join_multiplayer_game`
 
@@ -185,15 +215,17 @@ Response event: `multiplayer_game_joined`
 {
   "gameId": "generated-game-id",
   "playerId": "player-two-id",
-  "playerNumber": 2,
+  "playerNumber": 1,
   "playersConnected": 2,
   "status": "playing",
-  "message": "Player 2 turn",
+  "message": "Player 1 turn",
   "difficulty": "multiplayer",
   "mode": "multiplayer",
-  "currentPlayer": 2
+  "currentPlayer": 1
 }
 ```
+
+The joining player can be assigned `playerNumber: 1` or `playerNumber: 2`. Player 1 is always yellow and always starts the current multiplayer game.
 
 ### Multiplayer Disconnect Rule
 
@@ -233,18 +265,21 @@ When one player accepts, the server emits `play_again_updated`:
 }
 ```
 
-When both players accept, the server resets the board and emits `board_updated` with:
+When both players accept, the server creates a new game id, resets the board, and emits `board_updated` with:
 
 ```json
 {
+  "gameId": "new-generated-game-id",
+  "playerId": "same-player-id",
   "status": "playing",
-  "message": "Player 2 turn",
-  "currentPlayer": 2,
+  "message": "Player 1 turn",
+  "currentPlayer": 1,
+  "mode": "multiplayer",
   "playAgainAccepted": 0
 }
 ```
 
-The rematch starting player is randomized.
+The rematch starting player is randomized, then assigned `playerNumber: 1` so yellow always starts. Clients replace the URL with `/game/{newId}`.
 
 ### `leave_game`
 
@@ -303,7 +338,7 @@ Invalid moves emit `invalid_move`.
 
 ## REST
 
-React gameplay uses Socket.IO. REST only exposes `GET /api/health` and `POST /api/new-game`.
+React gameplay uses Socket.IO. REST exposes `GET /api/health`, `GET /api/profile/games`, and `POST /api/new-game`.
 
 ## Difficulty Values
 
@@ -318,8 +353,8 @@ hard = depth 7, 5s
 
 ```text
 0 = empty
-1 = human
-2 = AI
+1 = yellow / human / player 1
+2 = red / AI / player 2
 ```
 
 ## Status Values
@@ -336,3 +371,5 @@ invalid_move
 ```
 
 Frontend status text is green only when the local player can move and displays `Your turn`. Opponent turns and AI thinking states display in red.
+
+Profile history treats win and draw statuses as completed games: `human_win`, `ai_win`, `player1_win`, `player2_win`, and `draw`.

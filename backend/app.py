@@ -10,7 +10,7 @@ import jwt
 import numpy as np
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from flask_socketio import SocketIO, emit, join_room
+from flask_socketio import SocketIO, emit, join_room, leave_room
 
 import supabase_store
 from ai.minimax import get_best_move, normalize_transposition_table
@@ -25,6 +25,7 @@ MAX_ACTIVE_GAMES = 300
 AI_GAME_TTL_SECONDS = 30 * 60
 MULTIPLAYER_GAME_TTL_SECONDS = 2 * 60 * 60
 FINISHED_STATUSES = {"human_win", "ai_win", "player1_win", "player2_win", "draw"}
+COMPLETED_STATUSES = {"human_win", "ai_win", "player1_win", "player2_win", "draw"}
 DIFFICULTIES = {
     "very_easy": {"depth": 1, "time_limit": 3},
     "easy": {"depth": 2, "time_limit": 3},
@@ -101,15 +102,48 @@ def is_auth_required():
     return app.config.get("AUTH_REQUIRED", AUTH_REQUIRED)
 
 
+def get_auth_field(value, name):
+    if isinstance(value, dict):
+        return value.get(name)
+    return getattr(value, name, None)
+
+
+def auth_context_from_user(user):
+    profile_id = get_auth_field(user, "id")
+    if not profile_id:
+        return None, "Invalid session"
+    return {"profile_id": profile_id, "email": get_auth_field(user, "email")}, None
+
+
+def auth_context_from_claims(claims):
+    profile_id = claims.get("sub")
+    if not profile_id:
+        return None, "Invalid session"
+    return {"profile_id": profile_id, "email": claims.get("email")}, None
+
+
+def verify_access_token_with_supabase(access_token):
+    client = supabase_store.get_client()
+    if client is None:
+        return None, "Authentication is not configured"
+
+    try:
+        response = client.auth.get_user(access_token)
+    except Exception:
+        return None, "Invalid session"
+
+    return auth_context_from_user(get_auth_field(response, "user"))
+
+
 def verify_access_token(access_token):
     if not is_auth_required():
         return {"profile_id": None, "email": None}, None
 
-    if not SUPABASE_JWT_SECRET:
-        return None, "Authentication is not configured"
-
     if not access_token:
         return None, "Login required"
+
+    if not SUPABASE_JWT_SECRET:
+        return verify_access_token_with_supabase(access_token)
 
     try:
         claims = jwt.decode(access_token, SUPABASE_JWT_SECRET, algorithms=["HS256"], audience="authenticated")
@@ -126,15 +160,17 @@ def verify_access_token(access_token):
     except jwt.PyJWTError:
         return None, "Invalid session"
 
-    profile_id = claims.get("sub")
-    if not profile_id:
-        return None, "Invalid session"
-
-    return {"profile_id": profile_id, "email": claims.get("email")}, None
+    return auth_context_from_claims(claims)
 
 
 def authenticate_payload(data):
     access_token = data.get("accessToken") if isinstance(data, dict) else None
+    return verify_access_token(access_token)
+
+
+def authenticate_request():
+    auth_header = request.headers.get("Authorization", "")
+    access_token = auth_header.removeprefix("Bearer ").strip()
     return verify_access_token(access_token)
 
 
@@ -151,6 +187,7 @@ def empty_response(difficulty="medium"):
 
 def create_game_state(difficulty, player_id=None, profile_id=None):
     now = time.time()
+    current_player = random.choice([HUMAN, AI])
     return {
         "mode": "ai",
         "player_id": player_id or uuid.uuid4().hex,
@@ -159,8 +196,8 @@ def create_game_state(difficulty, player_id=None, profile_id=None):
         "board": create_board(),
         "difficulty": difficulty,
         "status": "playing",
-        "message": "Your turn",
-        "current_player": random.choice([HUMAN, AI]),
+        "message": "AI is thinking" if current_player == AI else "Your turn",
+        "current_player": current_player,
         "transposition_table": {},
         "move_number": 0,
         "lock": threading.Lock(),
@@ -187,7 +224,7 @@ def create_multiplayer_game_state(player_id=None, profile_id=None):
         "difficulty": "multiplayer",
         "status": "waiting",
         "message": "Waiting for Player 2",
-        "current_player": random.choice([HUMAN, AI]),
+        "current_player": HUMAN,
         "disconnect_deadline": None,
         "rematch_requests": set(),
         "move_number": 0,
@@ -195,6 +232,20 @@ def create_multiplayer_game_state(player_id=None, profile_id=None):
         "created_at": now,
         "updated_at": now,
     }
+
+
+def assign_multiplayer_pieces(game, starter_player_id=None):
+    player_ids = list(game.get("players", {}).keys())
+    if len(player_ids) < 2:
+        game["current_player"] = HUMAN
+        return
+
+    starter_id = starter_player_id if starter_player_id in game["players"] else random.choice(player_ids)
+    if starter_id not in game["players"]:
+        starter_id = player_ids[0]
+    for current_player_id, player in game["players"].items():
+        player["piece"] = HUMAN if current_player_id == starter_id else AI
+    game["current_player"] = HUMAN
 
 
 def get_game_lock(game):
@@ -255,6 +306,14 @@ def remove_ai_games_for_sid(socket_id):
 def store_game(game_id, game):
     with games_lock:
         games[game_id] = game
+
+
+def replace_game_id(old_game_id, game):
+    new_game_id = uuid.uuid4().hex
+    with games_lock:
+        games.pop(old_game_id, None)
+        games[new_game_id] = game
+    return new_game_id
 
 
 def pop_game(game_id):
@@ -365,12 +424,16 @@ def apply_ai_turn(game, game_id=None):
     return ai_move, None
 
 
-def start_ai_game_if_needed(game, game_id=None):
+def emit_ai_turn_if_needed(game_id, game):
     if game.get("current_player") != AI:
-        game["message"] = "Your turn"
-        return None, None
+        return
 
-    return apply_ai_turn(game, game_id)
+    ai_move, error = apply_ai_turn(game, game_id)
+    if error:
+        socketio.emit("invalid_move", make_socket_error(game_id, game, error), to=game_id)
+        return
+
+    socketio.emit("board_updated", serialize_game(game_id, game, ai_move=ai_move), to=game_id)
 
 
 def make_socket_error(game_id, game, message):
@@ -597,14 +660,44 @@ def is_multiplayer_finished(game):
     return game["status"] in {"player1_win", "player2_win", "draw"}
 
 
+def is_completed_game(game):
+    return game["status"] in COMPLETED_STATUSES
+
+
+def finalize_or_delete_previous_game(game_id, game):
+    if is_completed_game(game):
+        supabase_store.update_game_record(game_id, game)
+    else:
+        supabase_store.delete_game_record(game_id)
+
+
 def reset_multiplayer_game(game):
+    now = time.time()
     game["board"] = create_board()
     game["status"] = "playing" if len(game["players"]) == 2 else "waiting"
-    game["current_player"] = random.choice([HUMAN, AI])
+    assign_multiplayer_pieces(game)
     game["message"] = f"Player {game['current_player']} turn" if len(game["players"]) == 2 else "Waiting for Player 2"
     game["disconnect_deadline"] = None
     game["rematch_requests"] = set()
+    game["move_number"] = 0
+    game["created_at"] = now
     mark_game_updated(game)
+
+
+def move_multiplayer_room(old_game_id, new_game_id, game):
+    for player in game.get("players", {}).values():
+        socket_id = player.get("socket_id")
+        if not socket_id:
+            continue
+        socketio.server.enter_room(socket_id, new_game_id, namespace="/")
+        socketio.server.leave_room(socket_id, old_game_id, namespace="/")
+
+
+def emit_multiplayer_board_update(game_id, game):
+    for player_id, player in game.get("players", {}).items():
+        socket_id = player.get("socket_id")
+        if socket_id:
+            socketio.emit("board_updated", serialize_game(game_id, game, player_id=player_id), to=socket_id)
 
 
 @app.get("/api/health")
@@ -617,6 +710,19 @@ def new_game():
     data = request.get_json(silent=True) or {}
     difficulty = parse_difficulty(data)
     return jsonify(empty_response(difficulty))
+
+
+@app.get("/api/profile/games")
+def profile_games():
+    auth_context, auth_error = authenticate_request()
+    if auth_error:
+        return jsonify({"message": auth_error}), 401
+
+    profile_id = auth_context.get("profile_id")
+    if not profile_id:
+        return jsonify({"message": "Login required"}), 401
+
+    return jsonify({"games": supabase_store.fetch_completed_games(profile_id)})
 
 
 @socketio.on("create_game")
@@ -636,15 +742,10 @@ def socket_create_game(data):
     game_id = uuid.uuid4().hex
     game = create_game_state(difficulty, profile_id=auth_context["profile_id"])
     supabase_store.create_game_record(game_id, game)
-    ai_move, error = start_ai_game_if_needed(game, game_id)
-    if error:
-        supabase_store.delete_game_record(game_id)
-        emit("invalid_move", make_socket_error(game_id, game, error))
-        return
-
     store_game(game_id, game)
     join_room(game_id)
-    emit("game_created", serialize_game(game_id, game, ai_move=ai_move, include_player_id=True))
+    emit("game_created", serialize_game(game_id, game, include_player_id=True))
+    emit_ai_turn_if_needed(game_id, game)
 
 
 @socketio.on("join_game")
@@ -752,16 +853,16 @@ def socket_join_multiplayer_game(data):
             "connected": True,
             "disconnect_token": None,
         }
+        assign_multiplayer_pieces(game)
         game["status"] = "playing"
         game["message"] = f"Player {game['current_player']} turn"
         mark_game_updated(game)
         supabase_store.add_game_player_records(game_id, game)
         joined_payload = serialize_game(game_id, game, player_id=player_id)
-        updated_payload = serialize_game(game_id, game)
     join_room(game_id)
     print(f"Player 2 connected to game {game_id}")
     emit("multiplayer_game_joined", joined_payload)
-    emit("board_updated", updated_payload, to=game_id)
+    emit_multiplayer_board_update(game_id, game)
 
 
 @socketio.on("disconnect")
@@ -801,7 +902,7 @@ def socket_leave_game(data):
         return
 
     if game.get("mode") != "multiplayer":
-        if game["status"] in FINISHED_STATUSES:
+        if is_completed_game(game):
             supabase_store.update_game_record(game_id, game)
         else:
             supabase_store.delete_game_record(game_id)
@@ -824,7 +925,7 @@ def socket_leave_game(data):
 
         if is_multiplayer_finished(game):
             left_payload = {"gameId": game_id, "message": f"Player {player['piece']} left the room"}
-            supabase_store.update_game_record(game_id, game)
+            finalize_or_delete_previous_game(game_id, game)
             pop_game(game_id)
             socketio.emit("player_left", left_payload, to=game_id, skip_sid=request.sid)
             emit("game_left", {"gameId": game_id})
@@ -850,10 +951,13 @@ def socket_play_again(data):
         mark_game_updated(game)
 
         if len(game["rematch_requests"]) == 2 and all(player.get("connected") for player in game["players"].values()):
+            finalize_or_delete_previous_game(game_id, game)
             reset_multiplayer_game(game)
-            supabase_store.reset_game_record(game_id, game)
-            payload = serialize_game(game_id, game)
-            event_name = "board_updated"
+            new_game_id = replace_game_id(game_id, game)
+            move_multiplayer_room(game_id, new_game_id, game)
+            supabase_store.create_game_record(new_game_id, game)
+            emit_multiplayer_board_update(new_game_id, game)
+            return
         else:
             payload = serialize_game(game_id, game)
             event_name = "play_again_updated"
@@ -905,35 +1009,28 @@ def socket_reset_game(data):
 
     if game.get("mode") == "multiplayer":
         with get_game_lock(game):
+            finalize_or_delete_previous_game(game_id, game)
             reset_multiplayer_game(game)
-            supabase_store.reset_game_record(game_id, game)
-            payload = serialize_game(game_id, game)
-        emit("board_updated", payload, to=game_id)
+            new_game_id = replace_game_id(game_id, game)
+            move_multiplayer_room(game_id, new_game_id, game)
+            supabase_store.create_game_record(new_game_id, game)
+        emit_multiplayer_board_update(new_game_id, game)
         return
 
     with get_game_lock(game):
         difficulty = parse_difficulty(data or {})
-        game["board"] = create_board()
-        game["difficulty"] = difficulty
-        game["status"] = "playing"
-        game["current_player"] = random.choice([HUMAN, AI])
-        game["message"] = "Your turn"
-        game["transposition_table"] = {}
-        game["move_number"] = 0
-        game["socket_id"] = request.sid
-        mark_game_updated(game)
-        supabase_store.reset_game_record(game_id, game)
-        ai_move, error = start_ai_game_if_needed(game, game_id)
-        if error:
-            invalid_payload = make_socket_error(game_id, game, error)
-        else:
-            payload = serialize_game(game_id, game, ai_move=ai_move)
+        previous_player_id = game["player_id"]
+        previous_profile_id = game.get("profile_id")
+        finalize_or_delete_previous_game(game_id, game)
+        new_game = create_game_state(difficulty, player_id=previous_player_id, profile_id=previous_profile_id)
+        new_game_id = replace_game_id(game_id, new_game)
+        supabase_store.create_game_record(new_game_id, new_game)
+        leave_room(game_id)
+        join_room(new_game_id)
+        payload = serialize_game(new_game_id, new_game, include_player_id=True)
 
-    if error:
-        emit("invalid_move", invalid_payload)
-        return
-
-    emit("board_updated", payload, to=game_id)
+    emit("board_updated", payload)
+    emit_ai_turn_if_needed(new_game_id, new_game)
 
 
 if __name__ == "__main__":

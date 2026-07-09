@@ -11,9 +11,10 @@ const SETUP_PATH = getEnvRoute("VITE_SETUP_PATH", "/");
 const GAME_PATH = getEnvRoute("VITE_GAME_PATH", "/game");
 const LOGIN_PATH = getEnvRoute("VITE_LOGIN_PATH", "/login");
 const SIGNUP_PATH = getEnvRoute("VITE_SIGNUP_PATH", "/signup");
+const PROFILE_PATH = getEnvRoute("VITE_PROFILE_PATH", "/profiles");
 const TOS_PATH = getEnvRoute("VITE_TOS_PATH", "/tos");
 const PRIVACY_POLICY_PATH = getEnvRoute("VITE_PRIVACY_POLICY_PATH", "/privacypolicy");
-const APP_PATHS = new Set([SETUP_PATH, GAME_PATH, LOGIN_PATH, SIGNUP_PATH, TOS_PATH, PRIVACY_POLICY_PATH]);
+const APP_PATHS = new Set([SETUP_PATH, GAME_PATH, LOGIN_PATH, SIGNUP_PATH, PROFILE_PATH, TOS_PATH, PRIVACY_POLICY_PATH]);
 const ROWS = 6;
 const COLS = 7;
 
@@ -260,7 +261,46 @@ function formatDifficulty(difficulty) {
   return difficulty.replace("_", " ");
 }
 
+function formatDateTime(value) {
+  if (!value) {
+    return "-";
+  }
+
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(new Date(value));
+}
+
+function formatGameStatus(status) {
+  return status.replace("_", " ");
+}
+
+function isGamePath(pathname) {
+  return pathname === GAME_PATH || pathname.startsWith(`${GAME_PATH}/`);
+}
+
+function gamePath(gameId) {
+  return gameId ? `${GAME_PATH}/${encodeURIComponent(gameId)}` : GAME_PATH;
+}
+
+function getRouteGameId() {
+  if (!isGamePath(window.location.pathname) || window.location.pathname === GAME_PATH) {
+    return null;
+  }
+
+  const [gameId] = window.location.pathname.slice(GAME_PATH.length + 1).split("/");
+  return gameId ? decodeURIComponent(gameId) : null;
+}
+
 function getCurrentPath() {
+  if (isGamePath(window.location.pathname)) {
+    return GAME_PATH;
+  }
+
   return APP_PATHS.has(window.location.pathname) ? window.location.pathname : SETUP_PATH;
 }
 
@@ -299,6 +339,10 @@ function App() {
     password: "",
   });
   const [authSession, setAuthSession] = useState(null);
+  const [userProfile, setUserProfile] = useState(null);
+  const [profileGames, setProfileGames] = useState([]);
+  const [profileLoading, setProfileLoading] = useState(false);
+  const [profileError, setProfileError] = useState("");
   const [authReady, setAuthReady] = useState(!supabaseClient);
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState("");
@@ -342,10 +386,9 @@ function App() {
 
   const redirectTo = useCallback((path, replace = false) => {
     if (window.location.pathname !== path) {
-      window.location[replace ? "replace" : "assign"](path);
-      return;
+      window.history[replace ? "replaceState" : "pushState"]({}, "", path);
     }
-    setRoutePath(path);
+    setRoutePath(getCurrentPath());
   }, []);
 
   useEffect(() => {
@@ -417,6 +460,9 @@ function App() {
     setSelectedDifficulty(data.difficulty || DEFAULT_DIFFICULTY);
     setGameMode(data.mode || GAME_MODE_AI);
     setCurrentPlayer(data.currentPlayer || PLAYER);
+    if (data.playerNumber) {
+      setPlayerNumber(data.playerNumber);
+    }
     setPlayersConnected(data.playersConnected || 0);
     setDisconnectDeadline(data.disconnectDeadline || null);
     setPlayAgainAccepted(data.playAgainAccepted || 0);
@@ -424,7 +470,7 @@ function App() {
       setPlayAgainRequested(false);
     }
     setGameStarted(true);
-    setBusy(false);
+    setBusy(data.mode !== GAME_MODE_MULTIPLAYER && data.currentPlayer === AI && data.status === "playing");
 
     if (data.mode === GAME_MODE_MULTIPLAYER && playerColumn !== null) {
       setPlayerMoves((currentMoves) => [playerColumn, ...currentMoves]);
@@ -442,6 +488,69 @@ function App() {
     };
   }, [authSession]);
 
+  const loadUserProfile = useCallback(async (session) => {
+    if (!supabaseClient || !session?.user?.id) {
+      setUserProfile(null);
+      return;
+    }
+
+    const { data, error } = await supabaseClient
+      .from("profiles")
+      .select("username,display_name")
+      .eq("id", session.user.id)
+      .maybeSingle();
+
+    if (error) {
+      setUserProfile(null);
+      return;
+    }
+
+    setUserProfile(data || null);
+  }, []);
+
+  const loadProfileGames = useCallback(async () => {
+    if (!authSession?.access_token) {
+      setProfileGames([]);
+      return;
+    }
+
+    setProfileLoading(true);
+    setProfileError("");
+    try {
+      const response = await fetch(`${SOCKET_URL}/api/profile/games`, {
+        headers: {
+          Authorization: `Bearer ${authSession.access_token}`,
+        },
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data?.message || "Could not load profile games");
+      }
+      setProfileGames(data.games || []);
+    } catch (error) {
+      setProfileError(error.message);
+      setProfileGames([]);
+    } finally {
+      setProfileLoading(false);
+    }
+  }, [authSession]);
+
+  useEffect(() => {
+    if (!authSession) {
+      setUserProfile(null);
+      setProfileGames([]);
+      return;
+    }
+
+    loadUserProfile(authSession);
+  }, [authSession, loadUserProfile]);
+
+  useEffect(() => {
+    if (routePath === PROFILE_PATH && authSession) {
+      loadProfileGames();
+    }
+  }, [authSession, loadProfileGames, routePath]);
+
   useEffect(() => {
     const nextSocket = io(SOCKET_URL, { transports: ["websocket"] });
     setSocketClient(nextSocket);
@@ -451,6 +560,7 @@ function App() {
         return;
       }
 
+      const routeGameId = getRouteGameId();
       const pendingGame = takePendingGame();
       if (pendingGame) {
         clearSession();
@@ -473,14 +583,19 @@ function App() {
       }
 
       const multiplayerSession = loadMultiplayerSession();
-      if (multiplayerSession) {
+      if (multiplayerSession && (!routeGameId || multiplayerSession.gameId === routeGameId)) {
         nextSocket.emit("join_multiplayer_game", authPayload(multiplayerSession));
         return;
       }
 
       const storedSession = loadSession();
-      if (storedSession) {
+      if (storedSession && (!routeGameId || storedSession.gameId === routeGameId)) {
         nextSocket.emit("join_game", authPayload(storedSession));
+        return;
+      }
+
+      if (routeGameId) {
+        nextSocket.emit("join_multiplayer_game", authPayload({ gameId: routeGameId }));
       }
     }
 
@@ -503,8 +618,8 @@ function App() {
       setPlayerMoves([]);
       setAiMoves([]);
       setGameStarted(true);
-      setBusy(false);
-      redirectTo(GAME_PATH);
+      setBusy(data.mode !== GAME_MODE_MULTIPLAYER && data.currentPlayer === AI && data.status === "playing");
+      redirectTo(gamePath(data.gameId));
     }
 
     function handleGameJoined(data) {
@@ -526,8 +641,8 @@ function App() {
       setPlayerMoves([]);
       setAiMoves([]);
       setGameStarted(true);
-      setBusy(false);
-      redirectTo(GAME_PATH, true);
+      setBusy(data.mode !== GAME_MODE_MULTIPLAYER && data.currentPlayer === AI && data.status === "playing");
+      redirectTo(gamePath(data.gameId), true);
     }
 
     function handleMultiplayerGameStarted(data) {
@@ -550,7 +665,7 @@ function App() {
       setAiMoves([]);
       setGameStarted(true);
       setBusy(false);
-      redirectTo(GAME_PATH);
+      redirectTo(gamePath(data.gameId));
       console.log(`Player ${data.playerNumber} connected`);
     }
 
@@ -571,6 +686,20 @@ function App() {
     }
 
     async function handleBoardUpdated(data) {
+      if (data.gameId) {
+        setGameId(data.gameId);
+        if (data.playerId) {
+          setPlayerId(data.playerId);
+          if (data.mode === GAME_MODE_MULTIPLAYER) {
+            clearSession();
+            saveMultiplayerSession(data.gameId, data.playerId);
+          } else {
+            clearMultiplayerSession();
+            saveSession(data.gameId, data.playerId);
+          }
+        }
+        redirectTo(gamePath(data.gameId), true);
+      }
       await applyServerBoard(data);
     }
 
@@ -677,8 +806,21 @@ function App() {
 
     clearSession();
     clearMultiplayerSession();
-    savePendingMultiplayerJoin(requestedGameId);
-    window.location.assign(GAME_PATH);
+    setGameMode(GAME_MODE_MULTIPLAYER);
+    setPlayerNumber(null);
+    setCurrentPlayer(PLAYER);
+    setBoard(emptyBoard());
+    setAnimatedPieces([]);
+    setWinningPieces([]);
+    setPlayerMoves([]);
+    setAiMoves([]);
+    setGameId(requestedGameId);
+    setPlayerId(null);
+    setStatus("waiting");
+    setMessage("Joining multiplayer room...");
+    setGameStarted(false);
+    setBusy(true);
+    socketClient.emit("join_multiplayer_game", authPayload({ gameId: requestedGameId }));
   }
 
   function requestNewGame() {
@@ -700,14 +842,34 @@ function App() {
     }
 
     if (!gameStarted && selectedSetupMode === GAME_MODE_MULTIPLAYER) {
-      savePendingGame(GAME_MODE_MULTIPLAYER, selectedDifficulty);
-      window.location.assign(GAME_PATH);
+      startMultiplayerGame();
       return;
     }
 
     if (!gameStarted) {
-      savePendingGame(GAME_MODE_AI, selectedDifficulty);
-      window.location.assign(GAME_PATH);
+      if (!socketClient?.connected) {
+        setStatus("error");
+        setMessage(`Flask SocketIO is not responding at ${SOCKET_URL}`);
+        return;
+      }
+
+      clearSession();
+      clearMultiplayerSession();
+      pendingMoveRef.current = null;
+      setGameMode(GAME_MODE_AI);
+      setCurrentPlayer(PLAYER);
+      setBoard(emptyBoard());
+      setAnimatedPieces([]);
+      setWinningPieces([]);
+      setPlayerMoves([]);
+      setAiMoves([]);
+      setGameId(null);
+      setPlayerId(null);
+      setStatus("waiting");
+      setMessage("Creating game...");
+      setGameStarted(false);
+      setBusy(true);
+      socketClient.emit("create_game", authPayload({ difficulty: selectedDifficulty }));
       return;
     }
 
@@ -774,12 +936,12 @@ function App() {
       return;
     }
 
-      if (!socketClient?.connected || !gameId || !playerId) {
-        return;
-      }
+    if (!socketClient?.connected || !gameId || !playerId || currentPlayer !== PLAYER) {
+      return;
+    }
 
-      setBusy(true);
-      setMessage("AI is thinking...");
+    setBusy(true);
+    setMessage("AI is thinking...");
     const playerBoard = applyLocalMove(board, column, PLAYER);
     const playerPieces = findChangedPieces(board, playerBoard);
     pendingMoveRef.current = {
@@ -918,6 +1080,7 @@ function App() {
             username,
             display_name: username,
           });
+          setUserProfile({ username, display_name: username });
           setAuthSession(data.session);
           setAuthOpen(false);
           if (routePath === LOGIN_PATH || routePath === SIGNUP_PATH) {
@@ -975,9 +1138,11 @@ function App() {
     !busy &&
     !gameOver &&
     status === "playing" &&
-    (gameMode !== GAME_MODE_MULTIPLAYER || (playerNumber === currentPlayer && playersConnected === 2));
+    ((gameMode === GAME_MODE_AI && currentPlayer === PLAYER) ||
+      (gameMode === GAME_MODE_MULTIPLAYER && playerNumber === currentPlayer && playersConnected === 2));
   const showingSetup = routePath === SETUP_PATH;
   const showingGame = routePath === GAME_PATH;
+  const showingProfile = routePath === PROFILE_PATH;
   const showingLegalPage = routePath === TOS_PATH || routePath === PRIVACY_POLICY_PATH;
   let displayMessage = message;
   if (!gameOver && canDropPiece) {
@@ -1001,6 +1166,7 @@ function App() {
   const playerMoveLabel = gameMode === GAME_MODE_MULTIPLAYER ? "Your moves" : "Your moves";
   const opponentMoveLabel = gameMode === GAME_MODE_MULTIPLAYER ? "Other player's moves" : "AI moves";
   const isAuthenticated = Boolean(authSession);
+  const accountName = userProfile?.display_name || userProfile?.username || authSession?.user?.user_metadata?.username || "Account";
   const authForm = (
     <>
       <div className="auth-mode-tabs" role="tablist" aria-label="Auth mode">
@@ -1145,6 +1311,52 @@ function App() {
       <strong>{message}</strong>
     </section>
   );
+  const profileView = (
+    <section className="profile-page">
+      <div className="profile-header">
+        <div>
+          <span>Player</span>
+          <strong>{accountName}</strong>
+        </div>
+        <button type="button" onClick={loadProfileGames} disabled={profileLoading}>
+          Refresh
+        </button>
+      </div>
+      {profileError ? <strong className="profile-error">{profileError}</strong> : null}
+      {profileLoading ? (
+        <section className="profile-empty">
+          <strong>Loading games...</strong>
+        </section>
+      ) : profileGames.length === 0 ? (
+        <section className="profile-empty">
+          <strong>No completed games</strong>
+        </section>
+      ) : (
+        <section className="profile-games" aria-label="Completed games">
+          {profileGames.map((game) => (
+            <article className="profile-game-row" key={game.id}>
+              <div>
+                <span>{game.mode === GAME_MODE_MULTIPLAYER ? "Vs Player" : `AI - ${formatDifficulty(game.difficulty || DEFAULT_DIFFICULTY)}`}</span>
+                <strong>{game.result}</strong>
+              </div>
+              <div>
+                <span>Status</span>
+                <strong>{formatGameStatus(game.status)}</strong>
+              </div>
+              <div>
+                <span>Played</span>
+                <strong>{formatDateTime(game.endedAt || game.startedAt)}</strong>
+              </div>
+              <div>
+                <span>Room</span>
+                <strong>{game.id}</strong>
+              </div>
+            </article>
+          ))}
+        </section>
+      )}
+    </section>
+  );
   const gameView = (
     <>
       <section className="status-panel">
@@ -1248,7 +1460,7 @@ function App() {
   ) : null;
   const legalView = <section className="blank-page" aria-label={routePath === TOS_PATH ? "Terms of Service" : "Privacy Policy"} />;
   let pageView = setupView;
-  if (!authReady && (showingSetup || showingGame)) {
+  if (!authReady && (showingSetup || showingGame || showingProfile)) {
     pageView = loadingView;
   } else if (routePath === LOGIN_PATH || routePath === SIGNUP_PATH) {
     pageView = authPageView;
@@ -1256,6 +1468,10 @@ function App() {
     pageView = authRequiredView;
   } else if (showingGame) {
     pageView = gameStarted ? gameView : loadingView;
+  } else if (showingProfile && !isAuthenticated) {
+    pageView = authRequiredView;
+  } else if (showingProfile) {
+    pageView = profileView;
   } else if (showingLegalPage) {
     pageView = legalView;
   }
@@ -1268,7 +1484,13 @@ function App() {
         </a>
         {isAuthenticated ? (
           <div className="account-actions">
-            <span>{authSession.user?.email || "Account"}</span>
+            <a className="auth-route-link" href={PROFILE_PATH} onClick={(event) => {
+              event.preventDefault();
+              redirectTo(PROFILE_PATH);
+            }}>
+              Profile
+            </a>
+            <span>{accountName}</span>
             <button className="auth-open-button" type="button" onClick={logout}>
               Logout
             </button>
@@ -1296,8 +1518,11 @@ function App() {
           <a href={TOS_PATH}>Terms of Service</a>
           <span>Contact</span>
           <span>About</span>
+          <a href="https://github.com/Michaeldo2004/Connect4web" target="_blank" rel="noreferrer">
+            Repository
+          </a>
         </nav>
-        <span>Version 0.1</span>
+        <span>Connect4web by Michael D</span>
       </footer>
 
       {authOpen ? (

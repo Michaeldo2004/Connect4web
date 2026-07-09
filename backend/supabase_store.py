@@ -4,7 +4,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-FINISHED_STATUSES = {"human_win", "ai_win", "player1_win", "player2_win", "draw", "abandoned"}
+COMPLETED_STATUSES = {"human_win", "ai_win", "player1_win", "player2_win", "draw"}
+GAME_OVER_STATUSES = COMPLETED_STATUSES | {"abandoned"}
 WINNER_BY_STATUS = {
     "human_win": 1,
     "ai_win": 2,
@@ -103,7 +104,7 @@ def winner_for_status(status):
 
 def game_payload(game_id, game):
     status = game.get("status", "playing")
-    finished = status in FINISHED_STATUSES
+    finished = status in GAME_OVER_STATUSES
     payload = {
         "id": db_game_id(game_id),
         "mode": game.get("mode", "ai"),
@@ -245,3 +246,52 @@ def record_move(game_id, game, player_number, column, board_before, board_after,
         client.table("game_moves").insert(payload).execute()
 
     return execute_safely(action)
+
+
+def completed_game_result(game_data, player_number):
+    status = game_data.get("status")
+    winner = game_data.get("winner_player_number")
+    if status == "draw":
+        return "Draw"
+    if winner is None:
+        return "Unknown"
+    return "Win" if winner == player_number else "Loss"
+
+
+def fetch_completed_games(profile_id):
+    client = get_client()
+    if client is None or not profile_id:
+        return []
+
+    response = (
+        client.table("game_players")
+        .select(
+            "player_number,is_ai,ai_difficulty,display_name_snapshot,"
+            "games(id,mode,difficulty,status,winner_player_number,started_at,ended_at)"
+        )
+        .eq("profile_id", profile_id)
+        .execute()
+    )
+
+    completed_games = []
+    for row in response.data or []:
+        game_data = row.get("games") or {}
+        if isinstance(game_data, list):
+            game_data = game_data[0] if game_data else {}
+        if game_data.get("status") not in COMPLETED_STATUSES:
+            continue
+
+        player_number = row.get("player_number")
+        completed_games.append({
+            "id": game_data.get("id"),
+            "mode": game_data.get("mode"),
+            "difficulty": game_data.get("difficulty"),
+            "status": game_data.get("status"),
+            "winnerPlayerNumber": game_data.get("winner_player_number"),
+            "startedAt": game_data.get("started_at"),
+            "endedAt": game_data.get("ended_at"),
+            "playerNumber": player_number,
+            "result": completed_game_result(game_data, player_number),
+        })
+
+    return sorted(completed_games, key=lambda game: game.get("endedAt") or game.get("startedAt") or "", reverse=True)
