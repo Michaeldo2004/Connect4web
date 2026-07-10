@@ -9,12 +9,13 @@ const PENDING_MULTIPLAYER_JOIN_KEY = "connect4_pending_multiplayer_join";
 const SOCKET_URL = getEnvString("VITE_BACKEND_URL", "http://localhost:5000").replace(/\/+$/, "");
 const SETUP_PATH = getEnvRoute("VITE_SETUP_PATH", "/");
 const GAME_PATH = getEnvRoute("VITE_GAME_PATH", "/game");
+const JOIN_PATH = getEnvRoute("VITE_JOIN_PATH", "/join");
 const LOGIN_PATH = getEnvRoute("VITE_LOGIN_PATH", "/login");
 const SIGNUP_PATH = getEnvRoute("VITE_SIGNUP_PATH", "/signup");
 const PROFILE_PATH = getEnvRoute("VITE_PROFILE_PATH", "/profiles");
 const TOS_PATH = getEnvRoute("VITE_TOS_PATH", "/tos");
 const PRIVACY_POLICY_PATH = getEnvRoute("VITE_PRIVACY_POLICY_PATH", "/privacypolicy");
-const APP_PATHS = new Set([SETUP_PATH, GAME_PATH, LOGIN_PATH, SIGNUP_PATH, PROFILE_PATH, TOS_PATH, PRIVACY_POLICY_PATH]);
+const APP_PATHS = new Set([SETUP_PATH, GAME_PATH, JOIN_PATH, LOGIN_PATH, SIGNUP_PATH, PROFILE_PATH, TOS_PATH, PRIVACY_POLICY_PATH]);
 const ROWS = 6;
 const COLS = 7;
 
@@ -276,7 +277,22 @@ function formatDateTime(value) {
 }
 
 function formatGameStatus(status) {
-  return status.replace("_", " ");
+  const statusLabels = {
+    human_win: "Player Wins",
+    ai_win: "AI Wins",
+    player1_win: "Player 1 Wins",
+    player2_win: "Player 2 Wins",
+    draw: "Draw",
+  };
+  return statusLabels[status] || status.replace("_", " ");
+}
+
+function formatWinLossRatio(wins, losses) {
+  if (losses === 0) {
+    return wins === 0 ? "0.00" : `${wins}.00`;
+  }
+
+  return (wins / losses).toFixed(2);
 }
 
 function isGamePath(pathname) {
@@ -331,6 +347,10 @@ function App() {
   const [playAgainAccepted, setPlayAgainAccepted] = useState(0);
   const [playAgainRequested, setPlayAgainRequested] = useState(false);
   const [otherPlayerLeftMessage, setOtherPlayerLeftMessage] = useState("");
+  const [isRoomPublic, setIsRoomPublic] = useState(false);
+  const [publicGames, setPublicGames] = useState([]);
+  const [publicGamesLoading, setPublicGamesLoading] = useState(false);
+  const [joiningPublicGameId, setJoiningPublicGameId] = useState("");
   const [authOpen, setAuthOpen] = useState(false);
   const [authMode, setAuthMode] = useState("login");
   const [authFields, setAuthFields] = useState({
@@ -353,6 +373,27 @@ function App() {
   const gameOver = useMemo(() => {
     return ["human_win", "ai_win", "player1_win", "player2_win", "draw"].includes(status);
   }, [status]);
+  const profileStats = useMemo(() => {
+    const stats = profileGames.reduce(
+      (currentStats, game) => {
+        if (game.result === "Win") {
+          currentStats.wins += 1;
+        } else if (game.result === "Loss") {
+          currentStats.losses += 1;
+        } else if (game.result === "Draw") {
+          currentStats.draws += 1;
+        }
+        currentStats.total += 1;
+        return currentStats;
+      },
+      { total: 0, wins: 0, losses: 0, draws: 0 },
+    );
+
+    return {
+      ...stats,
+      winLossRatio: formatWinLossRatio(stats.wins, stats.losses),
+    };
+  }, [profileGames]);
 
   useEffect(() => {
     boardRef.current = board;
@@ -432,6 +473,7 @@ function App() {
     setPlayAgainAccepted(0);
     setPlayAgainRequested(false);
     setOtherPlayerLeftMessage("");
+    setIsRoomPublic(false);
     setBusy(false);
   }, []);
 
@@ -466,6 +508,7 @@ function App() {
     setPlayersConnected(data.playersConnected || 0);
     setDisconnectDeadline(data.disconnectDeadline || null);
     setPlayAgainAccepted(data.playAgainAccepted || 0);
+    setIsRoomPublic(Boolean(data.publicRoom));
     if (data.status === "playing") {
       setPlayAgainRequested(false);
     }
@@ -609,6 +652,7 @@ function App() {
       setCurrentPlayer(data.currentPlayer || PLAYER);
       setDisconnectDeadline(data.disconnectDeadline || null);
       setPlayAgainAccepted(data.playAgainAccepted || 0);
+      setIsRoomPublic(Boolean(data.publicRoom));
       setAnimatedPieces([]);
       setWinningPieces([]);
       setBoard(data.board);
@@ -632,6 +676,7 @@ function App() {
       setCurrentPlayer(data.currentPlayer || PLAYER);
       setDisconnectDeadline(data.disconnectDeadline || null);
       setPlayAgainAccepted(data.playAgainAccepted || 0);
+      setIsRoomPublic(Boolean(data.publicRoom));
       setAnimatedPieces([]);
       setWinningPieces(findWinningPieces(data.board));
       setBoard(data.board);
@@ -655,6 +700,7 @@ function App() {
       setCurrentPlayer(data.currentPlayer || PLAYER);
       setDisconnectDeadline(data.disconnectDeadline || null);
       setPlayAgainAccepted(data.playAgainAccepted || 0);
+      setIsRoomPublic(Boolean(data.publicRoom));
       setGameMode(GAME_MODE_MULTIPLAYER);
       setAnimatedPieces([]);
       setWinningPieces([]);
@@ -665,6 +711,7 @@ function App() {
       setAiMoves([]);
       setGameStarted(true);
       setBusy(false);
+      setJoiningPublicGameId("");
       redirectTo(gamePath(data.gameId));
       console.log(`Player ${data.playerNumber} connected`);
     }
@@ -674,6 +721,13 @@ function App() {
       clearMultiplayerSession();
       clearLocalGame();
       setMessage(data?.message || "Game not found");
+      setJoiningPublicGameId("");
+      if (getCurrentPath() === JOIN_PATH) {
+        setBusy(false);
+        nextSocket.emit("list_public_games", authPayload());
+        redirectTo(JOIN_PATH, true);
+        return;
+      }
       redirectTo(SETUP_PATH, true);
     }
 
@@ -736,6 +790,11 @@ function App() {
       }
     }
 
+    function handlePublicGames(data) {
+      setPublicGames(data?.games || []);
+      setPublicGamesLoading(false);
+    }
+
     nextSocket.on("connect", handleConnect);
     nextSocket.on("game_created", handleGameCreated);
     nextSocket.on("game_joined", handleGameJoined);
@@ -747,6 +806,7 @@ function App() {
     nextSocket.on("play_again_updated", handlePlayAgainUpdated);
     nextSocket.on("player_left", handlePlayerLeft);
     nextSocket.on("game_left", handleGameLeft);
+    nextSocket.on("public_games", handlePublicGames);
     nextSocket.on("invalid_move", handleInvalidMove);
     nextSocket.on("connect_error", () => {
       setStatus("error");
@@ -758,6 +818,13 @@ function App() {
       nextSocket.disconnect();
     };
   }, [applyServerBoard, authPayload, clearLocalGame, redirectTo]);
+
+  useEffect(() => {
+    if (routePath === JOIN_PATH && authSession && socketClient?.connected) {
+      setPublicGamesLoading(true);
+      socketClient.emit("list_public_games", authPayload());
+    }
+  }, [authPayload, authSession, routePath, socketClient]);
 
   function startMultiplayerGame() {
     if (!authSession) {
@@ -788,19 +855,20 @@ function App() {
     setMessage("Creating multiplayer room...");
     setGameStarted(false);
     setBusy(true);
-    socketClient.emit("create_multiplayer_game", authPayload());
+    socketClient.emit("create_multiplayer_game", authPayload({ ownerName: accountName }));
   }
 
-  function joinMultiplayerGame() {
+  function joinMultiplayerGame(requestedGameIdOverride = "", publicJoin = false) {
     if (!authSession) {
       redirectTo(LOGIN_PATH);
       return;
     }
 
-    const requestedGameId = joinGameId.trim();
+    const requestedGameId = (requestedGameIdOverride || joinGameId).trim();
     if (!requestedGameId || !socketClient?.connected) {
       setStatus("error");
       setMessage(!requestedGameId ? "Enter a room ID" : `Flask SocketIO is not responding at ${SOCKET_URL}`);
+      setJoiningPublicGameId("");
       return;
     }
 
@@ -820,7 +888,39 @@ function App() {
     setMessage("Joining multiplayer room...");
     setGameStarted(false);
     setBusy(true);
-    socketClient.emit("join_multiplayer_game", authPayload({ gameId: requestedGameId }));
+    socketClient.emit("join_multiplayer_game", authPayload({ gameId: requestedGameId, publicJoin }));
+  }
+
+  function requestPublicGames() {
+    if (!authSession) {
+      redirectTo(LOGIN_PATH);
+      return;
+    }
+
+    if (!socketClient?.connected) {
+      setMessage(`Flask SocketIO is not responding at ${SOCKET_URL}`);
+      return;
+    }
+
+    setPublicGamesLoading(true);
+    socketClient.emit("list_public_games", authPayload());
+  }
+
+  function joinPublicGame(publicGameId) {
+    if (busy) {
+      return;
+    }
+
+    setJoiningPublicGameId(publicGameId);
+    joinMultiplayerGame(publicGameId, true);
+  }
+
+  function togglePublicRoom() {
+    if (!socketClient?.connected || !gameId || !playerId || busy) {
+      return;
+    }
+
+    socketClient.emit("set_room_public", authPayload({ gameId, playerId, public: !isRoomPublic }));
   }
 
   function requestNewGame() {
@@ -918,6 +1018,10 @@ function App() {
     clearMultiplayerSession();
     clearLocalGame();
     setSelectedSetupMode(GAME_MODE_MULTIPLAYER);
+  }
+
+  function showJoinGamePage() {
+    redirectTo(JOIN_PATH);
   }
 
   const playColumn = useCallback((column) => {
@@ -1141,6 +1245,7 @@ function App() {
     ((gameMode === GAME_MODE_AI && currentPlayer === PLAYER) ||
       (gameMode === GAME_MODE_MULTIPLAYER && playerNumber === currentPlayer && playersConnected === 2));
   const showingSetup = routePath === SETUP_PATH;
+  const showingJoin = routePath === JOIN_PATH;
   const showingGame = routePath === GAME_PATH;
   const showingProfile = routePath === PROFILE_PATH;
   const showingLegalPage = routePath === TOS_PATH || routePath === PRIVACY_POLICY_PATH;
@@ -1163,6 +1268,8 @@ function App() {
     showingGame &&
     (gameMode !== GAME_MODE_MULTIPLAYER || (status === "waiting" && playersConnected === 1) || gameOver);
   const canRequestPlayAgain = gameStarted && gameMode === GAME_MODE_MULTIPLAYER && gameOver;
+  const canTogglePublicRoom =
+    gameStarted && showingGame && gameMode === GAME_MODE_MULTIPLAYER && status === "waiting" && playersConnected === 1 && playerNumber === PLAYER;
   const playerMoveLabel = gameMode === GAME_MODE_MULTIPLAYER ? "Your moves" : "Your moves";
   const opponentMoveLabel = gameMode === GAME_MODE_MULTIPLAYER ? "Other player's moves" : "AI moves";
   const isAuthenticated = Boolean(authSession);
@@ -1257,32 +1364,58 @@ function App() {
     authRequiredView
   ) : (
     <section className="difficulty-panel">
-      <div className="difficulty-tabs" role="tablist" aria-label="Difficulty">
-        {DIFFICULTIES.map((difficulty) => (
+      <div className="mode-select-layout">
+        <div className="mode-side mode-side-player">
           <button
-            key={difficulty.key}
             type="button"
-            role="tab"
-            aria-selected={selectedDifficulty === difficulty.key}
-            className={`difficulty-tab difficulty-${difficulty.key}${selectedDifficulty === difficulty.key ? " selected" : ""}`}
-            onClick={() => chooseDifficulty(difficulty.key)}
+            aria-pressed={selectedSetupMode === GAME_MODE_MULTIPLAYER}
+            className={`setup-mode-card vs-player-button${selectedSetupMode === GAME_MODE_MULTIPLAYER ? " selected" : ""}`}
+            onClick={chooseMultiplayerMode}
             disabled={busy}
           >
-            <span>{difficulty.label}</span>
+            <span>Vs Player</span>
           </button>
-        ))}
+        </div>
+
+        <div className="setup-create-column">
+          <button className="play-button" type="button" onClick={requestNewGame} disabled={busy}>
+            Create game
+          </button>
+          <button className="join-game-link" type="button" onClick={showJoinGamePage} disabled={busy}>
+            Join Game
+          </button>
+        </div>
+
+        <div className="mode-side mode-side-ai">
+          <span className="mode-side-label">Vs AI</span>
+          <div className="difficulty-tabs" role="tablist" aria-label="AI difficulty">
+            {DIFFICULTIES.map((difficulty) => (
+              <button
+                key={difficulty.key}
+                type="button"
+                role="tab"
+                aria-selected={selectedSetupMode === GAME_MODE_AI && selectedDifficulty === difficulty.key}
+                className={`difficulty-tab difficulty-${difficulty.key}${selectedSetupMode === GAME_MODE_AI && selectedDifficulty === difficulty.key ? " selected" : ""}`}
+                onClick={() => chooseDifficulty(difficulty.key)}
+                disabled={busy}
+              >
+                <span>{difficulty.label}</span>
+              </button>
+            ))}
+          </div>
+        </div>
       </div>
-      <button className="play-button" type="button" onClick={requestNewGame} disabled={busy}>
-        Play
-      </button>
-      <button
-        className={`vs-player-button${selectedSetupMode === GAME_MODE_MULTIPLAYER ? " selected" : ""}`}
-        type="button"
-        onClick={chooseMultiplayerMode}
-        disabled={busy}
-      >
-        Vs Player
-      </button>
+    </section>
+  );
+  const joinGameView = !authReady ? (
+    <section className="difficulty-panel">
+      <strong>Loading account...</strong>
+    </section>
+  ) : !isAuthenticated ? (
+    authRequiredView
+  ) : (
+    <section className="difficulty-panel join-game-panel">
+      <strong>Join Game</strong>
       <div className="multiplayer-join">
         <input
           type="text"
@@ -1292,10 +1425,41 @@ function App() {
           aria-label="Room ID"
           disabled={busy}
         />
-        <button type="button" onClick={joinMultiplayerGame} disabled={busy}>
+        <button type="button" onClick={() => joinMultiplayerGame()} disabled={busy}>
           Join
         </button>
       </div>
+      <section className="public-games-panel" aria-label="Joinable games">
+        <div className="public-games-header">
+          <strong>Joinable games</strong>
+          <button type="button" onClick={requestPublicGames} disabled={busy || publicGamesLoading}>
+            Refresh
+          </button>
+        </div>
+        {publicGamesLoading ? (
+          <span className="public-games-empty">Loading rooms...</span>
+        ) : publicGames.length === 0 ? (
+          <span className="public-games-empty">No public rooms</span>
+        ) : (
+          <div className="public-games-list">
+            {publicGames.map((publicGame) => (
+              <div className="public-game-row" key={publicGame.gameId}>
+                <span>{publicGame.ownerName}'s room</span>
+                <button
+                  type="button"
+                  onClick={() => joinPublicGame(publicGame.gameId)}
+                  disabled={busy || joiningPublicGameId === publicGame.gameId}
+                >
+                  {joiningPublicGameId === publicGame.gameId ? "Attempting to join..." : "Join room"}
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+      <button className="join-game-link" type="button" onClick={() => redirectTo(SETUP_PATH)} disabled={busy}>
+        Back
+      </button>
     </section>
   );
   const authPageView = (
@@ -1322,6 +1486,28 @@ function App() {
           Refresh
         </button>
       </div>
+      <section className="profile-stats" aria-label="Profile statistics">
+        <div>
+          <span>Total played</span>
+          <strong>{profileStats.total}</strong>
+        </div>
+        <div>
+          <span>Wins</span>
+          <strong>{profileStats.wins}</strong>
+        </div>
+        <div>
+          <span>Losses</span>
+          <strong>{profileStats.losses}</strong>
+        </div>
+        <div>
+          <span>Draws</span>
+          <strong>{profileStats.draws}</strong>
+        </div>
+        <div>
+          <span>W/L ratio</span>
+          <strong>{profileStats.winLossRatio}</strong>
+        </div>
+      </section>
       {profileError ? <strong className="profile-error">{profileError}</strong> : null}
       {profileLoading ? (
         <section className="profile-empty">
@@ -1359,6 +1545,14 @@ function App() {
   );
   const gameView = (
     <>
+      {canTogglePublicRoom ? (
+        <section className="public-room-toggle">
+          <label>
+            <span>Make Room Public</span>
+            <input type="checkbox" checked={isRoomPublic} onChange={togglePublicRoom} disabled={busy} />
+          </label>
+        </section>
+      ) : null}
       <section className="status-panel">
         <div>
           <span>Status</span>
@@ -1468,6 +1662,8 @@ function App() {
     pageView = authRequiredView;
   } else if (showingGame) {
     pageView = gameStarted ? gameView : loadingView;
+  } else if (showingJoin) {
+    pageView = joinGameView;
   } else if (showingProfile && !isAuthenticated) {
     pageView = authRequiredView;
   } else if (showingProfile) {

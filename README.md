@@ -132,7 +132,7 @@ Every new AI game randomizes the starting side. Multiplayer rooms randomize the 
 - Database persistence is backend-only and optional. If Supabase env vars are missing, gameplay still works without saving.
 - Auth requires Supabase env vars on the frontend. The backend verifies tokens with `SUPABASE_JWT_SECRET` when set, or through the configured Supabase client.
 - Rejoin only works while the backend process stays alive.
-- Free backend hosting has no load balancer for horizontally scaling websocket rooms.
+- Free backend hosting limited CPU resources to work with.
 - In-memory Socket.IO rooms are not safe for horizontal scaling without a message queue or shared store.
 
 ## Status

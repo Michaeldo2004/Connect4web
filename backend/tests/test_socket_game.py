@@ -275,6 +275,59 @@ class SocketGameTests(unittest.TestCase):
         finally:
             second_client.disconnect()
 
+    def test_public_multiplayer_room_can_be_listed_and_joined_once(self):
+        self.client.emit("create_multiplayer_game")
+        created = find_event(self.client, "multiplayer_game_created")
+        self.client.emit("set_room_public", {
+            "gameId": created["gameId"],
+            "playerId": created["playerId"],
+            "public": True,
+        })
+        public_update = find_event(self.client, "board_updated")
+        self.assertTrue(public_update["publicRoom"])
+
+        second_client = socketio.test_client(app)
+        third_client = socketio.test_client(app)
+        try:
+            second_client.emit("list_public_games")
+            public_games = find_event(second_client, "public_games")
+            self.assertEqual(public_games["games"][0]["gameId"], created["gameId"])
+
+            second_client.emit("join_multiplayer_game", {
+                "gameId": created["gameId"],
+                "publicJoin": True,
+            })
+            joined = find_event(second_client, "multiplayer_game_joined")
+            self.assertIsNotNone(joined)
+            self.assertFalse(games[created["gameId"]]["public"])
+
+            third_client.emit("join_multiplayer_game", {
+                "gameId": created["gameId"],
+                "publicJoin": True,
+            })
+            rejected = find_event(third_client, "join_rejected")
+            self.assertIsNotNone(rejected)
+            self.assertEqual(rejected["message"], "Multiplayer game is full")
+        finally:
+            second_client.disconnect()
+            third_client.disconnect()
+
+    def test_public_join_rejects_private_waiting_room(self):
+        self.client.emit("create_multiplayer_game")
+        created = find_event(self.client, "multiplayer_game_created")
+        second_client = socketio.test_client(app)
+        try:
+            second_client.emit("join_multiplayer_game", {
+                "gameId": created["gameId"],
+                "publicJoin": True,
+            })
+            rejected = find_event(second_client, "join_rejected")
+            self.assertIsNotNone(rejected)
+            self.assertEqual(rejected["message"], "Room is no longer public")
+            self.assertEqual(len(games[created["gameId"]]["players"]), 1)
+        finally:
+            second_client.disconnect()
+
     def test_multiplayer_starter_is_assigned_yellow(self):
         for starter_index in [0, 1]:
             games.clear()

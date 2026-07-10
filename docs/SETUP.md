@@ -24,6 +24,12 @@ Game screen:
 http://localhost:5173/game/{id}
 ```
 
+Join screen:
+
+```text
+http://localhost:5173/join
+```
+
 Profile screen:
 
 ```text
@@ -95,7 +101,7 @@ npm install
 npm run dev
 ```
 
-Vite opens the browser at `http://localhost:5173`. Pick a difficulty or `Vs Player`, then click `Play` to create a room and redirect to `/game/{id}`.
+Vite opens the browser at `http://localhost:5173`. Pick `Vs Player` or a `Vs AI` difficulty, then click `Create game` to create a room and redirect to `/game/{id}`. The `/join` route supports manual room ID joins and refreshable public waiting-room discovery.
 
 Auth uses Supabase Auth. The app has `/login`, `/signup`, and `/profiles` routes, plus a nav popup. Users must be logged in to play or view completed profile games when `AUTH_REQUIRED=true`.
 
@@ -105,6 +111,7 @@ Frontend runtime URLs and paths are read from `frontend/.env`:
 VITE_BACKEND_URL=http://localhost:5000
 VITE_SETUP_PATH=/
 VITE_GAME_PATH=/game
+VITE_JOIN_PATH=/join
 VITE_LOGIN_PATH=/login
 VITE_SIGNUP_PATH=/signup
 VITE_PROFILE_PATH=/profiles
@@ -128,7 +135,7 @@ cd frontend
 npm test
 ```
 
-These tests use Node's built-in test runner. They statically check the UI shell routes, Supabase auth wiring, profile history UI, auth modal, footer links, and mobile CSS rules.
+These tests use Node's built-in test runner. They statically check the UI shell routes, Supabase auth wiring, profile history UI and stats, public room join UI, auth modal, footer links, and mobile CSS rules.
 
 ## Backend Tests
 
@@ -142,8 +149,8 @@ These tests use Flask-SocketIO's in-process test client and do not require the b
 Current expected result:
 
 ```text
-Ran 55 tests
+Ran 61 tests
 OK
 ```
 
-The tests cover AI websocket gameplay, AI opening move flow, yellow-token multiplayer starter assignment, two-player websocket rooms, turn enforcement, reset with new game ids, reconnect, rematch voting with new game ids, leave-room behavior, the 15-second disconnect default-win rule, env-backed backend config, JWT/Supabase auth checks, win/draw profile game history, the database schema draft, and Supabase persistence payload behavior.
+The tests cover AI websocket gameplay, AI opening move flow, yellow-token multiplayer starter assignment, two-player websocket rooms, public waiting-room listing and public join rejection, turn enforcement, reset with new game ids, reconnect, rematch voting with new game ids, leave-room behavior, the 15-second disconnect default-win rule, env-backed backend config, JWT/Supabase auth checks, win/draw profile game history, the database schema draft, and Supabase persistence payload behavior.

@@ -12,6 +12,7 @@ test("manual routes are env-backed with local defaults", () => {
   assert.match(appSource, /const SOCKET_URL = getEnvString\("VITE_BACKEND_URL", "http:\/\/localhost:5000"\)/);
   assert.match(appSource, /const SETUP_PATH = getEnvRoute\("VITE_SETUP_PATH", "\/"\);/);
   assert.match(appSource, /const GAME_PATH = getEnvRoute\("VITE_GAME_PATH", "\/game"\);/);
+  assert.match(appSource, /const JOIN_PATH = getEnvRoute\("VITE_JOIN_PATH", "\/join"\);/);
   assert.match(appSource, /const LOGIN_PATH = getEnvRoute\("VITE_LOGIN_PATH", "\/login"\);/);
   assert.match(appSource, /const SIGNUP_PATH = getEnvRoute\("VITE_SIGNUP_PATH", "\/signup"\);/);
   assert.match(appSource, /const PROFILE_PATH = getEnvRoute\("VITE_PROFILE_PATH", "\/profiles"\);/);
@@ -37,16 +38,42 @@ test("supabase auth client and jwt payload are wired", () => {
 test("profile route loads username and completed games", () => {
   assert.match(appSource, /const \[userProfile, setUserProfile\] = useState\(null\);/);
   assert.match(appSource, /const \[profileGames, setProfileGames\] = useState\(\[\]\);/);
+  assert.match(appSource, /const profileStats = useMemo/);
+  assert.match(appSource, /function formatWinLossRatio\(wins, losses\)/);
   assert.match(appSource, /from\("profiles"\)/);
   assert.match(appSource, /select\("username,display_name"\)/);
   assert.match(appSource, /api\/profile\/games/);
   assert.match(appSource, /Authorization: `Bearer \$\{authSession\.access_token\}`/);
   assert.match(appSource, /setProfileError\(error\.message\)/);
   assert.match(appSource, /formatGameStatus\(game\.status\)/);
+  assert.match(appSource, /human_win: "Player Wins"/);
   assert.match(appSource, /formatDateTime\(game\.endedAt \|\| game\.startedAt\)/);
   assert.match(appSource, /className="profile-page"/);
+  assert.match(appSource, /className="profile-stats"/);
+  assert.match(appSource, />\s*Total played\s*</);
+  assert.match(appSource, />\s*W\/L ratio\s*</);
   assert.match(appSource, /No completed games/);
   assert.match(appSource, /accountName/);
+});
+
+test("join route supports public room discovery", () => {
+  assert.match(appSource, /const \[publicGames, setPublicGames\] = useState\(\[\]\);/);
+  assert.match(appSource, /const \[joiningPublicGameId, setJoiningPublicGameId\] = useState\(""\);/);
+  assert.match(appSource, /socketClient\.emit\("list_public_games", authPayload\(\)\)/);
+  assert.match(appSource, /nextSocket\.on\("public_games", handlePublicGames\)/);
+  assert.match(appSource, /className="public-games-panel"/);
+  assert.match(appSource, />\s*Joinable games\s*</);
+  assert.match(appSource, /Attempting to join\.\.\./);
+  assert.match(appSource, /joinPublicGame\(publicGame\.gameId\)/);
+  assert.match(appSource, /joinMultiplayerGame\(publicGameId, true\)/);
+});
+
+test("waiting multiplayer room can be made public", () => {
+  assert.match(appSource, /const \[isRoomPublic, setIsRoomPublic\] = useState\(false\);/);
+  assert.match(appSource, /socketClient\.emit\("set_room_public", authPayload\(\{ gameId, playerId, public: !isRoomPublic \}\)\)/);
+  assert.match(appSource, /className="public-room-toggle"/);
+  assert.match(appSource, />\s*Make Room Public\s*</);
+  assert.match(appSource, /checked=\{isRoomPublic\}/);
 });
 
 test("board updates can replace stored game id", () => {

@@ -75,8 +75,10 @@ Create, join, move, reset, leave, and rematch events reject missing or invalid t
 ```text
 create_game { difficulty, accessToken }
 join_game { gameId, playerId, accessToken }
-create_multiplayer_game { accessToken }
-join_multiplayer_game { gameId, playerId?, accessToken }
+create_multiplayer_game { ownerName?, accessToken }
+list_public_games { accessToken }
+set_room_public { gameId, playerId, public, accessToken }
+join_multiplayer_game { gameId, playerId?, publicJoin?, accessToken }
 player_move { gameId, playerId, column, accessToken }
 reset_game { gameId, playerId, difficulty?, accessToken }
 play_again { gameId, playerId, accessToken }
@@ -90,8 +92,9 @@ game_created { gameId, playerId, board, status, message, difficulty, mode }
 game_joined { gameId, board, status, message, difficulty, mode }
 multiplayer_game_created { gameId, playerId, playerNumber, playersConnected, board, status, message, mode }
 multiplayer_game_joined { gameId, playerId, playerNumber, playersConnected, board, status, message, mode }
-board_updated { gameId, playerId?, board, status, message, aiMove, difficulty, mode, currentPlayer?, playersConnected?, disconnectDeadline?, playAgainAccepted? }
+board_updated { gameId, playerId?, board, status, message, aiMove, difficulty, mode, currentPlayer?, playersConnected?, disconnectDeadline?, playAgainAccepted?, publicRoom? }
 play_again_updated { gameId, board, status, message, difficulty, mode, currentPlayer, playersConnected, playAgainAccepted }
+public_games { games: [{ gameId, ownerName }] }
 player_left { gameId, message }
 game_left { gameId }
 invalid_move { gameId, board, status, message, difficulty, mode }
@@ -157,6 +160,7 @@ Request:
 
 ```json
 {
+  "ownerName": "Player",
   "accessToken": "supabase-access-token"
 }
 ```
@@ -182,11 +186,52 @@ Response event: `multiplayer_game_created`
   "aiMove": null,
   "difficulty": "multiplayer",
   "mode": "multiplayer",
-  "currentPlayer": 1
+  "currentPlayer": 1,
+  "publicRoom": false
 }
 ```
 
 The starter is randomized when the second player joins. The starter is assigned `playerNumber: 1`, which renders as yellow, and `currentPlayer` starts at `1`.
+
+### Public Multiplayer Rooms
+
+Waiting multiplayer rooms start private. Player 1 can toggle public visibility only while the room is waiting for Player 2.
+
+Make a waiting room public:
+
+```json
+{
+  "gameId": "generated-game-id",
+  "playerId": "player-one-id",
+  "public": true,
+  "accessToken": "supabase-access-token"
+}
+```
+
+Response event: `board_updated` with `publicRoom: true`.
+
+List joinable public rooms:
+
+```json
+{
+  "accessToken": "supabase-access-token"
+}
+```
+
+Response event: `public_games`
+
+```json
+{
+  "games": [
+    {
+      "gameId": "generated-game-id",
+      "ownerName": "Player"
+    }
+  ]
+}
+```
+
+The public list is in-memory and intended for a single backend instance. A public room stops being public when Player 2 joins, when the room stops waiting, or when the waiting owner disconnects.
 
 ### `join_multiplayer_game`
 
@@ -195,6 +240,16 @@ Player 2 joins with only the room ID:
 ```json
 {
   "gameId": "generated-game-id",
+  "accessToken": "supabase-access-token"
+}
+```
+
+Public-list joins include `publicJoin: true` so the server can reject rooms that stopped being public before the click reached the backend:
+
+```json
+{
+  "gameId": "generated-game-id",
+  "publicJoin": true,
   "accessToken": "supabase-access-token"
 }
 ```
@@ -226,6 +281,8 @@ Response event: `multiplayer_game_joined`
 ```
 
 The joining player can be assigned `playerNumber: 1` or `playerNumber: 2`. Player 1 is always yellow and always starts the current multiplayer game.
+
+Rooms with two assigned players reject additional joins. Reconnects require one of the existing saved `playerId` values.
 
 ### Multiplayer Disconnect Rule
 
@@ -372,4 +429,4 @@ invalid_move
 
 Frontend status text is green only when the local player can move and displays `Your turn`. Opponent turns and AI thinking states display in red.
 
-Profile history treats win and draw statuses as completed games: `human_win`, `ai_win`, `player1_win`, `player2_win`, and `draw`.
+Profile history treats win and draw statuses as completed games: `human_win`, `ai_win`, `player1_win`, `player2_win`, and `draw`. The frontend displays `human_win` as `Player Wins` in profile history.
