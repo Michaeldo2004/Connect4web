@@ -31,6 +31,22 @@
 - Updated frontend hard AI display label to `4s` to match the backend.
 - Added frontend static test coverage for theme and skeleton loading states.
 
+### Game Review
+
+- Profile rows now use `Review Game` instead of displaying the room ID.
+- Completed games open at `/game/{gameId}/review`; inaccessible, incomplete, missing, or empty-history reviews redirect to `/404`, then return home after three seconds.
+- The authenticated review endpoint returns only a participant's completed move history in chronological order.
+- Review includes board navigation, player-colored move chips in ten-move rows, drop animations, final winning-line highlighting, and game status/mode/room/move-order metadata.
+- Move evaluation is intentionally not implemented yet.
+
+### Live AI Scheduling
+
+- AI calculations now run outside per-game locks.
+- `aiThinking` is included in AI-game `board_updated` payloads while a search is active.
+- A non-blocking worker-slot semaphore prevents app-level executor backlog. A non-terminal move is rejected with `AI is busy, try again` before board mutation when every AI worker is occupied.
+- AI results are applied only when the same in-memory game object and `move_number` are still current; stale results are discarded.
+- A timed-out process keeps its slot until it actually exits, preventing the executor from silently accepting excess work.
+
 ## Verification already run
 
 Backend:
@@ -43,8 +59,8 @@ cd backend
 
 Result:
 
-- Socket tests passed: `31 tests`
-- Full backend tests passed: `68 tests`
+- Socket tests passed: `34 tests`
+- Full backend tests passed: `71 tests`
 
 Frontend:
 
@@ -64,50 +80,28 @@ Note: `npm test` printed a PowerShell npm wrapper `Access is denied` warning aft
 
 ## Important current risks
 
-### AI queue architecture is not implemented
+### Postgame Evaluation Architecture Is Not Implemented
 
-The backend still runs/waits for AI while holding the per-game lock.
+Do not reuse the live Socket.IO AI executor for postgame move evaluation. On a one-CPU Render instance, a long evaluation can still delay active games even though it no longer holds a game lock.
 
-Current flow:
-
-```text
-player move
-  -> lock game
-  -> apply human move
-  -> run/wait for AI
-  -> apply AI move
-  -> unlock game
-  -> emit update
-```
-
-Suggested future flow:
+Recommended design:
 
 ```text
-player move
-  -> lock game briefly
-  -> apply human move
-  -> mark ai_thinking
-  -> enqueue AI job with game_id + move_number
-  -> unlock game
-  -> emit "AI is thinking"
+completed game
+  -> insert/upsert durable Supabase analysis_jobs row
 
-AI worker
-  -> compute move outside lock
-  -> lock game briefly
-  -> verify same game_id + move_number
-  -> apply AI move or discard stale result
-  -> unlock game
-  -> emit update
+separate one-worker analysis service
+  -> atomically claim one job with a lease
+  -> replay game_moves in order
+  -> score legal moves from each board_before with a pure minimax wrapper
+  -> upsert move_analysis by move_id + minimax_depth
+  -> save progress, retry count, and final status
 ```
 
-Missing pieces:
-
-- bounded AI queue
-- queue-full `"AI is busy, try again"` response
-- `ai_thinking` state
-- move/version validation before applying AI output
-- stale AI result discard
-- releasing the game lock during CPU search
+- Keep analysis durable and idempotent so Render restarts do not lose work.
+- Keep the analysis service separate from the live Socket.IO service.
+- For rating precedence, use: highest score = `best`; otherwise lowest negative = `blunder`; other negative = `mistake`; remaining non-best nonnegative = `good`.
+- A future `analysis_jobs` table needs status, requested depth, current move cursor, attempts, lease expiry, and error fields.
 
 ### Deployment config still needs attention
 
@@ -130,8 +124,8 @@ git diff -- backend/app.py backend/tests/test_socket_game.py frontend/src/App.js
 
 1. Add Vercel rewrite config for SPA routes.
 2. Add Render production start config.
-3. Decide whether to implement the simple bounded AI queue.
-4. If implementing the queue, keep it single-process/single-worker for Render free first.
+3. Add the durable postgame evaluation job/worker design when move ratings are ready.
+4. If live AI demand exceeds worker slots, decide whether a bounded live queue is preferable to the current reject-and-retry behavior.
 5. Later, if scaling beyond one backend instance, move live room coordination to Redis or durable Supabase-backed state.
 
 ⚠ Better approach available: store this handoff as an untracked local `HANDOFF.md` for now, then convert the stable parts into docs after deployment choices are final — keeps temporary review notes out of permanent docs until decisions settle — tradeoff is someone must remember to promote the useful parts later.
