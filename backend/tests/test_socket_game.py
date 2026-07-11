@@ -1,4 +1,5 @@
 import unittest
+import threading
 from unittest.mock import patch
 
 import app as app_module
@@ -64,7 +65,10 @@ class SocketGameTests(unittest.TestCase):
         self.assertIn("playerId", payload)
         self.assertEqual(payload["status"], "playing")
         self.assertEqual(payload["difficulty"], "very_easy")
-        self.assertIn(payload["currentPlayer"], [1, 2])
+        self.assertEqual(payload["currentPlayer"], 1)
+        self.assertIn(payload["playerNumber"], [1, 2])
+        self.assertIn(payload["aiNumber"], [1, 2])
+        self.assertNotEqual(payload["playerNumber"], payload["aiNumber"])
         self.assertEqual(sum(cell != 0 for row in payload["board"] for cell in row), 0)
         self.assertIsNone(payload["aiMove"])
 
@@ -77,7 +81,9 @@ class SocketGameTests(unittest.TestCase):
             events = self.client.get_received()
             created = filter_events(events, "game_created")[0]
             updates = filter_events(events, "board_updated")
-            self.assertEqual(created["currentPlayer"], starter)
+            self.assertEqual(created["currentPlayer"], 1)
+            self.assertEqual(created["playerNumber"], 1 if starter == 1 else 2)
+            self.assertEqual(created["aiNumber"], 2 if starter == 1 else 1)
             self.assertEqual(sum(cell != 0 for row in created["board"] for cell in row), 0)
             self.assertIsNone(created["aiMove"])
 
@@ -87,10 +93,13 @@ class SocketGameTests(unittest.TestCase):
             else:
                 self.assertEqual(created["message"], "AI is thinking")
                 self.assertEqual(len(updates), 1)
-                self.assertEqual(updates[0]["currentPlayer"], 1)
+                self.assertEqual(updates[0]["currentPlayer"], 2)
+                self.assertEqual(updates[0]["playerNumber"], 2)
+                self.assertEqual(updates[0]["aiNumber"], 1)
                 self.assertEqual(updates[0]["message"], "Your turn")
                 self.assertIsNotNone(updates[0]["aiMove"])
                 self.assertEqual(sum(cell != 0 for row in updates[0]["board"] for cell in row), 1)
+                self.assertEqual(sum(cell == 1 for row in updates[0]["board"] for cell in row), 1)
                 self.assertEqual(games[created["gameId"]]["move_number"], 1)
 
     def test_ai_game_random_start_payload_stays_valid(self):
@@ -99,24 +108,24 @@ class SocketGameTests(unittest.TestCase):
             events = self.client.get_received()
             created = filter_events(events, "game_created")[0]
             updates = filter_events(events, "board_updated")
-            self.assertIn(created["currentPlayer"], [1, 2])
+            self.assertEqual(created["currentPlayer"], 1)
             self.assertEqual(sum(cell != 0 for row in created["board"] for cell in row), 0)
-            if created["currentPlayer"] == 1:
+            if created["aiNumber"] == 2:
                 self.assertEqual(updates, [])
             else:
                 self.assertEqual(len(updates), 1)
-                self.assertEqual(updates[0]["currentPlayer"], 1)
+                self.assertEqual(updates[0]["currentPlayer"], 2)
                 self.assertEqual(updates[0]["aiMove"], next(
                     column_index
                     for row in updates[0]["board"]
                     for column_index, cell in enumerate(row)
-                    if cell == 2
+                    if cell == 1
                 ))
 
     def test_ai_move_rejected_when_not_human_turn(self):
         created = self.create_game()
         game = games[created["gameId"]]
-        game["current_player"] = 2
+        game["current_player"] = game["ai_piece"]
         self.client.emit("player_move", {
             "gameId": created["gameId"],
             "playerId": created["playerId"],
@@ -125,6 +134,75 @@ class SocketGameTests(unittest.TestCase):
         invalid = find_event(self.client, "invalid_move")
         self.assertIsNotNone(invalid)
         self.assertEqual(invalid["message"], "Not your turn")
+
+    def test_ai_busy_rejects_nonterminal_human_move_without_mutating_the_game(self):
+        with patch("app.random.choice", return_value=1):
+            created = self.create_game()
+        game = games[created["gameId"]]
+
+        with patch.object(app_module, "reserve_ai_search_slot", return_value=False):
+            self.client.emit("player_move", {
+                "gameId": created["gameId"],
+                "playerId": created["playerId"],
+                "column": 3,
+            })
+
+        invalid = find_event(self.client, "invalid_move")
+        self.assertIsNotNone(invalid)
+        self.assertEqual(invalid["message"], "AI is busy, try again")
+        self.assertEqual(sum(cell != 0 for row in game["board"] for cell in row), 0)
+        self.assertEqual(game["move_number"], 0)
+        self.assertFalse(game["ai_thinking"])
+
+    def test_stale_ai_result_is_discarded_after_game_version_changes(self):
+        with patch("app.random.choice", return_value=1):
+            created = self.create_game()
+        game_id = created["gameId"]
+        game = games[game_id]
+
+        with app_module.get_game_lock(game_id):
+            job, error = app_module.apply_human_and_ai_move(game, 3, game_id)
+            self.assertIsNone(error)
+            self.assertIsNotNone(job)
+            self.assertTrue(game["ai_thinking"])
+            game["move_number"] += 1
+
+        with patch.object(app_module, "get_ai_move", return_value=((2, {}), True)):
+            app_module.complete_ai_turn(job)
+
+        self.assertEqual(sum(cell != 0 for row in game["board"] for cell in row), 1)
+        self.assertTrue(game["ai_thinking"])
+
+    def test_ai_search_runs_without_holding_the_game_lock(self):
+        with patch("app.random.choice", return_value=1):
+            created = self.create_game()
+        game_id = created["gameId"]
+        game = games[game_id]
+        search_started = threading.Event()
+        allow_search_to_finish = threading.Event()
+
+        def blocking_search(*_args):
+            search_started.set()
+            allow_search_to_finish.wait(timeout=1)
+            return (2, {}), True
+
+        app.config["AI_SEARCH_INLINE"] = False
+        try:
+            with app_module.get_game_lock(game_id):
+                job, error = app_module.apply_human_and_ai_move(game, 3, game_id)
+                self.assertIsNone(error)
+                self.assertIsNotNone(job)
+
+            with patch.object(app_module, "get_ai_move", side_effect=blocking_search):
+                app_module.launch_ai_turn(job)
+                self.assertTrue(search_started.wait(timeout=1))
+                game_lock = app_module.get_game_lock(game_id)
+                self.assertTrue(game_lock.acquire(blocking=False))
+                game_lock.release()
+                allow_search_to_finish.set()
+                socketio.sleep(0.02)
+        finally:
+            app.config["AI_SEARCH_INLINE"] = True
 
     def test_ai_reset_current_player_matches_opening_board(self):
         created = self.create_game()
@@ -144,14 +222,15 @@ class SocketGameTests(unittest.TestCase):
             self.assertIn(reset["gameId"], games)
             current_game_id = reset["gameId"]
             pieces = sum(cell != 0 for row in reset["board"] for cell in row)
-            self.assertIn(reset["currentPlayer"], [1, 2])
+            self.assertEqual(reset["currentPlayer"], 1)
             self.assertEqual(pieces, 0)
             self.assertIsNone(reset["aiMove"])
-            if reset["currentPlayer"] == 2:
+            if reset["aiNumber"] == 1:
                 self.assertEqual(reset["message"], "AI is thinking")
                 self.assertEqual(len(updates), 2)
-                self.assertEqual(updates[1]["currentPlayer"], 1)
+                self.assertEqual(updates[1]["currentPlayer"], 2)
                 self.assertIsNotNone(updates[1]["aiMove"])
+                self.assertEqual(sum(cell == 1 for row in updates[1]["board"] for cell in row), 1)
             else:
                 self.assertEqual(reset["message"], "Your turn")
                 self.assertEqual(len(updates), 1)
@@ -183,7 +262,7 @@ class SocketGameTests(unittest.TestCase):
 
     def test_player_move_updates_board(self):
         created = self.create_game()
-        games[created["gameId"]]["current_player"] = 1
+        games[created["gameId"]]["current_player"] = games[created["gameId"]]["human_piece"]
         self.client.emit("player_move", {
             "gameId": created["gameId"],
             "playerId": created["playerId"],
@@ -510,6 +589,30 @@ class SocketGameTests(unittest.TestCase):
         finally:
             if second_client.is_connected():
                 second_client.disconnect()
+
+    def test_multiplayer_reset_game_is_rejected_during_live_match(self):
+        self.client.emit("create_multiplayer_game")
+        created = find_event(self.client, "multiplayer_game_created")
+        second_client = socketio.test_client(app)
+        try:
+            second_client.emit("join_multiplayer_game", {"gameId": created["gameId"]})
+            joined = find_event(second_client, "multiplayer_game_joined")
+            self.client.get_received()
+
+            self.client.emit("reset_game", {
+                "gameId": created["gameId"],
+                "playerId": created["playerId"],
+            })
+
+            invalid = find_event(self.client, "invalid_move")
+            self.assertIsNotNone(invalid)
+            self.assertEqual(invalid["message"], "Use play again after the multiplayer match ends")
+            self.assertIn(created["gameId"], games)
+            self.assertEqual(games[created["gameId"]]["status"], "playing")
+            self.assertNotIn("board_updated", [event["name"] for event in self.client.get_received()])
+            self.assertEqual(joined["gameId"], created["gameId"])
+        finally:
+            second_client.disconnect()
 
     def test_multiplayer_play_again_resets_after_both_players_accept(self):
         self.client.emit("create_multiplayer_game")

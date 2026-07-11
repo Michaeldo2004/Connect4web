@@ -30,7 +30,7 @@ DIFFICULTIES = {
     "very_easy": {"depth": 1, "time_limit": 3},
     "easy": {"depth": 2, "time_limit": 3},
     "medium": {"depth": 5, "time_limit": 3},
-    "hard": {"depth": 7, "time_limit": 5},
+    "hard": {"depth": 7, "time_limit": 4},
 }
 supabase_store.load_local_env()
 
@@ -71,8 +71,10 @@ create_attempts = {}
 ai_executor = None
 ai_executor_lock = threading.Lock()
 AI_WORKER_COUNT = max(1, min(2, (os.cpu_count() or 2) - 1))
+AI_BUSY_MESSAGE = "AI is busy, try again"
 game_locks = {}
 game_locks_guard = threading.Lock()
+ai_search_slots = threading.BoundedSemaphore(AI_WORKER_COUNT)
 
 
 def get_game_lock(game_id):
@@ -208,7 +210,9 @@ def empty_response(difficulty="medium"):
 
 def create_game_state(difficulty, player_id=None, profile_id=None):
     now = time.time()
-    current_player = random.choice([HUMAN, AI])
+    starter = random.choice([HUMAN, AI])
+    human_piece = HUMAN if starter == HUMAN else AI
+    ai_piece = AI if starter == HUMAN else HUMAN
     return {
         "mode": "ai",
         "player_id": player_id or uuid.uuid4().hex,
@@ -217,13 +221,24 @@ def create_game_state(difficulty, player_id=None, profile_id=None):
         "board": create_board(),
         "difficulty": difficulty,
         "status": "playing",
-        "message": "AI is thinking" if current_player == AI else "Your turn",
-        "current_player": current_player,
+        "message": "AI is thinking" if starter == AI else "Your turn",
+        "current_player": HUMAN,
+        "human_piece": human_piece,
+        "ai_piece": ai_piece,
         "transposition_table": {},
+        "ai_thinking": False,
         "move_number": 0,
         "created_at": now,
         "updated_at": now,
     }
+
+
+def get_human_piece(game):
+    return game.get("human_piece", HUMAN)
+
+
+def get_ai_piece(game):
+    return game.get("ai_piece", AI)
 
 
 def create_multiplayer_game_state(player_id=None, profile_id=None):
@@ -387,23 +402,37 @@ def get_ai_executor():
         return ai_executor
 
 
-def get_ai_move(board, settings, transposition_table):
+def reserve_ai_search_slot():
+    return ai_search_slots.acquire(blocking=False)
+
+
+def release_ai_search_slot():
+    try:
+        ai_search_slots.release()
+    except ValueError:
+        pass
+
+
+def get_ai_move(board_data, settings, transposition_table, ai_piece=AI):
     if app.config.get("AI_SEARCH_INLINE"):
-        return run_best_move(board_to_list(board), AI, settings["depth"], settings["time_limit"], transposition_table)
+        return run_best_move(board_data, ai_piece, settings["depth"], settings["time_limit"], transposition_table), True
 
     future = get_ai_executor().submit(
         run_best_move,
-        board_to_list(board),
-        AI,
+        board_data,
+        ai_piece,
         settings["depth"],
         settings["time_limit"],
         transposition_table,
     )
     try:
-        return future.result(timeout=settings["time_limit"] + 1)
+        return future.result(timeout=settings["time_limit"] + 1), True
     except FutureTimeoutError:
-        future.cancel()
-        return None, transposition_table
+        # A running process cannot be canceled. Keep its slot reserved until it exits.
+        future.add_done_callback(lambda _future: release_ai_search_slot())
+        return (None, transposition_table), False
+    except Exception:
+        return (None, transposition_table), True
 
 
 def serialize_game(game_id, game, ai_move=None, include_player_id=False, player_id=None):
@@ -420,6 +449,9 @@ def serialize_game(game_id, game, ai_move=None, include_player_id=False, player_
     if "current_player" in game:
         payload["currentPlayer"] = game["current_player"]
 
+    if game.get("mode") != "multiplayer":
+        payload["aiThinking"] = bool(game.get("ai_thinking"))
+
     if include_player_id:
         payload["playerId"] = game["player_id"]
 
@@ -432,29 +464,62 @@ def serialize_game(game_id, game, ai_move=None, include_player_id=False, player_
         if player_id in game["players"]:
             payload["playerId"] = player_id
             payload["playerNumber"] = game["players"][player_id]["piece"]
+    else:
+        payload["playerNumber"] = get_human_piece(game)
+        payload["aiNumber"] = get_ai_piece(game)
 
     return payload
 
 
-def apply_ai_turn(game, game_id=None):
+def prepare_ai_turn(game_id, game, expected_game=None, slot_reserved=False):
+    if game is None or (expected_game is not None and game is not expected_game):
+        if slot_reserved:
+            release_ai_search_slot()
+        return None, None
+    if game.get("status") in FINISHED_STATUSES or game.get("current_player") != get_ai_piece(game) or game.get("ai_thinking"):
+        if slot_reserved:
+            release_ai_search_slot()
+        return None, None
+    if not slot_reserved and not reserve_ai_search_slot():
+        return None, AI_BUSY_MESSAGE
+
+    game["ai_thinking"] = True
+    game["message"] = "AI is thinking"
+    mark_game_updated(game)
+    supabase_store.update_game_record(game_id, game)
+    return {
+        "game_id": game_id,
+        "expected_game": game,
+        "move_number": game["move_number"],
+        "board": board_to_list(game["board"]),
+        "settings": DIFFICULTIES[game["difficulty"]],
+        "ai_piece": get_ai_piece(game),
+        "transposition_table": normalize_transposition_table(game.get("transposition_table")),
+    }, None
+
+
+def apply_ai_result(game, game_id, ai_move, transposition_table):
     board = game["board"]
-    difficulty = game["difficulty"]
-    transposition_table = normalize_transposition_table(game.get("transposition_table"))
-    settings = DIFFICULTIES[difficulty]
-    ai_move, transposition_table = get_ai_move(board, settings, transposition_table)
+    ai_piece = get_ai_piece(game)
+    human_piece = get_human_piece(game)
+    game["ai_thinking"] = False
 
     if ai_move is None or not is_valid_move(board, int(ai_move)):
         game["transposition_table"] = transposition_table
+        game["current_player"] = human_piece
+        game["message"] = "AI move failed. Your turn"
+        mark_game_updated(game)
+        supabase_store.update_game_record(game_id, game)
         return None, "AI returned an invalid move"
 
     ai_move = int(ai_move)
     board_before = board_to_list(board)
-    drop_piece(board, ai_move, AI)
+    drop_piece(board, ai_move, ai_piece)
     if game_id:
-        supabase_store.record_move(game_id, game, AI, ai_move, board_before, board_to_list(board), is_ai_move=True)
+        supabase_store.record_move(game_id, game, ai_piece, ai_move, board_before, board_to_list(board), is_ai_move=True)
     game["transposition_table"] = transposition_table
 
-    if check_win(board, AI):
+    if check_win(board, ai_piece):
         game["status"] = "ai_win"
         game["message"] = "AI wins"
     elif is_draw(board):
@@ -462,7 +527,7 @@ def apply_ai_turn(game, game_id=None):
         game["message"] = "Draw"
     else:
         game["status"] = "playing"
-        game["current_player"] = HUMAN
+        game["current_player"] = human_piece
         game["message"] = "Your turn"
 
     mark_game_updated(game)
@@ -471,26 +536,60 @@ def apply_ai_turn(game, game_id=None):
     return ai_move, None
 
 
-def emit_ai_turn_if_needed(game_id, expected_game=None):
+def complete_ai_turn(job):
+    release_slot = True
+    try:
+        (ai_move, transposition_table), release_slot = get_ai_move(
+            job["board"],
+            job["settings"],
+            job["transposition_table"],
+            job["ai_piece"],
+        )
+        with get_game_lock(job["game_id"]):
+            game = get_stored_game(job["game_id"])
+            if (
+                game is None
+                or game is not job["expected_game"]
+                or not game.get("ai_thinking")
+                or game.get("move_number") != job["move_number"]
+            ):
+                return
+
+            ai_move, error = apply_ai_result(game, job["game_id"], ai_move, transposition_table)
+            payload = serialize_game(job["game_id"], game, ai_move=ai_move)
+    finally:
+        if release_slot:
+            release_ai_search_slot()
+
+    socketio.emit("board_updated", payload, to=job["game_id"])
+
+
+def launch_ai_turn(job):
+    if app.config.get("AI_SEARCH_INLINE"):
+        complete_ai_turn(job)
+        return
+    socketio.start_background_task(complete_ai_turn, job)
+
+
+def emit_ai_turn_if_needed(game_id, expected_game=None, slot_reserved=False):
     with get_game_lock(game_id):
         game = get_stored_game(game_id)
-        if game is None or (expected_game is not None and game is not expected_game):
-            return
-        if game.get("current_player") != AI:
-            return
-
-        ai_move, error = apply_ai_turn(game, game_id)
+        job, error = prepare_ai_turn(game_id, game, expected_game, slot_reserved)
         if error:
             payload = make_socket_error(game_id, game, error)
-            event_name = "invalid_move"
-        else:
-            payload = serialize_game(game_id, game, ai_move=ai_move)
-            event_name = "board_updated"
+        elif job is not None:
+            payload = serialize_game(game_id, game)
 
-    if event_name == "invalid_move":
-        socketio.emit(event_name, payload, to=game_id)
+    if error:
+        socketio.emit("invalid_move", payload, to=game_id)
         return
-    socketio.emit(event_name, payload, to=game_id)
+    if job is None:
+        return
+    if app.config.get("AI_SEARCH_INLINE"):
+        launch_ai_turn(job)
+        return
+    socketio.emit("board_updated", payload, to=game_id)
+    launch_ai_turn(job)
 
 
 def make_socket_error(game_id, game, message):
@@ -576,7 +675,8 @@ def list_public_games_payload():
 
 def apply_human_and_ai_move(game, column, game_id=None):
     board = game["board"]
-    difficulty = game["difficulty"]
+    human_piece = get_human_piece(game)
+    ai_piece = get_ai_piece(game)
     transposition_table = normalize_transposition_table(game.get("transposition_table"))
 
     if not isinstance(column, int):
@@ -585,21 +685,27 @@ def apply_human_and_ai_move(game, column, game_id=None):
     if column < 0 or column >= COLS:
         return None, "Column out of range"
 
-    if game["status"] in FINISHED_STATUSES or check_win(board, HUMAN) or check_win(board, AI) or is_draw(board):
+    if game["status"] in FINISHED_STATUSES or check_win(board, human_piece) or check_win(board, ai_piece) or is_draw(board):
         return None, "Game is already over"
 
-    if game.get("current_player") != HUMAN:
+    if game.get("current_player") != human_piece:
         return None, "Not your turn"
 
     if not is_valid_move(board, column):
         return None, "Column is full"
 
-    board_before = board_to_list(board)
-    drop_piece(board, column, HUMAN)
-    if game_id:
-        supabase_store.record_move(game_id, game, HUMAN, column, board_before, board_to_list(board))
+    preview_board = board.copy()
+    drop_piece(preview_board, column, human_piece)
+    needs_ai_turn = not check_win(preview_board, human_piece) and not is_draw(preview_board)
+    if needs_ai_turn and not reserve_ai_search_slot():
+        return None, AI_BUSY_MESSAGE
 
-    if check_win(board, HUMAN):
+    board_before = board_to_list(board)
+    drop_piece(board, column, human_piece)
+    if game_id:
+        supabase_store.record_move(game_id, game, human_piece, column, board_before, board_to_list(board))
+
+    if check_win(board, human_piece):
         game["status"] = "human_win"
         game["message"] = "You win"
         game["transposition_table"] = transposition_table
@@ -617,8 +723,11 @@ def apply_human_and_ai_move(game, column, game_id=None):
             supabase_store.update_game_record(game_id, game)
         return None, None
 
-    game["current_player"] = AI
-    return apply_ai_turn(game, game_id)
+    game["current_player"] = ai_piece
+    job, error = prepare_ai_turn(game_id, game, slot_reserved=True)
+    if error:
+        return None, error
+    return job, None
 
 
 def apply_multiplayer_move(game, player_id, column, game_id=None):
@@ -823,6 +932,23 @@ def profile_games():
     return jsonify({"games": supabase_store.fetch_completed_games(profile_id)})
 
 
+@app.get("/api/profile/games/<game_id>/moves")
+def profile_game_moves(game_id):
+    auth_context, auth_error = authenticate_request()
+    if auth_error:
+        return jsonify({"message": auth_error}), 401
+
+    profile_id = auth_context.get("profile_id")
+    if not profile_id:
+        return jsonify({"message": "Login required"}), 401
+
+    moves = supabase_store.fetch_game_moves(profile_id, game_id)
+    if not moves:
+        return jsonify({"message": "Game history not found"}), 404
+
+    return jsonify({"moves": moves})
+
+
 @socketio.on("create_game")
 def socket_create_game(data):
     auth_context, auth_error = authenticate_payload(data or {})
@@ -839,11 +965,15 @@ def socket_create_game(data):
     difficulty = parse_difficulty(data or {})
     game_id = uuid.uuid4().hex
     game = create_game_state(difficulty, profile_id=auth_context["profile_id"])
+    ai_slot_reserved = game["current_player"] == get_ai_piece(game)
+    if ai_slot_reserved and not reserve_ai_search_slot():
+        emit("create_rejected", {"message": AI_BUSY_MESSAGE})
+        return
     supabase_store.create_game_record(game_id, game)
     store_game(game_id, game)
     join_room(game_id)
     emit("game_created", serialize_game(game_id, game, include_player_id=True))
-    emit_ai_turn_if_needed(game_id, game)
+    emit_ai_turn_if_needed(game_id, game, ai_slot_reserved)
 
 
 @socketio.on("join_game")
@@ -1203,11 +1333,11 @@ def socket_player_move(data):
                 payload = serialize_game(game_id, game)
                 emit_to_room = True
         else:
-            ai_move, error = apply_human_and_ai_move(game, data.get("column"), game_id)
+            ai_job, error = apply_human_and_ai_move(game, data.get("column"), game_id)
             if error:
                 invalid_payload = make_socket_error(game_id, game, error)
             else:
-                payload = serialize_game(game_id, game, ai_move=ai_move)
+                payload = serialize_game(game_id, game)
                 emit_to_room = False
 
     if error:
@@ -1217,7 +1347,12 @@ def socket_player_move(data):
     if emit_to_room:
         emit("board_updated", payload, to=game_id)
     else:
+        if ai_job is not None and app.config.get("AI_SEARCH_INLINE"):
+            launch_ai_turn(ai_job)
+            return
         emit("board_updated", payload)
+        if ai_job is not None:
+            launch_ai_turn(ai_job)
 
 
 @socketio.on("reset_game")
@@ -1233,41 +1368,41 @@ def socket_reset_game(data):
         emit("invalid_move", make_socket_error(game_id, None, "Game not found"))
         return
 
-    is_multiplayer_reset = False
     with get_game_lock(game_id):
         game = get_stored_game(game_id)
         error = validate_game_access(game_id, game, player_id, auth_context)
         if error:
             invalid_payload = make_socket_error(game_id, game, error)
         elif game.get("mode") == "multiplayer":
-            finalize_or_delete_previous_game(game_id, game)
-            reset_multiplayer_game(game)
-            new_game_id = replace_game_id(game_id, game)
-            move_multiplayer_room(game_id, new_game_id, game)
-            supabase_store.create_game_record(new_game_id, game)
-            is_multiplayer_reset = True
+            invalid_payload = make_socket_error(
+                game_id,
+                game,
+                "Use play again after the multiplayer match ends",
+            )
+            error = invalid_payload["message"]
         else:
             difficulty = parse_difficulty(data or {})
             previous_player_id = game["player_id"]
             previous_profile_id = game.get("profile_id")
-            finalize_or_delete_previous_game(game_id, game)
             new_game = create_game_state(difficulty, player_id=previous_player_id, profile_id=previous_profile_id)
-            new_game_id = replace_game_id(game_id, new_game)
-            supabase_store.create_game_record(new_game_id, new_game)
-            leave_room(game_id)
-            join_room(new_game_id)
-            payload = serialize_game(new_game_id, new_game, include_player_id=True)
+            ai_slot_reserved = new_game["current_player"] == get_ai_piece(new_game)
+            if ai_slot_reserved and not reserve_ai_search_slot():
+                invalid_payload = make_socket_error(game_id, game, AI_BUSY_MESSAGE)
+                error = invalid_payload["message"]
+            else:
+                finalize_or_delete_previous_game(game_id, game)
+                new_game_id = replace_game_id(game_id, new_game)
+                supabase_store.create_game_record(new_game_id, new_game)
+                leave_room(game_id)
+                join_room(new_game_id)
+                payload = serialize_game(new_game_id, new_game, include_player_id=True)
 
     if error:
         emit("invalid_move", invalid_payload)
         return
 
-    if is_multiplayer_reset:
-        emit_multiplayer_board_update(new_game_id, game)
-        return
-
     emit("board_updated", payload)
-    emit_ai_turn_if_needed(new_game_id, new_game)
+    emit_ai_turn_if_needed(new_game_id, new_game, ai_slot_reserved)
 
 
 if __name__ == "__main__":

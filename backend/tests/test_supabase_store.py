@@ -19,6 +19,9 @@ class FakeQuery:
     def eq(self, *_args):
         return self
 
+    def order(self, *_args):
+        return self
+
     def execute(self):
         return SimpleNamespace(data=self.rows)
 
@@ -69,6 +72,16 @@ class RecordingClient:
         return RecordingQuery(self, table_name)
 
 
+class MoveHistoryClient:
+    def __init__(self, membership, moves):
+        self.membership = membership
+        self.moves = moves
+
+    def table(self, table_name):
+        rows = self.membership if table_name == "game_players" else self.moves
+        return FakeQuery(rows)
+
+
 class SupabaseStoreTests(unittest.TestCase):
     def setUp(self):
         supabase_store._client = None
@@ -103,6 +116,21 @@ class SupabaseStoreTests(unittest.TestCase):
         self.assertIsNotNone(payload["ended_at"])
         self.assertEqual(payload["final_board"], [[0, 0, 0, 0, 0, 0, 0] for _ in range(6)])
 
+    def test_game_payload_uses_ai_game_human_piece_for_winner(self):
+        game_id = uuid.uuid4().hex
+        game = {
+            "mode": "ai",
+            "difficulty": "medium",
+            "status": "human_win",
+            "human_piece": 2,
+            "ai_piece": 1,
+            "board": np.array([[0, 0, 0, 0, 0, 0, 0] for _ in range(6)]),
+        }
+
+        payload = supabase_store.game_payload(game_id, game)
+
+        self.assertEqual(payload["winner_player_number"], 2)
+
     def test_ai_game_player_payloads_include_human_and_ai(self):
         game_id = uuid.uuid4().hex
         game = {"mode": "ai", "difficulty": "hard", "profile_id": None}
@@ -115,6 +143,18 @@ class SupabaseStoreTests(unittest.TestCase):
         self.assertEqual(players[1]["player_number"], 2)
         self.assertTrue(players[1]["is_ai"])
         self.assertEqual(players[1]["ai_difficulty"], "hard")
+
+    def test_ai_game_player_payloads_swap_when_ai_starts(self):
+        game_id = uuid.uuid4().hex
+        game = {"mode": "ai", "difficulty": "hard", "profile_id": "profile-1", "human_piece": 2, "ai_piece": 1}
+
+        players = supabase_store.game_player_payloads(game_id, game)
+
+        human = next(player for player in players if not player["is_ai"])
+        ai = next(player for player in players if player["is_ai"])
+        self.assertEqual(human["player_number"], 2)
+        self.assertEqual(human["profile_id"], "profile-1")
+        self.assertEqual(ai["player_number"], 1)
 
     def test_create_game_record_inserts_ai_game_and_players(self):
         game_id = uuid.uuid4().hex
@@ -256,6 +296,25 @@ class SupabaseStoreTests(unittest.TestCase):
         self.assertEqual([game["id"] for game in games], [draw_id, older_id])
         self.assertEqual(games[0]["result"], "Draw")
         self.assertEqual(games[1]["result"], "Loss")
+
+    def test_fetch_game_moves_requires_membership_and_returns_move_rows(self):
+        game_id = str(uuid.uuid4())
+        moves = [
+            {"move_number": 1, "player_number": 1, "column_played": 3, "board_before": [], "board_after": []},
+            {"move_number": 2, "player_number": 2, "column_played": 2, "board_before": [], "board_after": []},
+        ]
+        client = MoveHistoryClient([{"game_id": game_id, "games": {"status": "draw"}}], moves)
+
+        with patch.object(supabase_store, "get_client", return_value=client):
+            self.assertEqual(supabase_store.fetch_game_moves("profile-1", game_id), moves)
+
+        unauthorized_client = MoveHistoryClient([], moves)
+        with patch.object(supabase_store, "get_client", return_value=unauthorized_client):
+            self.assertIsNone(supabase_store.fetch_game_moves("profile-2", game_id))
+
+        active_client = MoveHistoryClient([{"game_id": game_id, "games": {"status": "playing"}}], moves)
+        with patch.object(supabase_store, "get_client", return_value=active_client):
+            self.assertIsNone(supabase_store.fetch_game_moves("profile-1", game_id))
 
 
 if __name__ == "__main__":

@@ -50,6 +50,32 @@ Response:
 }
 ```
 
+## Profile Game Review
+
+```text
+GET /api/profile/games/{gameId}/moves
+```
+
+Requires `Authorization: Bearer <supabase-access-token>`. The authenticated user must be a participant in the game.
+
+Returns the recorded moves in ascending order:
+
+```json
+{
+  "moves": [
+    {
+      "move_number": 1,
+      "player_number": 1,
+      "column_played": 3,
+      "board_before": [[0, 0, 0, 0, 0, 0, 0]],
+      "board_after": [[0, 0, 0, 1, 0, 0, 0]]
+    }
+  ]
+}
+```
+
+The frontend review is available at `/game/{gameId}/review`. It only loads completed games, opens on move 1, and supports previous/next navigation and direct move selection. Invalid, in-progress, or missing games redirect to `/404`, which returns home after three seconds. Move evaluation is not included yet.
+
 ## Socket.IO Gameplay
 
 Gameplay uses Socket.IO at:
@@ -88,11 +114,11 @@ leave_game { gameId, playerId, accessToken }
 ### Server Events
 
 ```text
-game_created { gameId, playerId, board, status, message, difficulty, mode }
-game_joined { gameId, board, status, message, difficulty, mode }
+game_created { gameId, playerId, playerNumber, aiNumber, board, status, message, difficulty, mode, currentPlayer }
+game_joined { gameId, playerNumber?, aiNumber?, board, status, message, difficulty, mode, currentPlayer }
 multiplayer_game_created { gameId, playerId, playerNumber, playersConnected, board, status, message, mode }
 multiplayer_game_joined { gameId, playerId, playerNumber, playersConnected, board, status, message, mode }
-board_updated { gameId, playerId?, board, status, message, aiMove, difficulty, mode, currentPlayer?, playersConnected?, disconnectDeadline?, playAgainAccepted?, publicRoom? }
+board_updated { gameId, playerId?, playerNumber?, aiNumber?, board, status, message, aiMove, aiThinking?, difficulty, mode, currentPlayer?, playersConnected?, disconnectDeadline?, playAgainAccepted?, publicRoom? }
 play_again_updated { gameId, board, status, message, difficulty, mode, currentPlayer, playersConnected, playAgainAccepted }
 public_games { games: [{ gameId, ownerName }] }
 player_left { gameId, message }
@@ -132,11 +158,13 @@ Response event: `game_created`
   "aiMove": null,
   "difficulty": "medium",
   "mode": "ai",
-  "currentPlayer": 1
+  "currentPlayer": 1,
+  "playerNumber": 1,
+  "aiNumber": 2
 }
 ```
 
-AI games randomize the starting side. If AI starts, `game_created` returns the empty board with `currentPlayer: 2` and `message: "AI is thinking"`, then `board_updated` carries the recorded AI opening move.
+AI games randomize the starting side. The first mover is always `1` (yellow). If AI starts, `game_created` returns the empty board with `currentPlayer: 1`, `playerNumber: 2`, `aiNumber: 1`, and `message: "AI is thinking"`, then `board_updated` carries the recorded yellow AI opening move and switches `currentPlayer` to `2`.
 
 ### `join_game`
 
@@ -403,16 +431,24 @@ React gameplay uses Socket.IO. REST exposes `GET /api/health`, `GET /api/profile
 very_easy = depth 1, 3s
 easy = depth 2, 3s
 medium = depth 5, 3s
-hard = depth 7, 5s
+hard = depth 7, 4s
 ```
+
+### AI Turn Scheduling
+
+AI calculations run outside the per-game lock. While an AI move is calculating, `board_updated` includes `aiThinking: true` and the board remains available for reconnects.
+
+The backend admits at most one active calculation per configured AI worker. A non-terminal human move is rejected with `AI is busy, try again` before changing the board when all worker slots are occupied. Results are applied only when the original `gameId` and `move_number` still match; stale results are discarded.
 
 ## Board Values
 
 ```text
 0 = empty
-1 = yellow / human / player 1
-2 = red / AI / player 2
+1 = yellow / player 1
+2 = red / player 2
 ```
+
+In AI games, `playerNumber` is the human piece and `aiNumber` is the AI piece. These can swap when the AI starts. In multiplayer games, `playerNumber` is the local player's assigned piece.
 
 ## Status Values
 

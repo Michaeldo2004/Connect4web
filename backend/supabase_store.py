@@ -98,7 +98,12 @@ def next_move_number(game):
     return game["move_number"]
 
 
-def winner_for_status(status):
+def winner_for_status(status, game=None):
+    if game is not None and game.get("mode") != "multiplayer":
+        if status == "human_win":
+            return game.get("human_piece", 1)
+        if status == "ai_win":
+            return game.get("ai_piece", 2)
     return WINNER_BY_STATUS.get(status)
 
 
@@ -110,7 +115,7 @@ def game_payload(game_id, game):
         "mode": game.get("mode", "ai"),
         "difficulty": game.get("difficulty"),
         "status": status,
-        "winner_player_number": winner_for_status(status),
+        "winner_player_number": winner_for_status(status, game),
         "final_board": board_to_json(game.get("board")) if finished else None,
         "ended_at": now_iso() if finished else None,
         "analysis_status": "not_requested",
@@ -139,11 +144,13 @@ def game_player_payloads(game_id, game):
             for player in game.get("players", {}).values()
         ]
 
+    human_piece = game.get("human_piece", 1)
+    ai_piece = game.get("ai_piece", 2)
     return [
         {
             "game_id": db_id,
             "profile_id": game.get("profile_id"),
-            "player_number": 1,
+            "player_number": human_piece,
             "is_ai": False,
             "ai_difficulty": None,
             "display_name_snapshot": "Player",
@@ -151,7 +158,7 @@ def game_player_payloads(game_id, game):
         {
             "game_id": db_id,
             "profile_id": None,
-            "player_number": 2,
+            "player_number": ai_piece,
             "is_ai": True,
             "ai_difficulty": game.get("difficulty"),
             "display_name_snapshot": f"AI - {game.get('difficulty')}",
@@ -295,3 +302,35 @@ def fetch_completed_games(profile_id):
         })
 
     return sorted(completed_games, key=lambda game: game.get("endedAt") or game.get("startedAt") or "", reverse=True)
+
+
+def fetch_game_moves(profile_id, game_id):
+    db_id = db_game_id(game_id)
+    client = get_client()
+    if client is None or not profile_id or db_id is None:
+        return None
+
+    membership = (
+        client.table("game_players")
+        .select("game_id,games!inner(status)")
+        .eq("profile_id", profile_id)
+        .eq("game_id", db_id)
+        .execute()
+    )
+    if not membership.data:
+        return None
+
+    game_data = membership.data[0].get("games") or {}
+    if isinstance(game_data, list):
+        game_data = game_data[0] if game_data else {}
+    if game_data.get("status") not in COMPLETED_STATUSES:
+        return None
+
+    response = (
+        client.table("game_moves")
+        .select("move_number,player_number,column_played,board_before,board_after")
+        .eq("game_id", db_id)
+        .order("move_number")
+        .execute()
+    )
+    return response.data or []

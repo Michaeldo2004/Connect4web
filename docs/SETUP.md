@@ -36,6 +36,14 @@ Profile screen:
 http://localhost:5173/profiles
 ```
 
+Completed games can be opened for review at:
+
+```text
+http://localhost:5173/game/{gameId}/review
+```
+
+Game review displays each persisted board state and move navigation. Only completed games can be reviewed. Invalid review routes show `/404` and return home after three seconds. Move evaluation is not enabled yet.
+
 Placeholder legal pages:
 
 ```text
@@ -153,4 +161,4 @@ Ran 61 tests
 OK
 ```
 
-The tests cover AI websocket gameplay, AI opening move flow, yellow-token multiplayer starter assignment, two-player websocket rooms, public waiting-room listing and public join rejection, turn enforcement, reset with new game ids, reconnect, rematch voting with new game ids, leave-room behavior, the 15-second disconnect default-win rule, env-backed backend config, JWT/Supabase auth checks, win/draw profile game history, the database schema draft, and Supabase persistence payload behavior.
+The tests cover AI websocket gameplay, AI worker admission and stale-result protection, AI opening move flow, yellow-token multiplayer starter assignment, two-player websocket rooms, public waiting-room listing and public join rejection, turn enforcement, reset with new game ids, reconnect, rematch voting with new game ids, leave-room behavior, the 15-second disconnect default-win rule, env-backed backend config, JWT/Supabase auth checks, win/draw profile game history, the database schema draft, and Supabase persistence payload behavior.

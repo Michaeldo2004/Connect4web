@@ -97,6 +97,43 @@ class AuthLayerTests(unittest.TestCase):
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.get_json()["message"], "Login required")
 
+    def test_profile_game_moves_endpoint_returns_authenticated_history(self):
+        app.config["AUTH_REQUIRED"] = True
+        expected_moves = [{"move_number": 1, "player_number": 1, "column_played": 3}]
+
+        with patch.object(app_module, "verify_access_token", return_value=({"profile_id": "user-123"}, None)):
+            with patch.object(app_module.supabase_store, "fetch_game_moves", return_value=expected_moves) as fetch_moves:
+                response = app.test_client().get(
+                    "/api/profile/games/game-1/moves",
+                    headers={"Authorization": "Bearer token"},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["moves"], expected_moves)
+        fetch_moves.assert_called_once_with("user-123", "game-1")
+
+    def test_profile_game_moves_endpoint_rejects_missing_login(self):
+        app.config["AUTH_REQUIRED"] = True
+
+        with patch.object(app_module, "verify_access_token", return_value=(None, "Login required")):
+            response = app.test_client().get("/api/profile/games/game-1/moves")
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.get_json()["message"], "Login required")
+
+    def test_profile_game_moves_endpoint_rejects_inaccessible_game(self):
+        app.config["AUTH_REQUIRED"] = True
+
+        with patch.object(app_module, "verify_access_token", return_value=({"profile_id": "user-123"}, None)):
+            with patch.object(app_module.supabase_store, "fetch_game_moves", return_value=None):
+                response = app.test_client().get(
+                    "/api/profile/games/game-1/moves",
+                    headers={"Authorization": "Bearer token"},
+                )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.get_json()["message"], "Game history not found")
+
 
 if __name__ == "__main__":
     unittest.main()
