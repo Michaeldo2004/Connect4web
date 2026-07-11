@@ -39,7 +39,7 @@ test("profile route loads username and completed games", () => {
   assert.match(appSource, /const \[userProfile, setUserProfile\] = useState\(null\);/);
   assert.match(appSource, /const \[profileGames, setProfileGames\] = useState\(\[\]\);/);
   assert.match(appSource, /const profileStats = useMemo/);
-  assert.match(appSource, /function formatWinLossRatio\(wins, losses\)/);
+  assert.match(appSource, /function formatWinRate\(wins, total\)/);
   assert.match(appSource, /from\("profiles"\)/);
   assert.match(appSource, /select\("username,display_name"\)/);
   assert.match(appSource, /api\/profile\/games/);
@@ -51,9 +51,44 @@ test("profile route loads username and completed games", () => {
   assert.match(appSource, /className="profile-page"/);
   assert.match(appSource, /className="profile-stats"/);
   assert.match(appSource, />\s*Total played\s*</);
-  assert.match(appSource, />\s*W\/L ratio\s*</);
+  assert.match(appSource, />\s*Win rate\s*</);
   assert.match(appSource, /No completed games/);
   assert.match(appSource, /accountName/);
+});
+
+test("profile games open a dedicated move review", () => {
+  assert.match(appSource, /const GAME_REVIEW_PATH = `\$\{GAME_PATH\}\/review`;/);
+  assert.match(appSource, /function isGameReviewPath\(pathname\)/);
+  assert.match(appSource, /function gameReviewPath\(gameId\)/);
+  assert.match(appSource, /function getGameReviewId\(\)/);
+  assert.match(appSource, /const NOT_FOUND_PATH = "\/404";/);
+  assert.match(appSource, /redirectTo\(NOT_FOUND_PATH, true\)/);
+  assert.match(appSource, /Returning home in 3 seconds/);
+  assert.match(appSource, /setTimeout\(\(\) => redirectTo\(SETUP_PATH, true\), 3000\)/);
+  assert.match(appSource, /api\/profile\/games\/\$\{encodeURIComponent\(selectedGameId\)\}\/moves/);
+  assert.match(appSource, /GAME_REVIEW_PATH/);
+  assert.match(appSource, />\s*Review Game\s*</);
+  assert.match(appSource, />\s*Back to games\s*</);
+  assert.match(appSource, /aria-label="Previous move"/);
+  assert.match(appSource, /aria-label="Next move"/);
+  assert.match(appSource, /splitIntoRows\(reviewMoves, 10\)/);
+  assert.match(appSource, /className=\{`review-move-button player-\$\{move\.player_number\}/);
+  assert.match(appSource, /board review-board/);
+  assert.match(appSource, /reviewAnimatedPieces/);
+  assert.match(appSource, /reviewWinningPieces/);
+  assert.match(appSource, /findChangedPieces\(previousBoard, currentBoard\)/);
+  assert.match(appSource, /reviewMoveIndex === reviewMoves\.length - 1 \? findWinningPieces\(currentBoard\)/);
+  assert.match(appSource, /drop-start/);
+  assert.match(appSource, /review-drop-\$\{reviewAnimationRun\}/);
+  assert.match(appSource, /function formatReviewStatus\(result\)/);
+  assert.match(appSource, /You Win/);
+  assert.match(appSource, /You Lost/);
+  assert.match(appSource, /return "Tie"/);
+  assert.match(appSource, /className="status-panel review-status-panel"/);
+  assert.match(appSource, /You moved first/);
+  assert.match(appSource, /You moved Second/);
+  assert.match(appSource, /review-player-first/);
+  assert.match(appSource, /review-player-second/);
 });
 
 test("join route supports public room discovery", () => {
@@ -89,8 +124,25 @@ test("nav shell includes brand and auth entry points", () => {
   assert.match(appSource, /className="site-nav"/);
   assert.match(appSource, /className="brand-mark"/);
   assert.match(appSource, />\s*CONNECT 4\s*</);
+  assert.match(appSource, /const THEME_KEY = "connect4_theme";/);
+  assert.match(appSource, /const \[theme, setTheme\] = useState\(getInitialTheme\);/);
+  assert.match(appSource, /className=\{`app-shell theme-\$\{theme\}`\}/);
+  assert.match(appSource, /className="theme-toggle-button"/);
+  assert.match(appSource, /Switch to \$\{themeToggleLabel\.toLowerCase\(\)\} theme/);
   assert.match(appSource, /Sign up \/ Login/);
   assert.match(appSource, /openAuthModal\("login"\)/);
+});
+
+test("loading states use skeleton views", () => {
+  assert.match(appSource, /function SkeletonBlock/);
+  assert.match(appSource, /function GameLoadingSkeleton/);
+  assert.match(appSource, /function ProfileLoadingSkeleton/);
+  assert.match(appSource, /function PublicRoomsSkeleton/);
+  assert.match(appSource, /<GameLoadingSkeleton message=\{message\} \/>/);
+  assert.match(appSource, /<ProfileLoadingSkeleton \/>/);
+  assert.match(appSource, /<PublicRoomsSkeleton \/>/);
+  assert.match(cssSource, /\.skeleton-block/);
+  assert.match(cssSource, /@keyframes skeleton-pulse/);
 });
 
 test("auth modal supports login, signup, and close states", () => {
@@ -137,9 +189,14 @@ test("connect 4 theme and mobile layout rules exist", () => {
   assert.match(cssSource, /--brand-blue:/);
   assert.match(cssSource, /--brand-red:/);
   assert.match(cssSource, /--brand-yellow:/);
+  assert.match(cssSource, /\.theme-dark\s*\{/);
+  assert.match(cssSource, /\.theme-toggle-button\s*\{/);
   assert.match(cssSource, /\.brand-mark\s*\{/);
   assert.match(cssSource, /\.profile-page\s*\{/);
   assert.match(cssSource, /\.profile-game-row\s*\{/);
+  assert.match(cssSource, /\.review-board-layout\s*\{/);
+  assert.match(cssSource, /\.review-move-row\s*\{/);
+  assert.match(cssSource, /\.review-move-button\.current\s*\{/);
   assert.match(cssSource, /color: var\(--brand-yellow\);/);
   assert.match(cssSource, /@media \(max-width: 760px\)/);
   assert.match(cssSource, /\.play-layout\s*\{\s*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/);

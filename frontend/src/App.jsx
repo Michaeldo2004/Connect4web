@@ -6,6 +6,7 @@ const STORAGE_KEY = "connect4_game_session";
 const MULTIPLAYER_STORAGE_KEY = "connect4_multiplayer_session";
 const PENDING_GAME_KEY = "connect4_pending_game";
 const PENDING_MULTIPLAYER_JOIN_KEY = "connect4_pending_multiplayer_join";
+const THEME_KEY = "connect4_theme";
 const SOCKET_URL = getEnvString("VITE_BACKEND_URL", "http://localhost:5000").replace(/\/+$/, "");
 const SETUP_PATH = getEnvRoute("VITE_SETUP_PATH", "/");
 const GAME_PATH = getEnvRoute("VITE_GAME_PATH", "/game");
@@ -13,9 +14,11 @@ const JOIN_PATH = getEnvRoute("VITE_JOIN_PATH", "/join");
 const LOGIN_PATH = getEnvRoute("VITE_LOGIN_PATH", "/login");
 const SIGNUP_PATH = getEnvRoute("VITE_SIGNUP_PATH", "/signup");
 const PROFILE_PATH = getEnvRoute("VITE_PROFILE_PATH", "/profiles");
+const GAME_REVIEW_PATH = `${GAME_PATH}/review`;
+const NOT_FOUND_PATH = "/404";
 const TOS_PATH = getEnvRoute("VITE_TOS_PATH", "/tos");
 const PRIVACY_POLICY_PATH = getEnvRoute("VITE_PRIVACY_POLICY_PATH", "/privacypolicy");
-const APP_PATHS = new Set([SETUP_PATH, GAME_PATH, JOIN_PATH, LOGIN_PATH, SIGNUP_PATH, PROFILE_PATH, TOS_PATH, PRIVACY_POLICY_PATH]);
+const APP_PATHS = new Set([SETUP_PATH, GAME_PATH, JOIN_PATH, LOGIN_PATH, SIGNUP_PATH, PROFILE_PATH, GAME_REVIEW_PATH, NOT_FOUND_PATH, TOS_PATH, PRIVACY_POLICY_PATH]);
 const ROWS = 6;
 const COLS = 7;
 
@@ -29,7 +32,7 @@ const DIFFICULTIES = [
   { key: "very_easy", label: "Very Easy", depth: 1, timeLimit: "3s" },
   { key: "easy", label: "Easy", depth: 2, timeLimit: "3s" },
   { key: "medium", label: "Medium", depth: 5, timeLimit: "3s" },
-  { key: "hard", label: "Hard", depth: 7, timeLimit: "5s" },
+  { key: "hard", label: "Hard", depth: 7, timeLimit: "4s" },
 ];
 const USERNAME_MAX_LENGTH = 32;
 const EMAIL_MAX_LENGTH = 254;
@@ -63,6 +66,62 @@ function createAuthClient() {
   }
 
   return createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
+}
+
+function getInitialTheme() {
+  const storedTheme = window.localStorage.getItem(THEME_KEY);
+  if (storedTheme === "dark" || storedTheme === "light") {
+    return storedTheme;
+  }
+
+  return window.matchMedia?.("(prefers-color-scheme: dark)")?.matches ? "dark" : "light";
+}
+
+function SkeletonBlock({ className = "" }) {
+  return <span className={`skeleton-block ${className}`.trim()} aria-hidden="true" />;
+}
+
+function GameLoadingSkeleton({ message }) {
+  return (
+    <section className="difficulty-panel loading-panel" aria-busy="true">
+      <SkeletonBlock className="skeleton-title" />
+      <SkeletonBlock className="skeleton-line skeleton-line-wide" />
+      <div className="skeleton-board" aria-hidden="true">
+        {Array.from({ length: ROWS * COLS }, (_, index) => (
+          <span key={index} />
+        ))}
+      </div>
+      <span className="sr-only">{message}</span>
+    </section>
+  );
+}
+
+function ProfileLoadingSkeleton() {
+  return (
+    <section className="profile-skeleton" aria-label="Loading completed games" aria-busy="true">
+      {Array.from({ length: 3 }, (_, index) => (
+        <article className="profile-game-row skeleton-row" key={index}>
+          <SkeletonBlock />
+          <SkeletonBlock />
+          <SkeletonBlock />
+          <SkeletonBlock className="skeleton-button" />
+        </article>
+      ))}
+    </section>
+  );
+}
+
+function PublicRoomsSkeleton() {
+  return (
+    <div className="public-games-list" aria-label="Loading public rooms" aria-busy="true">
+      {Array.from({ length: 2 }, (_, index) => (
+        <div className="public-game-row skeleton-row" key={index}>
+          <SkeletonBlock />
+          <SkeletonBlock className="skeleton-button" />
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function emptyBoard() {
@@ -180,6 +239,14 @@ function wait(ms) {
   });
 }
 
+function splitIntoRows(items, rowSize) {
+  const rows = [];
+  for (let index = 0; index < items.length; index += rowSize) {
+    rows.push(items.slice(index, index + rowSize));
+  }
+  return rows;
+}
+
 function saveSession(gameId, playerId) {
   window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ gameId, playerId }));
 }
@@ -287,24 +354,45 @@ function formatGameStatus(status) {
   return statusLabels[status] || status.replace("_", " ");
 }
 
-function formatWinLossRatio(wins, losses) {
-  if (losses === 0) {
-    return wins === 0 ? "0.00" : `${wins}.00`;
+function formatReviewStatus(result) {
+  if (result === "Win") {
+    return "You Win";
+  }
+  if (result === "Loss") {
+    return "You Lost";
+  }
+  if (result === "Draw") {
+    return "Tie";
+  }
+  return "-";
+}
+
+function formatWinRate(wins, total) {
+  if (total === 0) {
+    return "0%";
   }
 
-  return (wins / losses).toFixed(2);
+  return `${Math.round((wins / total) * 100)}%`;
 }
 
 function isGamePath(pathname) {
   return pathname === GAME_PATH || pathname.startsWith(`${GAME_PATH}/`);
 }
 
+function isGameReviewPath(pathname) {
+  return pathname.startsWith(`${GAME_PATH}/`) && pathname.endsWith("/review");
+}
+
 function gamePath(gameId) {
   return gameId ? `${GAME_PATH}/${encodeURIComponent(gameId)}` : GAME_PATH;
 }
 
+function gameReviewPath(gameId) {
+  return gameId ? `${GAME_PATH}/${encodeURIComponent(gameId)}/review` : GAME_REVIEW_PATH;
+}
+
 function getRouteGameId() {
-  if (!isGamePath(window.location.pathname) || window.location.pathname === GAME_PATH) {
+  if (!isGamePath(window.location.pathname) || window.location.pathname === GAME_PATH || isGameReviewPath(window.location.pathname)) {
     return null;
   }
 
@@ -312,7 +400,21 @@ function getRouteGameId() {
   return gameId ? decodeURIComponent(gameId) : null;
 }
 
+function getGameReviewId() {
+  if (!isGameReviewPath(window.location.pathname)) {
+    return null;
+  }
+
+  const reviewPath = window.location.pathname.slice(GAME_PATH.length + 1, -"/review".length);
+  const [gameId] = reviewPath.split("/");
+  return gameId ? decodeURIComponent(gameId) : null;
+}
+
 function getCurrentPath() {
+  if (isGameReviewPath(window.location.pathname)) {
+    return GAME_REVIEW_PATH;
+  }
+
   if (isGamePath(window.location.pathname)) {
     return GAME_PATH;
   }
@@ -324,7 +426,7 @@ function App() {
   const [routePath, setRoutePath] = useState(getCurrentPath);
   const [board, setBoard] = useState(emptyBoard);
   const [status, setStatus] = useState("setup");
-  const [message, setMessage] = useState(() => (getCurrentPath() === GAME_PATH ? "Loading game..." : "Choose difficulty"));
+  const [message, setMessage] = useState(() => ([GAME_PATH, GAME_REVIEW_PATH].includes(getCurrentPath()) ? "Loading game..." : "Choose difficulty"));
   const [busy, setBusy] = useState(false);
   const [gameStarted, setGameStarted] = useState(false);
   const [selectedDifficulty, setSelectedDifficulty] = useState(DEFAULT_DIFFICULTY);
@@ -339,6 +441,7 @@ function App() {
   const [gameMode, setGameMode] = useState(GAME_MODE_AI);
   const [selectedSetupMode, setSelectedSetupMode] = useState(GAME_MODE_AI);
   const [playerNumber, setPlayerNumber] = useState(null);
+  const [aiNumber, setAiNumber] = useState(AI);
   const [playersConnected, setPlayersConnected] = useState(0);
   const [currentPlayer, setCurrentPlayer] = useState(PLAYER);
   const [joinGameId, setJoinGameId] = useState("");
@@ -363,11 +466,21 @@ function App() {
   const [profileGames, setProfileGames] = useState([]);
   const [profileLoading, setProfileLoading] = useState(false);
   const [profileError, setProfileError] = useState("");
+  const [reviewMoves, setReviewMoves] = useState([]);
+  const [reviewMoveIndex, setReviewMoveIndex] = useState(0);
+  const [reviewAnimatedPieces, setReviewAnimatedPieces] = useState([]);
+  const [reviewAnimationRun, setReviewAnimationRun] = useState(0);
+  const [reviewWinningPieces, setReviewWinningPieces] = useState([]);
+  const [reviewLoading, setReviewLoading] = useState(false);
+  const [reviewError, setReviewError] = useState("");
   const [authReady, setAuthReady] = useState(!supabaseClient);
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState("");
+  const [theme, setTheme] = useState(getInitialTheme);
 
   const boardRef = useRef(board);
+  const playerNumberRef = useRef(playerNumber);
+  const aiNumberRef = useRef(aiNumber);
   const pendingMoveRef = useRef(null);
 
   const gameOver = useMemo(() => {
@@ -391,13 +504,44 @@ function App() {
 
     return {
       ...stats,
-      winLossRatio: formatWinLossRatio(stats.wins, stats.losses),
+      winRate: formatWinRate(stats.wins, stats.total),
     };
   }, [profileGames]);
+  const gameReviewId = getGameReviewId();
+  const reviewGame = profileGames.find((game) => game.id === gameReviewId) || null;
+  const reviewBoard = reviewMoves[reviewMoveIndex]?.board_after || emptyBoard();
+
+  useEffect(() => {
+    window.localStorage.setItem(THEME_KEY, theme);
+  }, [theme]);
+
+  useEffect(() => {
+    if (reviewMoves.length === 0) {
+      setReviewAnimatedPieces([]);
+      setReviewWinningPieces([]);
+      return;
+    }
+
+    const currentBoard = reviewMoves[reviewMoveIndex]?.board_after || emptyBoard();
+    const previousBoard = reviewMoves[reviewMoveIndex - 1]?.board_after || emptyBoard();
+    setReviewAnimatedPieces(findChangedPieces(previousBoard, currentBoard));
+    setReviewWinningPieces(
+      reviewMoveIndex === reviewMoves.length - 1 ? findWinningPieces(currentBoard) : [],
+    );
+    setReviewAnimationRun((currentRun) => currentRun + 1);
+  }, [reviewMoves, reviewMoveIndex]);
 
   useEffect(() => {
     boardRef.current = board;
   }, [board]);
+
+  useEffect(() => {
+    playerNumberRef.current = playerNumber;
+  }, [playerNumber]);
+
+  useEffect(() => {
+    aiNumberRef.current = aiNumber;
+  }, [aiNumber]);
 
   useEffect(() => {
     if (!supabaseClient) {
@@ -466,6 +610,7 @@ function App() {
     setGameMode(GAME_MODE_AI);
     setSelectedSetupMode(GAME_MODE_AI);
     setPlayerNumber(null);
+    setAiNumber(AI);
     setPlayersConnected(0);
     setCurrentPlayer(PLAYER);
     setDisconnectDeadline(null);
@@ -488,8 +633,10 @@ function App() {
 
     const previousBoard = pendingMove?.board || boardRef.current;
     const changedPieces = findChangedPieces(previousBoard, data.board);
-    const playerColumn = findMoveColumn(previousBoard, data.board, PLAYER);
-    const aiColumn = findMoveColumn(previousBoard, data.board, AI);
+    const nextPlayerNumber = data.playerNumber || playerNumberRef.current || PLAYER;
+    const nextAiNumber = data.aiNumber || aiNumberRef.current || AI;
+    const playerColumn = findMoveColumn(previousBoard, data.board, nextPlayerNumber);
+    const aiColumn = data.mode !== GAME_MODE_MULTIPLAYER ? findMoveColumn(previousBoard, data.board, nextAiNumber) : null;
     const winningLine = findWinningPieces(data.board);
 
     pendingMoveRef.current = null;
@@ -505,6 +652,9 @@ function App() {
     if (data.playerNumber) {
       setPlayerNumber(data.playerNumber);
     }
+    if (data.aiNumber) {
+      setAiNumber(data.aiNumber);
+    }
     setPlayersConnected(data.playersConnected || 0);
     setDisconnectDeadline(data.disconnectDeadline || null);
     setPlayAgainAccepted(data.playAgainAccepted || 0);
@@ -513,7 +663,7 @@ function App() {
       setPlayAgainRequested(false);
     }
     setGameStarted(true);
-    setBusy(data.mode !== GAME_MODE_MULTIPLAYER && data.currentPlayer === AI && data.status === "playing");
+    setBusy(data.mode !== GAME_MODE_MULTIPLAYER && data.currentPlayer === nextAiNumber && data.status === "playing");
 
     if (data.mode === GAME_MODE_MULTIPLAYER && playerColumn !== null) {
       setPlayerMoves((currentMoves) => [playerColumn, ...currentMoves]);
@@ -578,6 +728,39 @@ function App() {
     }
   }, [authSession]);
 
+  const loadGameReview = useCallback(async (selectedGameId) => {
+    if (!authSession?.access_token || !selectedGameId) {
+      setReviewMoves([]);
+      return;
+    }
+
+    setReviewLoading(true);
+    setReviewError("");
+    setReviewMoveIndex(0);
+    try {
+      const response = await fetch(`${SOCKET_URL}/api/profile/games/${encodeURIComponent(selectedGameId)}/moves`, {
+        headers: {
+          Authorization: `Bearer ${authSession.access_token}`,
+        },
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        redirectTo(NOT_FOUND_PATH, true);
+        return;
+      }
+      if (!Array.isArray(data.moves) || data.moves.length === 0) {
+        redirectTo(NOT_FOUND_PATH, true);
+        return;
+      }
+      setReviewMoves(data.moves);
+    } catch (error) {
+      setReviewError(error.message);
+      setReviewMoves([]);
+    } finally {
+      setReviewLoading(false);
+    }
+  }, [authSession, redirectTo]);
+
   useEffect(() => {
     if (!authSession) {
       setUserProfile(null);
@@ -589,10 +772,33 @@ function App() {
   }, [authSession, loadUserProfile]);
 
   useEffect(() => {
-    if (routePath === PROFILE_PATH && authSession) {
+    if ((routePath === PROFILE_PATH || routePath === GAME_REVIEW_PATH) && authSession) {
       loadProfileGames();
     }
   }, [authSession, loadProfileGames, routePath]);
+
+  useEffect(() => {
+    if (routePath === GAME_REVIEW_PATH && authSession) {
+      if (gameReviewId) {
+        loadGameReview(gameReviewId);
+      } else {
+        redirectTo(NOT_FOUND_PATH, true);
+      }
+      return;
+    }
+
+    setReviewMoves([]);
+    setReviewError("");
+  }, [authSession, gameReviewId, loadGameReview, redirectTo, routePath]);
+
+  useEffect(() => {
+    if (routePath !== NOT_FOUND_PATH) {
+      return undefined;
+    }
+
+    const redirectTimer = window.setTimeout(() => redirectTo(SETUP_PATH, true), 3000);
+    return () => window.clearTimeout(redirectTimer);
+  }, [redirectTo, routePath]);
 
   useEffect(() => {
     const nextSocket = io(SOCKET_URL, { transports: ["websocket"] });
@@ -647,7 +853,8 @@ function App() {
       setGameId(data.gameId);
       setPlayerId(data.playerId);
       setGameMode(data.mode || GAME_MODE_AI);
-      setPlayerNumber(null);
+      setPlayerNumber(data.playerNumber || null);
+      setAiNumber(data.aiNumber || AI);
       setPlayersConnected(data.playersConnected || 0);
       setCurrentPlayer(data.currentPlayer || PLAYER);
       setDisconnectDeadline(data.disconnectDeadline || null);
@@ -662,7 +869,7 @@ function App() {
       setPlayerMoves([]);
       setAiMoves([]);
       setGameStarted(true);
-      setBusy(data.mode !== GAME_MODE_MULTIPLAYER && data.currentPlayer === AI && data.status === "playing");
+      setBusy(data.mode !== GAME_MODE_MULTIPLAYER && data.currentPlayer === (data.aiNumber || AI) && data.status === "playing");
       redirectTo(gamePath(data.gameId));
     }
 
@@ -672,6 +879,7 @@ function App() {
       setPlayerId(storedSession?.playerId || null);
       setGameMode(data.mode || GAME_MODE_AI);
       setPlayerNumber(data.playerNumber || null);
+      setAiNumber(data.aiNumber || AI);
       setPlayersConnected(data.playersConnected || 0);
       setCurrentPlayer(data.currentPlayer || PLAYER);
       setDisconnectDeadline(data.disconnectDeadline || null);
@@ -686,7 +894,7 @@ function App() {
       setPlayerMoves([]);
       setAiMoves([]);
       setGameStarted(true);
-      setBusy(data.mode !== GAME_MODE_MULTIPLAYER && data.currentPlayer === AI && data.status === "playing");
+      setBusy(data.mode !== GAME_MODE_MULTIPLAYER && data.currentPlayer === (data.aiNumber || AI) && data.status === "playing");
       redirectTo(gamePath(data.gameId), true);
     }
 
@@ -696,6 +904,7 @@ function App() {
       setGameId(data.gameId);
       setPlayerId(data.playerId);
       setPlayerNumber(data.playerNumber);
+      setAiNumber(AI);
       setPlayersConnected(data.playersConnected || 0);
       setCurrentPlayer(data.currentPlayer || PLAYER);
       setDisconnectDeadline(data.disconnectDeadline || null);
@@ -843,6 +1052,7 @@ function App() {
     pendingMoveRef.current = null;
     setGameMode(GAME_MODE_MULTIPLAYER);
     setPlayerNumber(null);
+    setAiNumber(AI);
     setCurrentPlayer(PLAYER);
     setBoard(emptyBoard());
     setAnimatedPieces([]);
@@ -876,6 +1086,7 @@ function App() {
     clearMultiplayerSession();
     setGameMode(GAME_MODE_MULTIPLAYER);
     setPlayerNumber(null);
+    setAiNumber(AI);
     setCurrentPlayer(PLAYER);
     setBoard(emptyBoard());
     setAnimatedPieces([]);
@@ -1040,13 +1251,14 @@ function App() {
       return;
     }
 
-    if (!socketClient?.connected || !gameId || !playerId || currentPlayer !== PLAYER) {
+    const humanPiece = playerNumber || PLAYER;
+    if (!socketClient?.connected || !gameId || !playerId || currentPlayer !== humanPiece) {
       return;
     }
 
     setBusy(true);
     setMessage("AI is thinking...");
-    const playerBoard = applyLocalMove(board, column, PLAYER);
+    const playerBoard = applyLocalMove(board, column, humanPiece);
     const playerPieces = findChangedPieces(board, playerBoard);
     pendingMoveRef.current = {
       board: playerBoard,
@@ -1242,11 +1454,12 @@ function App() {
     !busy &&
     !gameOver &&
     status === "playing" &&
-    ((gameMode === GAME_MODE_AI && currentPlayer === PLAYER) ||
+    ((gameMode === GAME_MODE_AI && currentPlayer === (playerNumber || PLAYER)) ||
       (gameMode === GAME_MODE_MULTIPLAYER && playerNumber === currentPlayer && playersConnected === 2));
   const showingSetup = routePath === SETUP_PATH;
   const showingJoin = routePath === JOIN_PATH;
   const showingGame = routePath === GAME_PATH;
+  const showingGameReview = routePath === GAME_REVIEW_PATH;
   const showingProfile = routePath === PROFILE_PATH;
   const showingLegalPage = routePath === TOS_PATH || routePath === PRIVACY_POLICY_PATH;
   let displayMessage = message;
@@ -1274,6 +1487,10 @@ function App() {
   const opponentMoveLabel = gameMode === GAME_MODE_MULTIPLAYER ? "Other player's moves" : "AI moves";
   const isAuthenticated = Boolean(authSession);
   const accountName = userProfile?.display_name || userProfile?.username || authSession?.user?.user_metadata?.username || "Account";
+  const themeToggleLabel = theme === "dark" ? "Light" : "Dark";
+  const toggleTheme = () => {
+    setTheme((currentTheme) => (currentTheme === "dark" ? "light" : "dark"));
+  };
   const authForm = (
     <>
       <div className="auth-mode-tabs" role="tablist" aria-label="Auth mode">
@@ -1357,9 +1574,7 @@ function App() {
     </section>
   );
   const setupView = !authReady ? (
-    <section className="difficulty-panel">
-      <strong>Loading account...</strong>
-    </section>
+    <GameLoadingSkeleton message="Loading account..." />
   ) : !isAuthenticated ? (
     authRequiredView
   ) : (
@@ -1408,9 +1623,7 @@ function App() {
     </section>
   );
   const joinGameView = !authReady ? (
-    <section className="difficulty-panel">
-      <strong>Loading account...</strong>
-    </section>
+    <GameLoadingSkeleton message="Loading account..." />
   ) : !isAuthenticated ? (
     authRequiredView
   ) : (
@@ -1437,7 +1650,7 @@ function App() {
           </button>
         </div>
         {publicGamesLoading ? (
-          <span className="public-games-empty">Loading rooms...</span>
+          <PublicRoomsSkeleton />
         ) : publicGames.length === 0 ? (
           <span className="public-games-empty">No public rooms</span>
         ) : (
@@ -1471,8 +1684,123 @@ function App() {
     </section>
   );
   const loadingView = (
-    <section className="difficulty-panel">
-      <strong>{message}</strong>
+    <GameLoadingSkeleton message={message} />
+  );
+  const profileReviewView = (
+    <section className="profile-page profile-review-page">
+      <div className="profile-header">
+        <div>
+          <span>Game review</span>
+          <strong>{reviewGame ? formatGameStatus(reviewGame.status) : "Completed game"}</strong>
+        </div>
+        <button type="button" onClick={() => redirectTo(PROFILE_PATH)}>
+          Back to games
+        </button>
+      </div>
+      <section className="status-panel review-status-panel" aria-label="Game review details">
+        <div>
+          <span>Status</span>
+          <strong>{formatReviewStatus(reviewGame?.result)}</strong>
+        </div>
+        <div>
+          <span>Game Mode</span>
+          <strong>
+            {reviewGame
+              ? reviewGame.mode === GAME_MODE_MULTIPLAYER
+                ? "Vs Player"
+                : `AI - ${formatDifficulty(reviewGame.difficulty || DEFAULT_DIFFICULTY)}`
+              : "-"}
+          </strong>
+        </div>
+        <div>
+          <span>Room</span>
+          <strong>{reviewGame?.id || gameReviewId || "-"}</strong>
+        </div>
+        <div>
+          <span>Move Order</span>
+          <strong className={reviewGame?.playerNumber === 1 ? "review-player-first" : reviewGame?.playerNumber === 2 ? "review-player-second" : ""}>
+            {reviewGame?.playerNumber === 1 ? "You moved first" : reviewGame?.playerNumber === 2 ? "You moved Second" : "-"}
+          </strong>
+        </div>
+      </section>
+      {reviewLoading ? (
+        <ProfileLoadingSkeleton />
+      ) : reviewError ? (
+        <strong className="profile-error">{reviewError}</strong>
+      ) : reviewMoves.length === 0 ? (
+        <section className="profile-empty">
+          <strong>No move history available</strong>
+        </section>
+      ) : (
+        <>
+          <div className="review-board-layout">
+            <button
+              className="review-navigation review-navigation-previous"
+              type="button"
+              onClick={() => setReviewMoveIndex((index) => Math.max(0, index - 1))}
+              disabled={reviewMoveIndex === 0}
+              aria-label="Previous move"
+            >
+              &lt;
+            </button>
+            <div className="board-area review-board-area">
+              <div className="board review-board" role="grid" aria-label={`Board after move ${reviewMoves[reviewMoveIndex].move_number}`}>
+                {reviewBoard.flatMap((row, rowIndex) =>
+                  row.map((cell, columnIndex) => {
+                    const pieceKey = `${rowIndex}-${columnIndex}`;
+                    const isDropping = reviewAnimatedPieces.includes(pieceKey);
+                    const isWinning = reviewWinningPieces.includes(pieceKey);
+
+                    return (
+                      <div
+                        key={pieceKey}
+                        className={`cell player-${cell}${isDropping ? " dropping" : ""}${isWinning ? " winning" : ""}`}
+                        style={isDropping ? { "--drop-start": `-${(rowIndex + 1) * 115}%` } : undefined}
+                        role="gridcell"
+                        aria-label={`Row ${rowIndex + 1}, column ${columnIndex + 1}`}
+                      >
+                        <span key={isDropping ? `review-drop-${reviewAnimationRun}` : "review-piece"} />
+                      </div>
+                    );
+                  }),
+                )}
+              </div>
+            </div>
+            <button
+              className="review-navigation review-navigation-next"
+              type="button"
+              onClick={() => setReviewMoveIndex((index) => Math.min(reviewMoves.length - 1, index + 1))}
+              disabled={reviewMoveIndex === reviewMoves.length - 1}
+              aria-label="Next move"
+            >
+              &gt;
+            </button>
+          </div>
+          <div className="review-move-list" aria-label="Game moves">
+            {splitIntoRows(reviewMoves, 10).map((row, rowIndex) => (
+              <div className="review-move-row" key={`review-row-${rowIndex}`}>
+                {row.map((move, index) => {
+                  const moveIndex = rowIndex * 10 + index;
+                  return (
+                    <span className="review-move-entry" key={move.move_number}>
+                      <button
+                        type="button"
+                        className={`review-move-button player-${move.player_number}${moveIndex === reviewMoveIndex ? " current" : ""}`}
+                        onClick={() => setReviewMoveIndex(moveIndex)}
+                        aria-label={`Show move ${move.move_number}`}
+                        aria-current={moveIndex === reviewMoveIndex ? "step" : undefined}
+                      >
+                        {move.move_number}
+                      </button>
+                      {index < row.length - 1 ? <span className="review-move-separator" aria-hidden="true">&gt;</span> : null}
+                    </span>
+                  );
+                })}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
     </section>
   );
   const profileView = (
@@ -1504,15 +1832,13 @@ function App() {
           <strong>{profileStats.draws}</strong>
         </div>
         <div>
-          <span>W/L ratio</span>
-          <strong>{profileStats.winLossRatio}</strong>
+          <span>Win rate</span>
+          <strong>{profileStats.winRate}</strong>
         </div>
       </section>
       {profileError ? <strong className="profile-error">{profileError}</strong> : null}
       {profileLoading ? (
-        <section className="profile-empty">
-          <strong>Loading games...</strong>
-        </section>
+        <ProfileLoadingSkeleton />
       ) : profileGames.length === 0 ? (
         <section className="profile-empty">
           <strong>No completed games</strong>
@@ -1533,9 +1859,10 @@ function App() {
                 <span>Played</span>
                 <strong>{formatDateTime(game.endedAt || game.startedAt)}</strong>
               </div>
-              <div>
-                <span>Room</span>
-                <strong>{game.id}</strong>
+              <div className="profile-game-action">
+                <button type="button" onClick={() => redirectTo(gameReviewPath(game.id))}>
+                  Review Game
+                </button>
               </div>
             </article>
           ))}
@@ -1652,9 +1979,15 @@ function App() {
       ) : null}
     </section>
   ) : null;
+  const notFoundView = (
+    <section className="blank-page not-found-page" aria-label="Page not found">
+      <h1>404</h1>
+      <p>Page not found. Returning home in 3 seconds.</p>
+    </section>
+  );
   const legalView = <section className="blank-page" aria-label={routePath === TOS_PATH ? "Terms of Service" : "Privacy Policy"} />;
   let pageView = setupView;
-  if (!authReady && (showingSetup || showingGame || showingProfile)) {
+  if (!authReady && (showingSetup || showingGame || showingGameReview || showingProfile)) {
     pageView = loadingView;
   } else if (routePath === LOGIN_PATH || routePath === SIGNUP_PATH) {
     pageView = authPageView;
@@ -1662,18 +1995,24 @@ function App() {
     pageView = authRequiredView;
   } else if (showingGame) {
     pageView = gameStarted ? gameView : loadingView;
+  } else if (showingGameReview && !isAuthenticated) {
+    pageView = authRequiredView;
   } else if (showingJoin) {
     pageView = joinGameView;
   } else if (showingProfile && !isAuthenticated) {
     pageView = authRequiredView;
+  } else if (showingGameReview) {
+    pageView = profileReviewView;
   } else if (showingProfile) {
     pageView = profileView;
   } else if (showingLegalPage) {
     pageView = legalView;
+  } else if (routePath === NOT_FOUND_PATH) {
+    pageView = notFoundView;
   }
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell theme-${theme}`}>
       <header className="site-nav">
         <a className="brand-mark" href={SETUP_PATH}>
           CONNECT 4
@@ -1686,6 +2025,9 @@ function App() {
             }}>
               Profile
             </a>
+            <button className="theme-toggle-button" type="button" onClick={toggleTheme} aria-label={`Switch to ${themeToggleLabel.toLowerCase()} theme`}>
+              {themeToggleLabel}
+            </button>
             <span>{accountName}</span>
             <button className="auth-open-button" type="button" onClick={logout}>
               Logout
@@ -1693,6 +2035,9 @@ function App() {
           </div>
         ) : (
           <div className="account-actions">
+            <button className="theme-toggle-button" type="button" onClick={toggleTheme} aria-label={`Switch to ${themeToggleLabel.toLowerCase()} theme`}>
+              {themeToggleLabel}
+            </button>
             <a className="auth-route-link" href={LOGIN_PATH}>
               Login
             </a>
