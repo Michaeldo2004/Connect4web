@@ -1,0 +1,478 @@
+import os
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+COMPLETED_STATUSES = {"human_win", "ai_win", "player1_win", "player2_win", "draw"}
+GAME_OVER_STATUSES = COMPLETED_STATUSES | {"abandoned"}
+WINNER_BY_STATUS = {
+    "human_win": 1,
+    "ai_win": 2,
+    "player1_win": 1,
+    "player2_win": 2,
+}
+
+_env_loaded = False
+_client_checked = False
+_client = None
+
+
+def load_local_env():
+    global _env_loaded
+    if _env_loaded:
+        return
+
+    env_path = Path(__file__).with_name(".env")
+    if env_path.exists():
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
+
+    _env_loaded = True
+
+
+def get_client():
+    global _client_checked, _client
+    if _client_checked:
+        return _client
+
+    load_local_env()
+    url = os.environ.get("SUPABASE_URL")
+    secret_key = os.environ.get("SUPABASE_SECRET_KEY")
+    if not url or not secret_key:
+        _client_checked = True
+        return None
+
+    try:
+        from supabase import create_client
+
+        _client = create_client(url, secret_key)
+    except Exception as error:
+        print(f"Supabase sync disabled: {error.__class__.__name__}")
+        _client = None
+
+    _client_checked = True
+    return _client
+
+
+def is_enabled():
+    return get_client() is not None
+
+
+def execute_safely(action):
+    client = get_client()
+    if client is None:
+        return False
+
+    try:
+        action(client)
+        return True
+    except Exception as error:
+        print(f"Supabase sync failed: {error.__class__.__name__}")
+        return False
+
+
+def db_game_id(game_id):
+    try:
+        return str(uuid.UUID(str(game_id)))
+    except (TypeError, ValueError):
+        return None
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def board_to_json(board):
+    if hasattr(board, "astype"):
+        return board.astype(int).tolist()
+    return board
+
+
+def next_move_number(game):
+    game["move_number"] = game.get("move_number", 0) + 1
+    return game["move_number"]
+
+
+def winner_for_status(status, game=None):
+    if game is not None and game.get("mode") != "multiplayer":
+        if status == "human_win":
+            return game.get("human_piece", 1)
+        if status == "ai_win":
+            return game.get("ai_piece", 2)
+    return WINNER_BY_STATUS.get(status)
+
+
+def game_payload(game_id, game):
+    status = game.get("status", "playing")
+    finished = status in GAME_OVER_STATUSES
+    payload = {
+        "id": db_game_id(game_id),
+        "mode": game.get("mode", "ai"),
+        "difficulty": game.get("difficulty"),
+        "status": status,
+        "winner_player_number": winner_for_status(status, game),
+        "final_board": board_to_json(game.get("board")) if finished else None,
+        "ended_at": now_iso() if finished else None,
+        "analysis_status": "not_requested",
+        "analysis_requested_at": None,
+        "analysis_completed_at": None,
+        "analysis_error": None,
+    }
+    return {key: value for key, value in payload.items() if value is not None or key != "id"}
+
+
+def game_player_payloads(game_id, game):
+    db_id = db_game_id(game_id)
+    if db_id is None:
+        return []
+
+    if game.get("mode") == "multiplayer":
+        return [
+            {
+                "game_id": db_id,
+                "profile_id": player.get("profile_id"),
+                "player_number": player["piece"],
+                "is_ai": False,
+                "ai_difficulty": None,
+                "display_name_snapshot": player.get("display_name") or f"Player {player['piece']}",
+            }
+            for player in game.get("players", {}).values()
+        ]
+
+    human_piece = game.get("human_piece", 1)
+    ai_piece = game.get("ai_piece", 2)
+    return [
+        {
+            "game_id": db_id,
+            "profile_id": game.get("profile_id"),
+            "player_number": human_piece,
+            "is_ai": False,
+            "ai_difficulty": None,
+            "display_name_snapshot": "Player",
+        },
+        {
+            "game_id": db_id,
+            "profile_id": None,
+            "player_number": ai_piece,
+            "is_ai": True,
+            "ai_difficulty": game.get("difficulty"),
+            "display_name_snapshot": f"AI - {game.get('difficulty')}",
+        },
+    ]
+
+
+def create_game_record(game_id, game):
+    db_id = db_game_id(game_id)
+    if db_id is None:
+        return False
+
+    def action(client):
+        client.table("games").insert(game_payload(game_id, game)).execute()
+        player_payloads = game_player_payloads(game_id, game)
+        if player_payloads:
+            client.table("game_players").insert(player_payloads).execute()
+
+    return execute_safely(action)
+
+
+def add_game_player_records(game_id, game):
+    player_payloads = game_player_payloads(game_id, game)
+    if not player_payloads:
+        return False
+
+    def action(client):
+        # Persist each participant independently. A conflict or malformed row
+        # for one player must not prevent the other participant from being
+        # associated with the completed game.
+        for player_payload in player_payloads:
+            client.table("game_players").upsert(player_payload, on_conflict="game_id,player_number").execute()
+        client.table("games").update(game_payload(game_id, game)).eq("id", db_game_id(game_id)).execute()
+
+    return execute_safely(action)
+
+
+def update_game_record(game_id, game):
+    db_id = db_game_id(game_id)
+    if db_id is None:
+        return False
+
+    def action(client):
+        payload = game_payload(game_id, game)
+        payload.pop("id", None)
+        client.table("games").update(payload).eq("id", db_id).execute()
+
+    return execute_safely(action)
+
+
+def set_game_analysis_status(game_id, status, error=None):
+    db_id = db_game_id(game_id)
+    if db_id is None:
+        return False
+
+    payload = {"analysis_status": status, "analysis_error": error}
+    if status == "processing":
+        payload.update({
+            "analysis_requested_at": now_iso(),
+            "analysis_completed_at": None,
+        })
+    elif status in {"complete", "failed"}:
+        payload["analysis_completed_at"] = now_iso()
+
+    def action(client):
+        client.table("games").update(payload).eq("id", db_id).execute()
+
+    return execute_safely(action)
+
+
+def replace_move_analysis(game_id, rows):
+    db_id = db_game_id(game_id)
+    if db_id is None:
+        return False
+
+    payloads = [
+        {
+            "move_id": row["move_id"],
+            "game_id": db_id,
+            "minimax_depth": row["minimax_depth"],
+            "played_column": row["played_column"],
+            "best_column": row["best_column"],
+            "played_score": row["played_score"],
+            "best_score": row["best_score"],
+            "rating": row["rating"],
+        }
+        for row in rows
+    ]
+
+    def action(client):
+        client.table("move_analysis").delete().eq("game_id", db_id).execute()
+        if payloads:
+            client.table("move_analysis").insert(payloads).execute()
+
+    return execute_safely(action)
+
+
+def delete_game_record(game_id):
+    db_id = db_game_id(game_id)
+    if db_id is None:
+        return False
+
+    def action(client):
+        client.table("games").delete().eq("id", db_id).execute()
+
+    return execute_safely(action)
+
+
+def reset_game_record(game_id, game):
+    db_id = db_game_id(game_id)
+    if db_id is None:
+        return False
+
+    game["move_number"] = 0
+
+    def action(client):
+        client.table("game_moves").delete().eq("game_id", db_id).execute()
+        payload = game_payload(game_id, game)
+        payload.pop("id", None)
+        payload["started_at"] = now_iso()
+        client.table("games").update(payload).eq("id", db_id).execute()
+
+    return execute_safely(action)
+
+
+def record_move(game_id, game, player_number, column, board_before, board_after, is_ai_move=False, profile_id=None):
+    db_id = db_game_id(game_id)
+    if db_id is None:
+        return False
+
+    payload = {
+        "game_id": db_id,
+        "move_number": next_move_number(game),
+        "player_number": player_number,
+        "profile_id": None if game.get("mode") == "multiplayer" else profile_id,
+        "is_ai_move": is_ai_move,
+        "column_played": int(column),
+        "board_before": board_before,
+        "board_after": board_after,
+    }
+
+    def action(client):
+        client.table("game_moves").insert(payload).execute()
+
+    return execute_safely(action)
+
+
+def completed_game_result(game_data, player_number):
+    status = game_data.get("status")
+    winner = game_data.get("winner_player_number")
+    if status == "draw":
+        return "Draw"
+    if winner is None:
+        return "Unknown"
+    return "Win" if winner == player_number else "Loss"
+
+
+def inferred_move(move_number, board_before, board_after):
+    if not isinstance(board_before, list) or not isinstance(board_after, list):
+        return None
+    changes = []
+    for row_index, row in enumerate(board_after):
+        if row_index >= len(board_before) or not isinstance(row, list) or not isinstance(board_before[row_index], list):
+            return None
+        for column_index, value in enumerate(row):
+            previous = board_before[row_index][column_index] if column_index < len(board_before[row_index]) else None
+            if value != previous:
+                changes.append((column_index, value))
+    if len(changes) != 1 or changes[0][1] not in (1, 2):
+        return None
+    column, player_number = changes[0]
+    return {
+        "move_number": move_number,
+        "player_number": player_number,
+        "column_played": column,
+        "board_before": board_before,
+        "board_after": board_after,
+        "reconstructed": True,
+    }
+
+
+def repair_move_history(moves, final_board=None):
+    repaired = []
+    for move in sorted(moves or [], key=lambda item: item.get("move_number", 0)):
+        expected = (repaired[-1]["move_number"] + 1) if repaired else 1
+        if move.get("move_number") == expected + 1:
+            previous_board = repaired[-1]["board_after"] if repaired else move.get("board_before")
+            recovered = inferred_move(expected, previous_board, move.get("board_before"))
+            if recovered:
+                repaired.append(recovered)
+        repaired.append(move)
+    if repaired and final_board is not None:
+        recovered = inferred_move(repaired[-1]["move_number"] + 1, repaired[-1].get("board_after"), final_board)
+        if recovered:
+            repaired.append(recovered)
+    return repaired
+
+
+def fetch_completed_games(profile_id):
+    client = get_client()
+    if client is None or not profile_id:
+        return []
+
+    response = (
+        client.table("game_players")
+        .select(
+            "player_number,is_ai,ai_difficulty,display_name_snapshot,"
+            "games(id,mode,difficulty,status,winner_player_number,started_at,ended_at,"
+            "game_players(player_number,display_name_snapshot,profiles(username,display_name)))"
+        )
+        .eq("profile_id", profile_id)
+        .execute()
+    )
+
+    completed_games = []
+    for row in response.data or []:
+        game_data = row.get("games") or {}
+        if isinstance(game_data, list):
+            game_data = game_data[0] if game_data else {}
+        if game_data.get("status") not in COMPLETED_STATUSES:
+            continue
+
+        player_number = row.get("player_number")
+        game_players = game_data.get("game_players") or []
+        player_names = {}
+        for game_player in game_players:
+            profile = game_player.get("profiles") or {}
+            if isinstance(profile, list):
+                profile = profile[0] if profile else {}
+            display_name = profile.get("display_name") or profile.get("username") or game_player.get("display_name_snapshot")
+            if game_player.get("player_number") and display_name:
+                player_names[str(game_player["player_number"])] = display_name
+        completed_games.append({
+            "id": game_data.get("id"),
+            "mode": game_data.get("mode"),
+            "difficulty": game_data.get("difficulty"),
+            "status": game_data.get("status"),
+            "winnerPlayerNumber": game_data.get("winner_player_number"),
+            "startedAt": game_data.get("started_at"),
+            "endedAt": game_data.get("ended_at"),
+            "playerNumber": player_number,
+            "playerNames": player_names,
+            "winnerName": player_names.get(str(game_data.get("winner_player_number"))),
+            "result": completed_game_result(game_data, player_number),
+        })
+
+    return sorted(completed_games, key=lambda game: game.get("endedAt") or game.get("startedAt") or "", reverse=True)
+
+
+def fetch_game_moves(profile_id, game_id):
+    db_id = db_game_id(game_id)
+    client = get_client()
+    if client is None or not profile_id or db_id is None:
+        return None
+
+    membership = (
+        client.table("game_players")
+        .select("game_id,games!inner(status,final_board,winner_player_number)")
+        .eq("profile_id", profile_id)
+        .eq("game_id", db_id)
+        .execute()
+    )
+    if not membership.data:
+        return None
+
+    game_data = membership.data[0].get("games") or {}
+    if isinstance(game_data, list):
+        game_data = game_data[0] if game_data else {}
+    if game_data.get("status") not in COMPLETED_STATUSES:
+        return None
+
+    response = (
+        client.table("game_moves")
+        .select(
+            "id,move_number,player_number,column_played,board_before,board_after,"
+            "move_analysis(minimax_depth,played_column,best_column,played_score,best_score,score_loss,rating)"
+        )
+        .eq("game_id", db_id)
+        .order("move_number")
+        .execute()
+    )
+    return repair_move_history(response.data or [], game_data.get("final_board"))
+
+
+def fetch_game_analysis_source(profile_id, game_id):
+    db_id = db_game_id(game_id)
+    client = get_client()
+    if client is None or not profile_id or db_id is None:
+        return None
+
+    membership = (
+        client.table("game_players")
+        .select("game_id,games!inner(status,final_board,analysis_status,analysis_error)")
+        .eq("profile_id", profile_id)
+        .eq("game_id", db_id)
+        .execute()
+    )
+    if not membership.data:
+        return None
+    game_data = membership.data[0].get("games") or {}
+    if isinstance(game_data, list):
+        game_data = game_data[0] if game_data else {}
+    if game_data.get("status") not in COMPLETED_STATUSES:
+        return None
+
+    response = (
+        client.table("game_moves")
+        .select("id,move_number,player_number,column_played,board_before,board_after")
+        .eq("game_id", db_id)
+        .order("move_number")
+        .execute()
+    )
+    return {
+        "analysis_status": game_data.get("analysis_status") or "not_requested",
+        "analysis_error": game_data.get("analysis_error"),
+        "moves": repair_move_history(response.data or [], game_data.get("final_board")),
+    }

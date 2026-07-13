@@ -1,0 +1,54 @@
+{
+  "latest_run": {
+    "very_easy": {
+      "games": 10,
+      "minimax_wins": 0,
+      "online_wins": 10,
+      "ties": 0
+    },
+    "easy": {
+      "games": 10,
+      "minimax_wins": 0,
+      "online_wins": 10,
+      "ties": 0
+    },
+    "medium": {
+      "games": 10,
+      "minimax_wins": 5,
+      "online_wins": 0,
+      "ties": 5
+    },
+    "hard": {
+      "games": 10,
+      "minimax_wins": 5,
+      "online_wins": 5,
+      "ties": 0
+    }
+  },
+  "cumulative": {
+    "very_easy": {
+      "games": 10,
+      "minimax_wins": 0,
+      "online_wins": 10,
+      "ties": 0
+    },
+    "easy": {
+      "games": 20,
+      "minimax_wins": 0,
+      "online_wins": 20,
+      "ties": 0
+    },
+    "medium": {
+      "games": 20,
+      "minimax_wins": 10,
+      "online_wins": 0,
+      "ties": 10
+    },
+    "hard": {
+      "games": 20,
+      "minimax_wins": 10,
+      "online_wins": 10,
+      "ties": 0
+    }
+  }
+}
