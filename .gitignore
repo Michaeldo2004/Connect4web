@@ -16,3 +16,4 @@ backend/.env
 .DS_Store
 
 HANDOFF.md
+.codex/
