@@ -58,7 +58,6 @@ def get_best_move(board, piece, max_depth=5, time_limit=3, transposition_table=N
     return (int(best_col), transposition_table) if return_table else int(best_col)
 
 
-<<<<<<< HEAD
 def get_move_scores(board, piece, max_depth=4, time_limit=30):
     """Return fixed-depth minimax scores for every legal move in a position."""
     valid_moves = ordered_moves(board)
@@ -94,8 +93,6 @@ def get_move_scores(board, piece, max_depth=4, time_limit=30):
     return int(best_col), scores
 
 
-=======
->>>>>>> origin/main
 def search_best_move(board, piece, opponent_piece, search_depth, deadline, transposition_table):
     check_time(deadline)
     valid_moves = ordered_moves(board)

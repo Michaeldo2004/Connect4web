@@ -139,11 +139,7 @@ def game_player_payloads(game_id, game):
                 "player_number": player["piece"],
                 "is_ai": False,
                 "ai_difficulty": None,
-<<<<<<< HEAD
                 "display_name_snapshot": player.get("display_name") or f"Player {player['piece']}",
-=======
-                "display_name_snapshot": f"Player {player['piece']}",
->>>>>>> origin/main
             }
             for player in game.get("players", {}).values()
         ]
@@ -190,15 +186,11 @@ def add_game_player_records(game_id, game):
         return False
 
     def action(client):
-<<<<<<< HEAD
         # Persist each participant independently. A conflict or malformed row
         # for one player must not prevent the other participant from being
         # associated with the completed game.
         for player_payload in player_payloads:
             client.table("game_players").upsert(player_payload, on_conflict="game_id,player_number").execute()
-=======
-        client.table("game_players").upsert(player_payloads, on_conflict="game_id,player_number").execute()
->>>>>>> origin/main
         client.table("games").update(game_payload(game_id, game)).eq("id", db_game_id(game_id)).execute()
 
     return execute_safely(action)
@@ -217,7 +209,6 @@ def update_game_record(game_id, game):
     return execute_safely(action)
 
 
-<<<<<<< HEAD
 def set_game_analysis_status(game_id, status, error=None):
     db_id = db_game_id(game_id)
     if db_id is None:
@@ -265,8 +256,6 @@ def replace_move_analysis(game_id, rows):
     return execute_safely(action)
 
 
-=======
->>>>>>> origin/main
 def delete_game_record(game_id):
     db_id = db_game_id(game_id)
     if db_id is None:
@@ -304,11 +293,7 @@ def record_move(game_id, game, player_number, column, board_before, board_after,
         "game_id": db_id,
         "move_number": next_move_number(game),
         "player_number": player_number,
-<<<<<<< HEAD
         "profile_id": None if game.get("mode") == "multiplayer" else profile_id,
-=======
-        "profile_id": profile_id,
->>>>>>> origin/main
         "is_ai_move": is_ai_move,
         "column_played": int(column),
         "board_before": board_before,
@@ -331,7 +316,6 @@ def completed_game_result(game_data, player_number):
     return "Win" if winner == player_number else "Loss"
 
 
-<<<<<<< HEAD
 def inferred_move(move_number, board_before, board_after):
     if not isinstance(board_before, list) or not isinstance(board_after, list):
         return None
@@ -373,8 +357,6 @@ def repair_move_history(moves, final_board=None):
     return repaired
 
 
-=======
->>>>>>> origin/main
 def fetch_completed_games(profile_id):
     client = get_client()
     if client is None or not profile_id:
@@ -384,12 +366,8 @@ def fetch_completed_games(profile_id):
         client.table("game_players")
         .select(
             "player_number,is_ai,ai_difficulty,display_name_snapshot,"
-<<<<<<< HEAD
             "games(id,mode,difficulty,status,winner_player_number,started_at,ended_at,"
             "game_players(player_number,display_name_snapshot,profiles(username,display_name)))"
-=======
-            "games(id,mode,difficulty,status,winner_player_number,started_at,ended_at)"
->>>>>>> origin/main
         )
         .eq("profile_id", profile_id)
         .execute()
@@ -404,7 +382,6 @@ def fetch_completed_games(profile_id):
             continue
 
         player_number = row.get("player_number")
-<<<<<<< HEAD
         game_players = game_data.get("game_players") or []
         player_names = {}
         for game_player in game_players:
@@ -414,8 +391,6 @@ def fetch_completed_games(profile_id):
             display_name = profile.get("display_name") or profile.get("username") or game_player.get("display_name_snapshot")
             if game_player.get("player_number") and display_name:
                 player_names[str(game_player["player_number"])] = display_name
-=======
->>>>>>> origin/main
         completed_games.append({
             "id": game_data.get("id"),
             "mode": game_data.get("mode"),
@@ -425,11 +400,8 @@ def fetch_completed_games(profile_id):
             "startedAt": game_data.get("started_at"),
             "endedAt": game_data.get("ended_at"),
             "playerNumber": player_number,
-<<<<<<< HEAD
             "playerNames": player_names,
             "winnerName": player_names.get(str(game_data.get("winner_player_number"))),
-=======
->>>>>>> origin/main
             "result": completed_game_result(game_data, player_number),
         })
 
@@ -444,11 +416,7 @@ def fetch_game_moves(profile_id, game_id):
 
     membership = (
         client.table("game_players")
-<<<<<<< HEAD
         .select("game_id,games!inner(status,final_board,winner_player_number)")
-=======
-        .select("game_id,games!inner(status)")
->>>>>>> origin/main
         .eq("profile_id", profile_id)
         .eq("game_id", db_id)
         .execute()
@@ -464,19 +432,14 @@ def fetch_game_moves(profile_id, game_id):
 
     response = (
         client.table("game_moves")
-<<<<<<< HEAD
         .select(
             "id,move_number,player_number,column_played,board_before,board_after,"
             "move_analysis(minimax_depth,played_column,best_column,played_score,best_score,score_loss,rating)"
         )
-=======
-        .select("move_number,player_number,column_played,board_before,board_after")
->>>>>>> origin/main
         .eq("game_id", db_id)
         .order("move_number")
         .execute()
     )
-<<<<<<< HEAD
     return repair_move_history(response.data or [], game_data.get("final_board"))
 
 
@@ -513,6 +476,3 @@ def fetch_game_analysis_source(profile_id, game_id):
         "analysis_error": game_data.get("analysis_error"),
         "moves": repair_move_history(response.data or [], game_data.get("final_board")),
     }
-=======
-    return response.data or []
->>>>>>> origin/main

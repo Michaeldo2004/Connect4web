@@ -52,7 +52,6 @@ class SupabaseSchemaTests(unittest.TestCase):
             self.assertIn(column_name, self.schema)
         self.assertIn("constraint game_moves_unique_move_number unique (game_id, move_number)", self.schema)
 
-<<<<<<< HEAD
     def test_multiplayer_ownership_is_unique_per_profile_and_game(self):
         self.assertIn("create unique index game_players_unique_profile_per_game", self.schema)
         self.assertIn("on public.game_players (game_id, profile_id)", self.schema)
@@ -65,8 +64,6 @@ class SupabaseSchemaTests(unittest.TestCase):
         self.assertIn("create trigger on_auth_user_created", self.schema)
         self.assertIn("after insert on auth.users", self.schema)
 
-=======
->>>>>>> origin/main
     def test_move_analysis_is_bound_to_the_same_game_as_the_move(self):
         self.assertIn("constraint game_moves_unique_id_game unique (id, game_id)", self.schema)
         self.assertIn("constraint move_analysis_move_game_fk foreign key (move_id, game_id)", self.schema)

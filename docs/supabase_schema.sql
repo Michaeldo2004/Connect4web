@@ -135,6 +135,9 @@ create index games_started_at_idx on public.games (started_at desc);
 create index games_analysis_status_idx on public.games (analysis_status);
 create index game_players_profile_id_idx on public.game_players (profile_id);
 create index game_players_game_id_idx on public.game_players (game_id);
+create unique index game_players_unique_profile_per_game
+on public.game_players (game_id, profile_id)
+where profile_id is not null;
 create index game_moves_game_id_move_number_idx on public.game_moves (game_id, move_number);
 create index move_analysis_game_id_idx on public.move_analysis (game_id);
 
@@ -159,6 +162,62 @@ for each row execute function public.set_updated_at();
 create trigger player_stats_set_updated_at
 before update on public.player_stats
 for each row execute function public.set_updated_at();
+
+-- Auth users and application profiles must remain one-to-one. Preserve a
+-- valid requested username, but fall back to the user's UUID when metadata is
+-- malformed or the requested username is already taken.
+create or replace function public.handle_new_user()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  preferred_username text;
+begin
+  preferred_username := left(
+    regexp_replace(
+      coalesce(
+        nullif(new.raw_user_meta_data ->> 'username', ''),
+        split_part(coalesce(new.email, ''), '@', 1),
+        'Player'
+      ),
+      '[^A-Za-z0-9_]',
+      '',
+      'g'
+    ),
+    32
+  );
+
+  if char_length(preferred_username) < 3 then
+    preferred_username := replace(new.id::text, '-', '');
+  end if;
+
+  begin
+    insert into public.profiles (id, username, display_name)
+    values (
+      new.id,
+      preferred_username,
+      coalesce(nullif(new.raw_user_meta_data ->> 'username', ''), preferred_username)
+    )
+    on conflict (id) do nothing;
+  exception when unique_violation then
+    insert into public.profiles (id, username, display_name)
+    values (
+      new.id,
+      replace(new.id::text, '-', ''),
+      coalesce(nullif(new.raw_user_meta_data ->> 'username', ''), 'Player')
+    )
+    on conflict (id) do nothing;
+  end;
+
+  return new;
+end;
+$$;
+
+create trigger on_auth_user_created
+after insert on auth.users
+for each row execute function public.handle_new_user();
 
 create or replace function public.is_game_participant(target_game_id uuid)
 returns boolean
