@@ -4,7 +4,10 @@ import random
 import threading
 import time
 import uuid
+<<<<<<< HEAD
 from collections import deque
+=======
+>>>>>>> origin/main
 from concurrent.futures import ProcessPoolExecutor, TimeoutError as FutureTimeoutError
 
 import jwt
@@ -14,7 +17,11 @@ from flask_cors import CORS
 from flask_socketio import SocketIO, emit, join_room, leave_room
 
 import supabase_store
+<<<<<<< HEAD
 from ai.minimax import get_best_move, get_move_scores, normalize_transposition_table
+=======
+from ai.minimax import get_best_move, normalize_transposition_table
+>>>>>>> origin/main
 from game.board import COLS, ROWS, check_win, create_board, drop_piece, is_valid_move
 
 HUMAN = 1
@@ -22,7 +29,10 @@ AI = 2
 DISCONNECT_GRACE_SECONDS = 15
 CREATE_RATE_LIMIT_COUNT = 100
 CREATE_RATE_LIMIT_SECONDS = 60
+<<<<<<< HEAD
 ROOM_VISIBILITY_RATE_LIMIT_SECONDS = 5
+=======
+>>>>>>> origin/main
 MAX_ACTIVE_GAMES = 300
 AI_GAME_TTL_SECONDS = 30 * 60
 MULTIPLAYER_GAME_TTL_SECONDS = 2 * 60 * 60
@@ -72,6 +82,7 @@ games_lock = threading.Lock()
 create_attempts = {}
 ai_executor = None
 ai_executor_lock = threading.Lock()
+<<<<<<< HEAD
 AI_WORKER_COUNT = max(1, get_env_int("AI_WORKER_COUNT", 1))
 AI_QUEUE_CAPACITY = 3
 AI_BUSY_MESSAGE = "AI queue is full, try again"
@@ -92,6 +103,13 @@ analysis_admission_wakeup_scheduled = False
 ai_admission_lock = ai_queue_lock
 ai_admission_queue = deque()
 ai_admissions_in_progress = 0
+=======
+AI_WORKER_COUNT = max(1, min(2, (os.cpu_count() or 2) - 1))
+AI_BUSY_MESSAGE = "AI is busy, try again"
+game_locks = {}
+game_locks_guard = threading.Lock()
+ai_search_slots = threading.BoundedSemaphore(AI_WORKER_COUNT)
+>>>>>>> origin/main
 
 
 def get_game_lock(game_id):
@@ -269,7 +287,10 @@ def create_multiplayer_game_state(player_id=None, profile_id=None):
             player_id: {
                 "piece": HUMAN,
                 "profile_id": profile_id,
+<<<<<<< HEAD
                 "display_name": "Player 1",
+=======
+>>>>>>> origin/main
                 "socket_id": request.sid if request else None,
                 "connected": True,
                 "disconnect_token": None,
@@ -412,6 +433,7 @@ def run_best_move(board_data, piece, max_depth, time_limit, transposition_table)
     )
 
 
+<<<<<<< HEAD
 def analysis_rating(score_loss):
     if score_loss <= 0:
         return "perfect"
@@ -456,6 +478,8 @@ def run_move_analysis(moves, minimax_depth, time_limit):
     return results
 
 
+=======
+>>>>>>> origin/main
 def get_ai_executor():
     global ai_executor
     with ai_executor_lock:
@@ -465,6 +489,7 @@ def get_ai_executor():
 
 
 def reserve_ai_search_slot():
+<<<<<<< HEAD
     global ai_active_jobs, ai_queue_reservations, ai_running_job_type
     with ai_queue_lock:
         if ai_running_job_type != "move_analysis" and ai_active_jobs < AI_WORKER_COUNT:
@@ -771,6 +796,16 @@ def reset_ai_admission_queue():
     with ai_admission_lock:
         ai_admission_queue.clear()
         ai_admissions_in_progress = 0
+=======
+    return ai_search_slots.acquire(blocking=False)
+
+
+def release_ai_search_slot():
+    try:
+        ai_search_slots.release()
+    except ValueError:
+        pass
+>>>>>>> origin/main
 
 
 def get_ai_move(board_data, settings, transposition_table, ai_piece=AI):
@@ -789,7 +824,11 @@ def get_ai_move(board_data, settings, transposition_table, ai_piece=AI):
         return future.result(timeout=settings["time_limit"] + 1), True
     except FutureTimeoutError:
         # A running process cannot be canceled. Keep its slot reserved until it exits.
+<<<<<<< HEAD
         future.add_done_callback(lambda _future: finish_ai_job())
+=======
+        future.add_done_callback(lambda _future: release_ai_search_slot())
+>>>>>>> origin/main
         return (None, transposition_table), False
     except Exception:
         return (None, transposition_table), True
@@ -811,8 +850,11 @@ def serialize_game(game_id, game, ai_move=None, include_player_id=False, player_
 
     if game.get("mode") != "multiplayer":
         payload["aiThinking"] = bool(game.get("ai_thinking"))
+<<<<<<< HEAD
         payload["aiQueued"] = bool(game.get("ai_queued"))
         payload["aiQueuePosition"] = game.get("ai_queue_position", 0)
+=======
+>>>>>>> origin/main
 
     if include_player_id:
         payload["playerId"] = game["player_id"]
@@ -823,10 +865,13 @@ def serialize_game(game_id, game, ai_move=None, include_player_id=False, player_
         payload["disconnectDeadline"] = game.get("disconnect_deadline")
         payload["playAgainAccepted"] = len(game.get("rematch_requests", set()))
         payload["publicRoom"] = bool(game.get("public"))
+<<<<<<< HEAD
         payload["playerNames"] = {
             str(player["piece"]): player.get("display_name") or f"Player {player['piece']}"
             for player in game["players"].values()
         }
+=======
+>>>>>>> origin/main
         if player_id in game["players"]:
             payload["playerId"] = player_id
             payload["playerNumber"] = game["players"][player_id]["piece"]
@@ -840,6 +885,7 @@ def serialize_game(game_id, game, ai_move=None, include_player_id=False, player_
 def prepare_ai_turn(game_id, game, expected_game=None, slot_reserved=False):
     if game is None or (expected_game is not None and game is not expected_game):
         if slot_reserved:
+<<<<<<< HEAD
             release_ai_search_slot(slot_reserved)
         return None, None
     if game.get("status") in FINISHED_STATUSES or game.get("current_player") != get_ai_piece(game) or game.get("ai_thinking"):
@@ -858,6 +904,19 @@ def prepare_ai_turn(game_id, game, expected_game=None, slot_reserved=False):
         if game["ai_queued"]
         else "AI is thinking"
     )
+=======
+            release_ai_search_slot()
+        return None, None
+    if game.get("status") in FINISHED_STATUSES or game.get("current_player") != get_ai_piece(game) or game.get("ai_thinking"):
+        if slot_reserved:
+            release_ai_search_slot()
+        return None, None
+    if not slot_reserved and not reserve_ai_search_slot():
+        return None, AI_BUSY_MESSAGE
+
+    game["ai_thinking"] = True
+    game["message"] = "AI is thinking"
+>>>>>>> origin/main
     mark_game_updated(game)
     supabase_store.update_game_record(game_id, game)
     return {
@@ -868,7 +927,10 @@ def prepare_ai_turn(game_id, game, expected_game=None, slot_reserved=False):
         "settings": DIFFICULTIES[game["difficulty"]],
         "ai_piece": get_ai_piece(game),
         "transposition_table": normalize_transposition_table(game.get("transposition_table")),
+<<<<<<< HEAD
         "reservation": reservation,
+=======
+>>>>>>> origin/main
     }, None
 
 
@@ -877,8 +939,11 @@ def apply_ai_result(game, game_id, ai_move, transposition_table):
     ai_piece = get_ai_piece(game)
     human_piece = get_human_piece(game)
     game["ai_thinking"] = False
+<<<<<<< HEAD
     game["ai_queued"] = False
     game["ai_queue_position"] = 0
+=======
+>>>>>>> origin/main
 
     if ai_move is None or not is_valid_move(board, int(ai_move)):
         game["transposition_table"] = transposition_table
@@ -914,7 +979,10 @@ def apply_ai_result(game, game_id, ai_move, transposition_table):
 
 def complete_ai_turn(job):
     release_slot = True
+<<<<<<< HEAD
     payload = None
+=======
+>>>>>>> origin/main
     try:
         (ai_move, transposition_table), release_slot = get_ai_move(
             job["board"],
@@ -934,6 +1002,7 @@ def complete_ai_turn(job):
 
             ai_move, error = apply_ai_result(game, job["game_id"], ai_move, transposition_table)
             payload = serialize_game(job["game_id"], game, ai_move=ai_move)
+<<<<<<< HEAD
     except Exception:
         # Never leave a game permanently locked in an AI-thinking state when
         # a worker fails unexpectedly. The human can continue or refresh and
@@ -960,6 +1029,20 @@ def complete_ai_turn(job):
 
     if payload is not None:
         socketio.emit("board_updated", payload, to=job["game_id"])
+=======
+    finally:
+        if release_slot:
+            release_ai_search_slot()
+
+    socketio.emit("board_updated", payload, to=job["game_id"])
+
+
+def launch_ai_turn(job):
+    if app.config.get("AI_SEARCH_INLINE"):
+        complete_ai_turn(job)
+        return
+    socketio.start_background_task(complete_ai_turn, job)
+>>>>>>> origin/main
 
 
 def emit_ai_turn_if_needed(game_id, expected_game=None, slot_reserved=False):
@@ -1088,8 +1171,12 @@ def apply_human_and_ai_move(game, column, game_id=None):
     preview_board = board.copy()
     drop_piece(preview_board, column, human_piece)
     needs_ai_turn = not check_win(preview_board, human_piece) and not is_draw(preview_board)
+<<<<<<< HEAD
     ai_reservation = reserve_ai_search_slot() if needs_ai_turn else None
     if needs_ai_turn and not ai_reservation:
+=======
+    if needs_ai_turn and not reserve_ai_search_slot():
+>>>>>>> origin/main
         return None, AI_BUSY_MESSAGE
 
     board_before = board_to_list(board)
@@ -1116,7 +1203,11 @@ def apply_human_and_ai_move(game, column, game_id=None):
         return None, None
 
     game["current_player"] = ai_piece
+<<<<<<< HEAD
     job, error = prepare_ai_turn(game_id, game, slot_reserved=ai_reservation)
+=======
+    job, error = prepare_ai_turn(game_id, game, slot_reserved=True)
+>>>>>>> origin/main
     if error:
         return None, error
     return job, None
@@ -1153,10 +1244,13 @@ def apply_multiplayer_move(game, player_id, column, game_id=None):
     board_before = board_to_list(board)
     drop_piece(board, column, player["piece"])
     if game_id:
+<<<<<<< HEAD
         # Re-sync both memberships before every move. This repairs a transient
         # join-time database failure and ensures both profiles own the same
         # completed game and can read the full shared move history.
         supabase_store.add_game_player_records(game_id, game)
+=======
+>>>>>>> origin/main
         supabase_store.record_move(
             game_id,
             game,
@@ -1325,6 +1419,7 @@ def profile_games():
     if not profile_id:
         return jsonify({"message": "Login required"}), 401
 
+<<<<<<< HEAD
     # Repair a participant row if its join-time database write failed. Games
     # remain in server memory after completion, so both players can recover
     # their profile history without replaying the match.
@@ -1338,6 +1433,8 @@ def profile_games():
     for game_id, game in profile_games_to_repair:
         supabase_store.add_game_player_records(game_id, game)
 
+=======
+>>>>>>> origin/main
     return jsonify({"games": supabase_store.fetch_completed_games(profile_id)})
 
 
@@ -1358,6 +1455,7 @@ def profile_game_moves(game_id):
     return jsonify({"moves": moves})
 
 
+<<<<<<< HEAD
 @app.post("/api/profile/games/<game_id>/analysis")
 def request_profile_game_analysis(game_id):
     auth_context, auth_error = authenticate_request()
@@ -1435,6 +1533,11 @@ def emit_ai_admission_result(auth_context, difficulty, queue_id=None):
 def socket_create_game(data):
     data = data or {}
     auth_context, auth_error = authenticate_payload(data)
+=======
+@socketio.on("create_game")
+def socket_create_game(data):
+    auth_context, auth_error = authenticate_payload(data or {})
+>>>>>>> origin/main
     if auth_error:
         emit("create_rejected", {"message": auth_error})
         return
@@ -1444,6 +1547,7 @@ def socket_create_game(data):
         emit("create_rejected", {"message": error})
         return
 
+<<<<<<< HEAD
     emit_ai_admission_result(auth_context, parse_difficulty(data))
 
 
@@ -1472,6 +1576,21 @@ def socket_cancel_ai_waiting(data):
     if queue_id:
         cancel_ai_admission(auth_context["profile_id"], queue_id)
     emit("ai_waiting_cancelled", {"queueId": queue_id})
+=======
+    remove_ai_games_for_sid(request.sid)
+    difficulty = parse_difficulty(data or {})
+    game_id = uuid.uuid4().hex
+    game = create_game_state(difficulty, profile_id=auth_context["profile_id"])
+    ai_slot_reserved = game["current_player"] == get_ai_piece(game)
+    if ai_slot_reserved and not reserve_ai_search_slot():
+        emit("create_rejected", {"message": AI_BUSY_MESSAGE})
+        return
+    supabase_store.create_game_record(game_id, game)
+    store_game(game_id, game)
+    join_room(game_id)
+    emit("game_created", serialize_game(game_id, game, include_player_id=True))
+    emit_ai_turn_if_needed(game_id, game, ai_slot_reserved)
+>>>>>>> origin/main
 
 
 @socketio.on("join_game")
@@ -1510,7 +1629,11 @@ def socket_join_game(data):
                 return
             game["socket_id"] = request.sid
             mark_game_updated(game)
+<<<<<<< HEAD
             joined_payload = serialize_game(game_id, game, include_player_id=True)
+=======
+            joined_payload = serialize_game(game_id, game)
+>>>>>>> origin/main
             updated_payload = None
             join_event = "ai"
 
@@ -1538,7 +1661,10 @@ def socket_create_multiplayer_game(data=None):
     player_id = uuid.uuid4().hex
     game = create_multiplayer_game_state(player_id, profile_id=auth_context["profile_id"])
     game["owner_name"] = sanitize_public_owner_name(data.get("ownerName"), auth_context.get("email") or "Player")
+<<<<<<< HEAD
     game["players"][player_id]["display_name"] = game["owner_name"]
+=======
+>>>>>>> origin/main
     store_game(game_id, game)
     supabase_store.create_game_record(game_id, game)
     join_room(game_id)
@@ -1564,10 +1690,17 @@ def socket_set_room_public(data):
     requested_public = bool(data.get("public")) if isinstance(data, dict) else False
     auth_context, auth_error = authenticate_payload(data)
     if auth_error:
+<<<<<<< HEAD
         emit("room_public_update_failed", {"gameId": game_id, "message": auth_error})
         return
     if not game_id:
         emit("room_public_update_failed", {"gameId": game_id, "message": "Game not found"})
+=======
+        emit("invalid_move", make_socket_error(game_id, None, auth_error))
+        return
+    if not game_id:
+        emit("invalid_move", make_socket_error(game_id, None, "Game not found"))
+>>>>>>> origin/main
         return
 
     with get_game_lock(game_id):
@@ -1584,6 +1717,7 @@ def socket_set_room_public(data):
                 invalid_payload = make_socket_error(game_id, game, "Only the room owner can make it public")
                 error = "invalid"
             else:
+<<<<<<< HEAD
                 now = time.time()
                 last_changed_at = game.get("public_changed_at", 0)
                 retry_after = ROOM_VISIBILITY_RATE_LIMIT_SECONDS - (now - last_changed_at)
@@ -1624,6 +1758,18 @@ def socket_set_room_public(data):
         "publicRoom": confirmed_public,
         "message": "Room is now public" if confirmed_public else "Room is now private",
     })
+=======
+                game["public"] = requested_public
+                mark_game_updated(game)
+                payload = serialize_game(game_id, game, player_id=player_id)
+                error = None
+
+    if error:
+        emit("invalid_move", invalid_payload)
+        return
+
+    emit("board_updated", payload)
+>>>>>>> origin/main
 
 
 @socketio.on("join_multiplayer_game")
@@ -1668,7 +1814,10 @@ def socket_join_multiplayer_game(data):
             game["players"][player_id] = {
                 "piece": AI,
                 "profile_id": auth_context["profile_id"],
+<<<<<<< HEAD
                 "display_name": sanitize_public_owner_name(data.get("playerName"), auth_context.get("email") or "Player"),
+=======
+>>>>>>> origin/main
                 "socket_id": request.sid,
                 "connected": True,
                 "disconnect_token": None,
@@ -1694,6 +1843,7 @@ def socket_join_multiplayer_game(data):
 
 @socketio.on("disconnect")
 def socket_disconnect():
+<<<<<<< HEAD
     with games_lock:
         disconnected_ai_games = [
             (game_id, game)
@@ -1707,6 +1857,10 @@ def socket_disconnect():
                 if game is expected_game and game.get("socket_id") == request.sid:
                     game["socket_id"] = None
                     mark_game_updated(game)
+=======
+    removed_games = remove_ai_games_for_sid(request.sid)
+    if removed_games:
+>>>>>>> origin/main
         return
 
     game_id, game, player_id, player = find_multiplayer_player_by_sid(request.sid)
@@ -1926,9 +2080,14 @@ def socket_reset_game(data):
             previous_player_id = game["player_id"]
             previous_profile_id = game.get("profile_id")
             new_game = create_game_state(difficulty, player_id=previous_player_id, profile_id=previous_profile_id)
+<<<<<<< HEAD
             ai_starts = new_game["current_player"] == get_ai_piece(new_game)
             ai_slot_reserved = reserve_ai_search_slot() if ai_starts else False
             if ai_starts and not ai_slot_reserved:
+=======
+            ai_slot_reserved = new_game["current_player"] == get_ai_piece(new_game)
+            if ai_slot_reserved and not reserve_ai_search_slot():
+>>>>>>> origin/main
                 invalid_payload = make_socket_error(game_id, game, AI_BUSY_MESSAGE)
                 error = invalid_payload["message"]
             else:

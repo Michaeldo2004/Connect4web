@@ -74,15 +74,7 @@ Returns the recorded moves in ascending order:
 }
 ```
 
-The frontend review is available at `/game/{gameId}/review`. It only loads completed games, opens on move 1, and supports previous/next navigation and direct move selection. Invalid, in-progress, or missing games redirect to `/404`, which returns home after three seconds.
-
-Request lazy post-game move analysis with:
-
-```text
-POST /api/profile/games/{gameId}/analysis
-```
-
-The authenticated user must be a participant in the completed game. A new request returns HTTP `202` with `status` (`queued` or `running`), `queuePosition`, and the `move_analysis` priority label. Completed analysis requests return HTTP `200`. Per-move results are persisted in `move_analysis` and included with later move-history responses; the game row progresses through `processing`, `complete`, or `failed`.
+The frontend review is available at `/game/{gameId}/review`. It only loads completed games, opens on move 1, and supports previous/next navigation and direct move selection. Invalid, in-progress, or missing games redirect to `/404`, which returns home after three seconds. Move evaluation is not included yet.
 
 ## Socket.IO Gameplay
 
@@ -442,13 +434,11 @@ medium = depth 5, 3s
 hard = depth 7, 4s
 ```
 
-### Priority Scheduling
+### AI Turn Scheduling
 
 AI calculations run outside the per-game lock. While an AI move is calculating, `board_updated` includes `aiThinking: true` and the board remains available for reconnects.
 
-The one-core default uses one non-preemptive worker with strict priority: live AI moves first, waiting-player admissions second, and post-game move analysis last. FIFO ordering is preserved within each tier. An analysis job starts only when no live move or admission is waiting. Once analysis starts it is never cancelled or preempted; new players remain in the waiting room and live moves queue ahead of later analysis jobs. Up to four admitted live sessions can hold one outstanding move each while analysis is running.
-
-Set `AI_WORKER_COUNT=1` to preserve this contract. Results are applied only when the original `gameId` and `move_number` still match; stale live results are discarded.
+The backend admits at most one active calculation per configured AI worker. A non-terminal human move is rejected with `AI is busy, try again` before changing the board when all worker slots are occupied. Results are applied only when the original `gameId` and `move_number` still match; stale results are discarded.
 
 ## Board Values
 

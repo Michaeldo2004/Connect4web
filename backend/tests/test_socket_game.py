@@ -27,8 +27,11 @@ class SocketGameTests(unittest.TestCase):
         app.config["AI_SEARCH_INLINE"] = True
         app.config["AUTH_REQUIRED"] = False
         games.clear()
+<<<<<<< HEAD
         app_module.reset_ai_job_queue()
         app_module.reset_ai_admission_queue()
+=======
+>>>>>>> origin/main
         app_module.create_attempts.clear()
         self.supabase_execute_patch = patch.object(app_module.supabase_store, "execute_safely", return_value=False)
         self.supabase_execute_patch.start()
@@ -39,8 +42,11 @@ class SocketGameTests(unittest.TestCase):
             self.client.disconnect()
         socketio.sleep(0.02)
         games.clear()
+<<<<<<< HEAD
         app_module.reset_ai_job_queue()
         app_module.reset_ai_admission_queue()
+=======
+>>>>>>> origin/main
         app_module.create_attempts.clear()
         app.config["AI_SEARCH_INLINE"] = False
         app.config.pop("AUTH_REQUIRED", None)
@@ -139,7 +145,11 @@ class SocketGameTests(unittest.TestCase):
         self.assertIsNotNone(invalid)
         self.assertEqual(invalid["message"], "Not your turn")
 
+<<<<<<< HEAD
     def test_full_ai_queue_rejects_nonterminal_human_move_without_mutating_the_game(self):
+=======
+    def test_ai_busy_rejects_nonterminal_human_move_without_mutating_the_game(self):
+>>>>>>> origin/main
         with patch("app.random.choice", return_value=1):
             created = self.create_game()
         game = games[created["gameId"]]
@@ -153,11 +163,16 @@ class SocketGameTests(unittest.TestCase):
 
         invalid = find_event(self.client, "invalid_move")
         self.assertIsNotNone(invalid)
+<<<<<<< HEAD
         self.assertEqual(invalid["message"], "AI queue is full, try again")
+=======
+        self.assertEqual(invalid["message"], "AI is busy, try again")
+>>>>>>> origin/main
         self.assertEqual(sum(cell != 0 for row in game["board"] for cell in row), 0)
         self.assertEqual(game["move_number"], 0)
         self.assertFalse(game["ai_thinking"])
 
+<<<<<<< HEAD
     def test_ai_queue_allows_three_waiting_jobs_in_fifo_order(self):
         with patch.object(app_module, "AI_WORKER_COUNT", 1):
             active_reservation = app_module.reserve_ai_search_slot()
@@ -299,6 +314,8 @@ class SocketGameTests(unittest.TestCase):
             ]
         self.assertEqual(positions, list(range(1, 11)))
 
+=======
+>>>>>>> origin/main
     def test_stale_ai_result_is_discarded_after_game_version_changes(self):
         with patch("app.random.choice", return_value=1):
             created = self.create_game()
@@ -440,6 +457,7 @@ class SocketGameTests(unittest.TestCase):
         self.assertIsNotNone(left)
         self.assertNotIn(created["gameId"], games)
 
+<<<<<<< HEAD
     def test_ai_disconnect_preserves_game_for_refresh_rejoin(self):
         created = self.create_game()
         self.client.disconnect()
@@ -476,6 +494,13 @@ class SocketGameTests(unittest.TestCase):
         self.assertFalse(game["ai_thinking"])
         self.assertEqual(game["current_player"], game["human_piece"])
         self.assertEqual(game["message"], "AI move failed. Your turn")
+=======
+    def test_ai_disconnect_removes_game(self):
+        created = self.create_game()
+        self.client.disconnect()
+        socketio.sleep(0.02)
+        self.assertNotIn(created["gameId"], games)
+>>>>>>> origin/main
 
     def test_reset_game_clears_board(self):
         created = self.create_game()
@@ -527,7 +552,10 @@ class SocketGameTests(unittest.TestCase):
             self.assertEqual(joined["status"], "playing")
             self.assertEqual(joined["currentPlayer"], 1)
             self.assertEqual(joined["message"], "Player 1 turn")
+<<<<<<< HEAD
             self.assertEqual(set(joined["playerNames"]), {"1", "2"})
+=======
+>>>>>>> origin/main
         finally:
             second_client.disconnect()
 
@@ -539,7 +567,11 @@ class SocketGameTests(unittest.TestCase):
             "playerId": created["playerId"],
             "public": True,
         })
+<<<<<<< HEAD
         public_update = find_event(self.client, "room_public_updated")
+=======
+        public_update = find_event(self.client, "board_updated")
+>>>>>>> origin/main
         self.assertTrue(public_update["publicRoom"])
 
         second_client = socketio.test_client(app)
@@ -568,6 +600,7 @@ class SocketGameTests(unittest.TestCase):
             second_client.disconnect()
             third_client.disconnect()
 
+<<<<<<< HEAD
     def test_room_visibility_changes_are_rate_limited(self):
         self.client.emit("create_multiplayer_game")
         created = find_event(self.client, "multiplayer_game_created")
@@ -585,6 +618,8 @@ class SocketGameTests(unittest.TestCase):
         self.assertTrue(rejected["publicRoom"])
         self.assertGreater(rejected["retryAfterMs"], 0)
 
+=======
+>>>>>>> origin/main
     def test_public_join_rejects_private_waiting_room(self):
         self.client.emit("create_multiplayer_game")
         created = find_event(self.client, "multiplayer_game_created")

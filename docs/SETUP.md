@@ -42,7 +42,7 @@ Completed games can be opened for review at:
 http://localhost:5173/game/{gameId}/review
 ```
 
-Game review displays each persisted board state and move navigation. Only completed games can be reviewed. Invalid review routes show `/404` and return home after three seconds. Authenticated participants can request lazy post-game move analysis through the backend analysis endpoint.
+Game review displays each persisted board state and move navigation. Only completed games can be reviewed. Invalid review routes show `/404` and return home after three seconds. Move evaluation is not enabled yet.
 
 Placeholder legal pages:
 
@@ -93,9 +93,6 @@ FRONTEND_ORIGIN=http://localhost:5173
 CORS_ALLOWED_ORIGINS=http://localhost:5173
 BACKEND_HOST=localhost
 BACKEND_PORT=5000
-AI_WORKER_COUNT=1
-MOVE_ANALYSIS_DEPTH=4
-MOVE_ANALYSIS_TIME_LIMIT=30
 ```
 
 Run `docs/supabase_schema.sql` in Supabase before enabling sync.
@@ -126,7 +123,6 @@ VITE_JOIN_PATH=/join
 VITE_LOGIN_PATH=/login
 VITE_SIGNUP_PATH=/signup
 VITE_PROFILE_PATH=/profiles
-VITE_AI_WAITING_PATH=/ai/waiting
 VITE_TOS_PATH=/tos
 VITE_PRIVACY_POLICY_PATH=/privacypolicy
 VITE_SUPABASE_URL=

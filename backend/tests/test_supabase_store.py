@@ -56,10 +56,13 @@ class RecordingQuery:
         self.client.operations.append({"table": self.table_name, "action": "update", "payload": payload})
         return self
 
+<<<<<<< HEAD
     def delete(self):
         self.client.operations.append({"table": self.table_name, "action": "delete"})
         return self
 
+=======
+>>>>>>> origin/main
     def eq(self, *args):
         self.client.operations[-1]["eq"] = args
         return self
@@ -199,10 +202,16 @@ class SupabaseStoreTests(unittest.TestCase):
         self.assertTrue(saved)
         self.assertEqual([(op["table"], op["action"]) for op in client.operations], [
             ("game_players", "upsert"),
+<<<<<<< HEAD
             ("game_players", "upsert"),
             ("games", "update"),
         ])
         player_rows = [client.operations[0]["payload"], client.operations[1]["payload"]]
+=======
+            ("games", "update"),
+        ])
+        player_rows = client.operations[0]["payload"]
+>>>>>>> origin/main
         self.assertEqual(client.operations[0]["kwargs"], {"on_conflict": "game_id,player_number"})
         self.assertEqual({row["player_number"] for row in player_rows}, {1, 2})
         self.assertEqual({row["profile_id"] for row in player_rows}, {"profile-1", "profile-2"})
@@ -321,6 +330,7 @@ class SupabaseStoreTests(unittest.TestCase):
         with patch.object(supabase_store, "get_client", return_value=active_client):
             self.assertIsNone(supabase_store.fetch_game_moves("profile-1", game_id))
 
+<<<<<<< HEAD
     def test_move_analysis_status_and_rows_are_persisted(self):
         game_id = str(uuid.uuid4())
         client = RecordingClient()
@@ -368,6 +378,8 @@ class SupabaseStoreTests(unittest.TestCase):
         self.assertEqual(repaired[1]["player_number"], 2)
         self.assertEqual(repaired[1]["column_played"], 4)
 
+=======
+>>>>>>> origin/main
 
 if __name__ == "__main__":
     unittest.main()

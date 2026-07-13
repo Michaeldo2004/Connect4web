@@ -13,8 +13,11 @@ class AuthLayerTests(unittest.TestCase):
     def tearDown(self):
         app.config.pop("AUTH_REQUIRED", None)
         games.clear()
+<<<<<<< HEAD
         app_module.reset_ai_job_queue()
         app_module.reset_ai_admission_queue()
+=======
+>>>>>>> origin/main
 
     def make_token(self, user_id="user-123", secret="test-secret"):
         return jwt.encode(
@@ -136,6 +139,7 @@ class AuthLayerTests(unittest.TestCase):
         self.assertEqual(response.status_code, 404)
         self.assertEqual(response.get_json()["message"], "Game history not found")
 
+<<<<<<< HEAD
     def test_profile_game_analysis_endpoint_queues_low_priority_job(self):
         app.config["AUTH_REQUIRED"] = True
         app_module.reset_ai_job_queue()
@@ -158,6 +162,8 @@ class AuthLayerTests(unittest.TestCase):
         self.assertEqual(response.get_json()["status"], "queued")
         self.assertEqual(response.get_json()["priority"], "move_analysis")
 
+=======
+>>>>>>> origin/main
 
 if __name__ == "__main__":
     unittest.main()

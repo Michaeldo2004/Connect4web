@@ -16,7 +16,6 @@ test("manual routes are env-backed with local defaults", () => {
   assert.match(appSource, /const LOGIN_PATH = getEnvRoute\("VITE_LOGIN_PATH", "\/login"\);/);
   assert.match(appSource, /const SIGNUP_PATH = getEnvRoute\("VITE_SIGNUP_PATH", "\/signup"\);/);
   assert.match(appSource, /const PROFILE_PATH = getEnvRoute\("VITE_PROFILE_PATH", "\/profiles"\);/);
-  assert.match(appSource, /const AI_WAITING_PATH = getEnvRoute\("VITE_AI_WAITING_PATH", "\/ai\/waiting"\);/);
   assert.match(appSource, /const TOS_PATH = getEnvRoute\("VITE_TOS_PATH", "\/tos"\);/);
   assert.match(appSource, /const PRIVACY_POLICY_PATH = getEnvRoute\("VITE_PRIVACY_POLICY_PATH", "\/privacypolicy"\);/);
   assert.match(appSource, /function isGamePath\(pathname\)/);
@@ -90,8 +89,6 @@ test("profile games open a dedicated move review", () => {
   assert.match(appSource, /You moved Second/);
   assert.match(appSource, /review-player-first/);
   assert.match(appSource, /review-player-second/);
-  assert.match(appSource, /move\.player_number === reviewGame\.playerNumber \? "You" : "Opponent"/);
-  assert.match(appSource, /<span>\{move\.move_number\}<\/span>/);
 });
 
 test("join route supports public room discovery", () => {
@@ -111,14 +108,7 @@ test("waiting multiplayer room can be made public", () => {
   assert.match(appSource, /socketClient\.emit\("set_room_public", authPayload\(\{ gameId, playerId, public: !isRoomPublic \}\)\)/);
   assert.match(appSource, /className="public-room-toggle"/);
   assert.match(appSource, />\s*Make Room Public\s*</);
-  assert.match(appSource, /aria-pressed=\{isRoomPublic\}/);
-  assert.match(appSource, /checked=\{isRoomPublic\} readOnly/);
-});
-
-test("live multiplayer results use relative winner messaging", () => {
-  assert.match(appSource, /displayMessage = "You Won!"/);
-  assert.match(appSource, /multiplayerPlayerNames\[String\(winnerNumber\)\]/);
-  assert.match(appSource, /\} won`/);
+  assert.match(appSource, /checked=\{isRoomPublic\}/);
 });
 
 test("board updates can replace stored game id", () => {
@@ -128,27 +118,6 @@ test("board updates can replace stored game id", () => {
   assert.match(appSource, /saveMultiplayerSession\(data\.gameId, data\.playerId\)/);
   assert.match(appSource, /saveSession\(data\.gameId, data\.playerId\)/);
   assert.match(appSource, /redirectTo\(gamePath\(data\.gameId\), true\)/);
-});
-
-test("AI rooms persist across refresh and ignore intermediate optimistic acknowledgements", () => {
-  assert.match(appSource, /pendingMove && data\.mode !== GAME_MODE_MULTIPLAYER && data\.aiThinking/);
-  assert.match(appSource, /saveSession\(data\.gameId, joinedPlayerId\)/);
-  assert.match(appSource, /Boolean\(data\.aiThinking\)/);
-  assert.match(appSource, /nextSocket\.emit\("join_game", authPayload\(storedSession\)\)/);
-  assert.match(appSource, /const \[aiQueuePosition, setAiQueuePosition\] = useState\(0\)/);
-  assert.match(appSource, /AI queued - position \$\{aiQueuePosition\}/);
-});
-
-test("AI admission waiting room persists and checks position every 20 seconds", () => {
-  assert.match(appSource, /const AI_WAITING_KEY = "connect4_ai_waiting"/);
-  assert.match(appSource, /function saveAiWaitingSession/);
-  assert.match(appSource, /nextSocket\.emit\("check_ai_waiting", authPayload\(waitingSession\)\)/);
-  assert.match(appSource, /window\.setInterval\(checkWaitingRoom, 20000\)/);
-  assert.match(appSource, /AI player is currently busy right now\./);
-  assert.match(appSource, /Your position in line:/);
-  assert.match(appSource, /\(checked every 20s\)/);
-  assert.match(appSource, /cancel_ai_waiting/);
-  assert.match(cssSource, /\.ai-waiting-panel/);
 });
 
 test("nav shell includes brand and auth entry points", () => {
@@ -174,17 +143,6 @@ test("loading states use skeleton views", () => {
   assert.match(appSource, /<PublicRoomsSkeleton \/>/);
   assert.match(cssSource, /\.skeleton-block/);
   assert.match(cssSource, /@keyframes skeleton-pulse/);
-});
-
-test("setup view explains modes and confirms the current selection", () => {
-  assert.match(appSource, />Choose how you want to play</);
-  assert.match(appSource, /className="setup-selection" aria-live="polite"/);
-  assert.match(appSource, />Share a room and play live</);
-  assert.match(appSource, /difficulty\.hint/);
-  assert.match(appSource, /className="setup-tips"/);
-  assert.match(cssSource, /\.setup-heading/);
-  assert.match(cssSource, /\.setup-selection/);
-  assert.match(cssSource, /\.setup-tips/);
 });
 
 test("auth modal supports login, signup, and close states", () => {

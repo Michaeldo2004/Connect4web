@@ -6,7 +6,6 @@ const STORAGE_KEY = "connect4_game_session";
 const MULTIPLAYER_STORAGE_KEY = "connect4_multiplayer_session";
 const PENDING_GAME_KEY = "connect4_pending_game";
 const PENDING_MULTIPLAYER_JOIN_KEY = "connect4_pending_multiplayer_join";
-const AI_WAITING_KEY = "connect4_ai_waiting";
 const THEME_KEY = "connect4_theme";
 const SOCKET_URL = getEnvString("VITE_BACKEND_URL", "http://localhost:5000").replace(/\/+$/, "");
 const SETUP_PATH = getEnvRoute("VITE_SETUP_PATH", "/");
@@ -15,12 +14,11 @@ const JOIN_PATH = getEnvRoute("VITE_JOIN_PATH", "/join");
 const LOGIN_PATH = getEnvRoute("VITE_LOGIN_PATH", "/login");
 const SIGNUP_PATH = getEnvRoute("VITE_SIGNUP_PATH", "/signup");
 const PROFILE_PATH = getEnvRoute("VITE_PROFILE_PATH", "/profiles");
-const AI_WAITING_PATH = getEnvRoute("VITE_AI_WAITING_PATH", "/ai/waiting");
 const GAME_REVIEW_PATH = `${GAME_PATH}/review`;
 const NOT_FOUND_PATH = "/404";
 const TOS_PATH = getEnvRoute("VITE_TOS_PATH", "/tos");
 const PRIVACY_POLICY_PATH = getEnvRoute("VITE_PRIVACY_POLICY_PATH", "/privacypolicy");
-const APP_PATHS = new Set([SETUP_PATH, GAME_PATH, JOIN_PATH, LOGIN_PATH, SIGNUP_PATH, PROFILE_PATH, AI_WAITING_PATH, GAME_REVIEW_PATH, NOT_FOUND_PATH, TOS_PATH, PRIVACY_POLICY_PATH]);
+const APP_PATHS = new Set([SETUP_PATH, GAME_PATH, JOIN_PATH, LOGIN_PATH, SIGNUP_PATH, PROFILE_PATH, GAME_REVIEW_PATH, NOT_FOUND_PATH, TOS_PATH, PRIVACY_POLICY_PATH]);
 const ROWS = 6;
 const COLS = 7;
 
@@ -31,10 +29,10 @@ const GAME_MODE_MULTIPLAYER = "multiplayer";
 const DEFAULT_DIFFICULTY = "medium";
 const MIN_AI_RESPONSE_MS = 2000;
 const DIFFICULTIES = [
-  { key: "very_easy", label: "Very Easy", hint: "Learn the board", depth: 1, timeLimit: "3s" },
-  { key: "easy", label: "Easy", hint: "A relaxed match", depth: 2, timeLimit: "3s" },
-  { key: "medium", label: "Medium", hint: "A fair challenge", depth: 5, timeLimit: "3s" },
-  { key: "hard", label: "Hard", hint: "Plan every move", depth: 7, timeLimit: "4s" },
+  { key: "very_easy", label: "Very Easy", depth: 1, timeLimit: "3s" },
+  { key: "easy", label: "Easy", depth: 2, timeLimit: "3s" },
+  { key: "medium", label: "Medium", depth: 5, timeLimit: "3s" },
+  { key: "hard", label: "Hard", depth: 7, timeLimit: "4s" },
 ];
 const USERNAME_MAX_LENGTH = 32;
 const EMAIL_MAX_LENGTH = 254;
@@ -291,26 +289,6 @@ function clearMultiplayerSession() {
   window.sessionStorage.removeItem(MULTIPLAYER_STORAGE_KEY);
 }
 
-function saveAiWaitingSession(queueId, difficulty) {
-  window.localStorage.setItem(AI_WAITING_KEY, JSON.stringify({ queueId, difficulty }));
-}
-
-function loadAiWaitingSession() {
-  try {
-    const waitingSession = JSON.parse(window.localStorage.getItem(AI_WAITING_KEY));
-    if (waitingSession?.queueId) {
-      return waitingSession;
-    }
-  } catch {
-    return null;
-  }
-  return null;
-}
-
-function clearAiWaitingSession() {
-  window.localStorage.removeItem(AI_WAITING_KEY);
-}
-
 function savePendingGame(mode, difficulty) {
   window.sessionStorage.setItem(PENDING_GAME_KEY, JSON.stringify({ mode, difficulty }));
 }
@@ -463,11 +441,7 @@ function App() {
   const [gameMode, setGameMode] = useState(GAME_MODE_AI);
   const [selectedSetupMode, setSelectedSetupMode] = useState(GAME_MODE_AI);
   const [playerNumber, setPlayerNumber] = useState(null);
-  const [multiplayerPlayerNames, setMultiplayerPlayerNames] = useState({});
   const [aiNumber, setAiNumber] = useState(AI);
-  const [aiQueuePosition, setAiQueuePosition] = useState(0);
-  const [aiWaitingQueueId, setAiWaitingQueueId] = useState(() => loadAiWaitingSession()?.queueId || "");
-  const [aiWaitingPosition, setAiWaitingPosition] = useState(0);
   const [playersConnected, setPlayersConnected] = useState(0);
   const [currentPlayer, setCurrentPlayer] = useState(PLAYER);
   const [joinGameId, setJoinGameId] = useState("");
@@ -477,9 +451,6 @@ function App() {
   const [playAgainRequested, setPlayAgainRequested] = useState(false);
   const [otherPlayerLeftMessage, setOtherPlayerLeftMessage] = useState("");
   const [isRoomPublic, setIsRoomPublic] = useState(false);
-  const [roomVisibilityPending, setRoomVisibilityPending] = useState(false);
-  const [roomVisibilityCooldown, setRoomVisibilityCooldown] = useState(false);
-  const [toast, setToast] = useState(null);
   const [publicGames, setPublicGames] = useState([]);
   const [publicGamesLoading, setPublicGamesLoading] = useState(false);
   const [joiningPublicGameId, setJoiningPublicGameId] = useState("");
@@ -508,8 +479,6 @@ function App() {
   const [theme, setTheme] = useState(getInitialTheme);
 
   const boardRef = useRef(board);
-  const toastTimerRef = useRef(null);
-  const roomVisibilityTimerRef = useRef(null);
   const playerNumberRef = useRef(playerNumber);
   const aiNumberRef = useRef(aiNumber);
   const pendingMoveRef = useRef(null);
@@ -540,9 +509,6 @@ function App() {
   }, [profileGames]);
   const gameReviewId = getGameReviewId();
   const reviewGame = profileGames.find((game) => game.id === gameReviewId) || null;
-  const reviewWinnerLabel = reviewGame?.status === "draw"
-    ? "Draw"
-    : reviewGame?.winnerName || (reviewGame?.winnerPlayerNumber ? `Player ${reviewGame.winnerPlayerNumber} Wins` : "Completed game");
   const reviewBoard = reviewMoves[reviewMoveIndex]?.board_after || emptyBoard();
 
   useEffect(() => {
@@ -644,9 +610,7 @@ function App() {
     setGameMode(GAME_MODE_AI);
     setSelectedSetupMode(GAME_MODE_AI);
     setPlayerNumber(null);
-    setMultiplayerPlayerNames({});
     setAiNumber(AI);
-    setAiQueuePosition(0);
     setPlayersConnected(0);
     setCurrentPlayer(PLAYER);
     setDisconnectDeadline(null);
@@ -660,18 +624,6 @@ function App() {
 
   const applyServerBoard = useCallback(async (data) => {
     const pendingMove = pendingMoveRef.current;
-    // The server acknowledges the optimistic human move before the AI search
-    // finishes. Keep that acknowledgement from racing the final AI result and
-    // overwriting the newer board after both async handlers resume.
-    if (pendingMove && data.mode !== GAME_MODE_MULTIPLAYER && data.aiThinking) {
-      setStatus(data.status);
-      setMessage(data.message);
-      setCurrentPlayer(data.currentPlayer);
-      setAiQueuePosition(data.aiQueuePosition || 0);
-      setBusy(true);
-      return;
-    }
-
     if (pendingMove && data.mode !== GAME_MODE_MULTIPLAYER) {
       const elapsed = Date.now() - pendingMove.startedAt;
       if (elapsed < MIN_AI_RESPONSE_MS) {
@@ -703,9 +655,7 @@ function App() {
     if (data.aiNumber) {
       setAiNumber(data.aiNumber);
     }
-    setAiQueuePosition(data.aiQueuePosition || 0);
     setPlayersConnected(data.playersConnected || 0);
-    setMultiplayerPlayerNames(data.playerNames || {});
     setDisconnectDeadline(data.disconnectDeadline || null);
     setPlayAgainAccepted(data.playAgainAccepted || 0);
     setIsRoomPublic(Boolean(data.publicRoom));
@@ -713,7 +663,7 @@ function App() {
       setPlayAgainRequested(false);
     }
     setGameStarted(true);
-    setBusy(data.mode !== GAME_MODE_MULTIPLAYER && Boolean(data.aiThinking) && data.status === "playing");
+    setBusy(data.mode !== GAME_MODE_MULTIPLAYER && data.currentPlayer === nextAiNumber && data.status === "playing");
 
     if (data.mode === GAME_MODE_MULTIPLAYER && playerColumn !== null) {
       setPlayerMoves((currentMoves) => [playerColumn, ...currentMoves]);
@@ -860,12 +810,6 @@ function App() {
       }
 
       const routeGameId = getRouteGameId();
-      const waitingSession = loadAiWaitingSession();
-      if (waitingSession) {
-        setAiWaitingQueueId(waitingSession.queueId);
-        nextSocket.emit("check_ai_waiting", authPayload(waitingSession));
-        return;
-      }
       const pendingGame = takePendingGame();
       if (pendingGame) {
         clearSession();
@@ -905,18 +849,13 @@ function App() {
     }
 
     function handleGameCreated(data) {
-      clearAiWaitingSession();
-      setAiWaitingQueueId("");
-      setAiWaitingPosition(0);
       saveSession(data.gameId, data.playerId);
       setGameId(data.gameId);
       setPlayerId(data.playerId);
       setGameMode(data.mode || GAME_MODE_AI);
       setPlayerNumber(data.playerNumber || null);
       setAiNumber(data.aiNumber || AI);
-      setAiQueuePosition(data.aiQueuePosition || 0);
       setPlayersConnected(data.playersConnected || 0);
-      setMultiplayerPlayerNames(data.playerNames || {});
       setCurrentPlayer(data.currentPlayer || PLAYER);
       setDisconnectDeadline(data.disconnectDeadline || null);
       setPlayAgainAccepted(data.playAgainAccepted || 0);
@@ -936,19 +875,12 @@ function App() {
 
     function handleGameJoined(data) {
       const storedSession = loadSession();
-      const joinedPlayerId = data.playerId || storedSession?.playerId || null;
-      if (data.mode !== GAME_MODE_MULTIPLAYER && joinedPlayerId) {
-        clearMultiplayerSession();
-        saveSession(data.gameId, joinedPlayerId);
-      }
       setGameId(data.gameId);
-      setPlayerId(joinedPlayerId);
+      setPlayerId(storedSession?.playerId || null);
       setGameMode(data.mode || GAME_MODE_AI);
       setPlayerNumber(data.playerNumber || null);
       setAiNumber(data.aiNumber || AI);
-      setAiQueuePosition(data.aiQueuePosition || 0);
       setPlayersConnected(data.playersConnected || 0);
-      setMultiplayerPlayerNames(data.playerNames || {});
       setCurrentPlayer(data.currentPlayer || PLAYER);
       setDisconnectDeadline(data.disconnectDeadline || null);
       setPlayAgainAccepted(data.playAgainAccepted || 0);
@@ -962,7 +894,7 @@ function App() {
       setPlayerMoves([]);
       setAiMoves([]);
       setGameStarted(true);
-      setBusy(data.mode !== GAME_MODE_MULTIPLAYER && Boolean(data.aiThinking) && data.status === "playing");
+      setBusy(data.mode !== GAME_MODE_MULTIPLAYER && data.currentPlayer === (data.aiNumber || AI) && data.status === "playing");
       redirectTo(gamePath(data.gameId), true);
     }
 
@@ -973,9 +905,7 @@ function App() {
       setPlayerId(data.playerId);
       setPlayerNumber(data.playerNumber);
       setAiNumber(AI);
-      setAiQueuePosition(0);
       setPlayersConnected(data.playersConnected || 0);
-      setMultiplayerPlayerNames(data.playerNames || {});
       setCurrentPlayer(data.currentPlayer || PLAYER);
       setDisconnectDeadline(data.disconnectDeadline || null);
       setPlayAgainAccepted(data.playAgainAccepted || 0);
@@ -998,9 +928,6 @@ function App() {
     function handleJoinRejected(data) {
       clearSession();
       clearMultiplayerSession();
-      clearAiWaitingSession();
-      setAiWaitingQueueId("");
-      setAiWaitingPosition(0);
       clearLocalGame();
       setMessage(data?.message || "Game not found");
       setJoiningPublicGameId("");
@@ -1014,34 +941,11 @@ function App() {
     }
 
     function handleCreateRejected(data) {
-      clearAiWaitingSession();
-      setAiWaitingQueueId("");
-      setAiWaitingPosition(0);
       clearSession();
       clearMultiplayerSession();
       clearLocalGame();
       setMessage(data?.message || "Could not create game");
       redirectTo(SETUP_PATH, true);
-    }
-
-    function handleAiWaiting(data) {
-      const waitingSession = loadAiWaitingSession();
-      const difficulty = data.difficulty || waitingSession?.difficulty || DEFAULT_DIFFICULTY;
-      saveAiWaitingSession(data.queueId, difficulty);
-      setAiWaitingQueueId(data.queueId);
-      setAiWaitingPosition(data.position || 1);
-      setBusy(false);
-      redirectTo(AI_WAITING_PATH, true);
-    }
-
-    function handleAiWaitingCancelled() {
-      clearAiWaitingSession();
-      setAiWaitingQueueId("");
-      setAiWaitingPosition(0);
-      setBusy(false);
-      if (getCurrentPath() === AI_WAITING_PATH) {
-        redirectTo(SETUP_PATH, true);
-      }
     }
 
     async function handleBoardUpdated(data) {
@@ -1100,43 +1004,6 @@ function App() {
       setPublicGamesLoading(false);
     }
 
-    function showToast(message, type) {
-      if (toastTimerRef.current) {
-        window.clearTimeout(toastTimerRef.current);
-      }
-      setToast({ message, type });
-      toastTimerRef.current = window.setTimeout(() => setToast(null), 3500);
-    }
-
-    function startRoomVisibilityCooldown(duration = 5000) {
-      if (roomVisibilityTimerRef.current) {
-        window.clearTimeout(roomVisibilityTimerRef.current);
-      }
-      setRoomVisibilityCooldown(true);
-      roomVisibilityTimerRef.current = window.setTimeout(() => {
-        setRoomVisibilityCooldown(false);
-        roomVisibilityTimerRef.current = null;
-      }, duration);
-    }
-
-    function handleRoomPublicUpdated(data) {
-      setIsRoomPublic(Boolean(data.publicRoom));
-      setRoomVisibilityPending(false);
-      startRoomVisibilityCooldown(5000);
-      showToast(data.message || "Room visibility updated", "success");
-    }
-
-    function handleRoomPublicUpdateFailed(data) {
-      if (typeof data?.publicRoom === "boolean") {
-        setIsRoomPublic(data.publicRoom);
-      }
-      setRoomVisibilityPending(false);
-      if (data?.retryAfterMs > 0) {
-        startRoomVisibilityCooldown(data.retryAfterMs);
-      }
-      showToast(data?.message || "Could not update room visibility", "error");
-    }
-
     nextSocket.on("connect", handleConnect);
     nextSocket.on("game_created", handleGameCreated);
     nextSocket.on("game_joined", handleGameJoined);
@@ -1144,15 +1011,11 @@ function App() {
     nextSocket.on("multiplayer_game_joined", handleMultiplayerGameStarted);
     nextSocket.on("join_rejected", handleJoinRejected);
     nextSocket.on("create_rejected", handleCreateRejected);
-    nextSocket.on("ai_waiting", handleAiWaiting);
-    nextSocket.on("ai_waiting_cancelled", handleAiWaitingCancelled);
     nextSocket.on("board_updated", handleBoardUpdated);
     nextSocket.on("play_again_updated", handlePlayAgainUpdated);
     nextSocket.on("player_left", handlePlayerLeft);
     nextSocket.on("game_left", handleGameLeft);
     nextSocket.on("public_games", handlePublicGames);
-    nextSocket.on("room_public_updated", handleRoomPublicUpdated);
-    nextSocket.on("room_public_update_failed", handleRoomPublicUpdateFailed);
     nextSocket.on("invalid_move", handleInvalidMove);
     nextSocket.on("connect_error", () => {
       setStatus("error");
@@ -1161,30 +1024,9 @@ function App() {
     });
 
     return () => {
-      if (toastTimerRef.current) {
-        window.clearTimeout(toastTimerRef.current);
-      }
-      if (roomVisibilityTimerRef.current) {
-        window.clearTimeout(roomVisibilityTimerRef.current);
-      }
       nextSocket.disconnect();
     };
   }, [applyServerBoard, authPayload, clearLocalGame, redirectTo]);
-
-  useEffect(() => {
-    if (routePath !== AI_WAITING_PATH || !aiWaitingQueueId || !socketClient?.connected) {
-      return undefined;
-    }
-    const checkWaitingRoom = () => {
-      const waitingSession = loadAiWaitingSession();
-      socketClient.emit("check_ai_waiting", authPayload({
-        queueId: aiWaitingQueueId,
-        difficulty: waitingSession?.difficulty || selectedDifficulty,
-      }));
-    };
-    const intervalId = window.setInterval(checkWaitingRoom, 20000);
-    return () => window.clearInterval(intervalId);
-  }, [aiWaitingQueueId, authPayload, routePath, selectedDifficulty, socketClient]);
 
   useEffect(() => {
     if (routePath === JOIN_PATH && authSession && socketClient?.connected) {
@@ -1257,7 +1099,7 @@ function App() {
     setMessage("Joining multiplayer room...");
     setGameStarted(false);
     setBusy(true);
-    socketClient.emit("join_multiplayer_game", authPayload({ gameId: requestedGameId, publicJoin, playerName: accountName }));
+    socketClient.emit("join_multiplayer_game", authPayload({ gameId: requestedGameId, publicJoin }));
   }
 
   function requestPublicGames() {
@@ -1285,11 +1127,10 @@ function App() {
   }
 
   function togglePublicRoom() {
-    if (!socketClient?.connected || !gameId || !playerId || busy || roomVisibilityPending || roomVisibilityCooldown) {
+    if (!socketClient?.connected || !gameId || !playerId || busy) {
       return;
     }
 
-    setRoomVisibilityPending(true);
     socketClient.emit("set_room_public", authPayload({ gameId, playerId, public: !isRoomPublic }));
   }
 
@@ -1325,9 +1166,6 @@ function App() {
 
       clearSession();
       clearMultiplayerSession();
-      clearAiWaitingSession();
-      setAiWaitingQueueId("");
-      setAiWaitingPosition(0);
       pendingMoveRef.current = null;
       setGameMode(GAME_MODE_AI);
       setCurrentPlayer(PLAYER);
@@ -1395,17 +1233,6 @@ function App() {
 
   function showJoinGamePage() {
     redirectTo(JOIN_PATH);
-  }
-
-  function leaveAiWaitingRoom() {
-    if (socketClient?.connected && aiWaitingQueueId) {
-      socketClient.emit("cancel_ai_waiting", authPayload({ queueId: aiWaitingQueueId }));
-      return;
-    }
-    clearAiWaitingSession();
-    setAiWaitingQueueId("");
-    setAiWaitingPosition(0);
-    redirectTo(SETUP_PATH, true);
   }
 
   const playColumn = useCallback((column) => {
@@ -1599,15 +1426,11 @@ function App() {
   }
 
   async function logout() {
-    if (socketClient?.connected && aiWaitingQueueId) {
-      socketClient.emit("cancel_ai_waiting", authPayload({ queueId: aiWaitingQueueId }));
-    }
     if (supabaseClient) {
       await supabaseClient.auth.signOut();
     }
     clearSession();
     clearMultiplayerSession();
-    clearAiWaitingSession();
     clearLocalGame();
     setAuthSession(null);
     redirectTo(LOGIN_PATH, true);
@@ -1635,36 +1458,24 @@ function App() {
       (gameMode === GAME_MODE_MULTIPLAYER && playerNumber === currentPlayer && playersConnected === 2));
   const showingSetup = routePath === SETUP_PATH;
   const showingJoin = routePath === JOIN_PATH;
-  const showingAiWaiting = routePath === AI_WAITING_PATH;
   const showingGame = routePath === GAME_PATH;
   const showingGameReview = routePath === GAME_REVIEW_PATH;
   const showingProfile = routePath === PROFILE_PATH;
   const showingLegalPage = routePath === TOS_PATH || routePath === PRIVACY_POLICY_PATH;
   let displayMessage = message;
-  if (gameOver && gameMode === GAME_MODE_MULTIPLAYER && status !== "draw") {
-    const winnerNumber = status === "player1_win" ? 1 : status === "player2_win" ? 2 : null;
-    if (winnerNumber === playerNumber) {
-      displayMessage = "You Won!";
-    } else if (winnerNumber) {
-      displayMessage = `${multiplayerPlayerNames[String(winnerNumber)] || `Player ${winnerNumber}`} won`;
-    }
-  } else if (!gameOver && canDropPiece) {
+  if (!gameOver && canDropPiece) {
     displayMessage = "Your turn";
   } else if (!gameOver && gameStarted && gameMode === GAME_MODE_MULTIPLAYER && playersConnected === 2) {
     displayMessage = "Other player's turn";
   } else if (!gameOver && gameStarted && gameMode === GAME_MODE_AI && busy) {
-    displayMessage = aiQueuePosition > 0 ? `AI queued - position ${aiQueuePosition}` : "AI is thinking";
+    displayMessage = "AI is thinking";
   }
 
   if (disconnectDeadline && disconnectSecondsLeft !== null && playersConnected < 2 && !gameOver) {
     displayMessage = `${message} Waiting ${disconnectSecondsLeft} seconds.`;
   }
 
-  const currentPlayerWon = gameOver && gameMode === GAME_MODE_MULTIPLAYER
-    && ((status === "player1_win" && playerNumber === 1) || (status === "player2_win" && playerNumber === 2));
-  const statusClassName = currentPlayerWon
-    ? "turn-status game-won"
-    : !gameOver && canDropPiece ? "turn-status your-turn" : "turn-status waiting-turn";
+  const statusClassName = !gameOver && canDropPiece ? "turn-status your-turn" : "turn-status waiting-turn";
   const canLeaveGame =
     gameStarted &&
     showingGame &&
@@ -1762,29 +1573,12 @@ function App() {
       </div>
     </section>
   );
-  const aiWaitingView = (
-    <section className="difficulty-panel ai-waiting-panel" aria-live="polite">
-      <span className="ai-waiting-spinner" aria-hidden="true" />
-      <div>
-        <span className="ai-waiting-eyebrow">AI waiting room</span>
-        <h1>AI player is currently busy right now.</h1>
-        <p>Your position in line: <strong>{aiWaitingPosition || "-"}</strong></p>
-        <small>(checked every 20s)</small>
-      </div>
-      <button type="button" onClick={leaveAiWaitingRoom}>Leave waiting room</button>
-    </section>
-  );
   const setupView = !authReady ? (
     <GameLoadingSkeleton message="Loading account..." />
   ) : !isAuthenticated ? (
     authRequiredView
   ) : (
     <section className="difficulty-panel">
-      <header className="setup-heading">
-        <span>New match</span>
-        <h1>Choose how you want to play</h1>
-        <p>Challenge a friend or sharpen your strategy against the AI.</p>
-      </header>
       <div className="mode-select-layout">
         <div className="mode-side mode-side-player">
           <button
@@ -1795,24 +1589,15 @@ function App() {
             disabled={busy}
           >
             <span>Vs Player</span>
-            <small>Share a room and play live</small>
           </button>
         </div>
 
         <div className="setup-create-column">
-          <div className="setup-selection" aria-live="polite">
-            <span>Your selection</span>
-            <strong>
-              {selectedSetupMode === GAME_MODE_MULTIPLAYER
-                ? "Vs Player"
-                : `Vs AI · ${DIFFICULTIES.find((difficulty) => difficulty.key === selectedDifficulty)?.label || "Medium"}`}
-            </strong>
-          </div>
           <button className="play-button" type="button" onClick={requestNewGame} disabled={busy}>
-            {busy ? "Creating..." : "Create game"}
+            Create game
           </button>
           <button className="join-game-link" type="button" onClick={showJoinGamePage} disabled={busy}>
-            Join a room
+            Join Game
           </button>
         </div>
 
@@ -1830,16 +1615,10 @@ function App() {
                 disabled={busy}
               >
                 <span>{difficulty.label}</span>
-                <small>{difficulty.hint}</small>
               </button>
             ))}
           </div>
         </div>
-      </div>
-      <div className="setup-tips" aria-label="Game tips">
-        <span><strong>01</strong> Pick a mode</span>
-        <span><strong>02</strong> Connect four pieces</span>
-        <span><strong>03</strong> Review completed games</span>
       </div>
     </section>
   );
@@ -1912,7 +1691,7 @@ function App() {
       <div className="profile-header">
         <div>
           <span>Game review</span>
-          <strong>{reviewGame ? `${reviewWinnerLabel}${reviewGame.winnerName ? " Wins" : ""}` : "Completed game"}</strong>
+          <strong>{reviewGame ? formatGameStatus(reviewGame.status) : "Completed game"}</strong>
         </div>
         <button type="button" onClick={() => redirectTo(PROFILE_PATH)}>
           Back to games
@@ -2002,20 +1781,16 @@ function App() {
               <div className="review-move-row" key={`review-row-${rowIndex}`}>
                 {row.map((move, index) => {
                   const moveIndex = rowIndex * 10 + index;
-                  const moveOwner = reviewGame?.playerNumber
-                    ? move.player_number === reviewGame.playerNumber ? "You" : "Opponent"
-                    : `Player ${move.player_number}`;
                   return (
                     <span className="review-move-entry" key={move.move_number}>
                       <button
                         type="button"
                         className={`review-move-button player-${move.player_number}${moveIndex === reviewMoveIndex ? " current" : ""}`}
                         onClick={() => setReviewMoveIndex(moveIndex)}
-                        aria-label={`Show move ${move.move_number} by ${moveOwner}`}
+                        aria-label={`Show move ${move.move_number}`}
                         aria-current={moveIndex === reviewMoveIndex ? "step" : undefined}
                       >
-                        <span>{moveOwner}</span>
-                        <span>{move.move_number}</span>
+                        {move.move_number}
                       </button>
                       {index < row.length - 1 ? <span className="review-move-separator" aria-hidden="true">&gt;</span> : null}
                     </span>
@@ -2097,6 +1872,14 @@ function App() {
   );
   const gameView = (
     <>
+      {canTogglePublicRoom ? (
+        <section className="public-room-toggle">
+          <label>
+            <span>Make Room Public</span>
+            <input type="checkbox" checked={isRoomPublic} onChange={togglePublicRoom} disabled={busy} />
+          </label>
+        </section>
+      ) : null}
       <section className="status-panel">
         <div>
           <span>Status</span>
@@ -2189,20 +1972,8 @@ function App() {
           Play again {playAgainAccepted}/2
         </button>
       ) : null}
-      {canTogglePublicRoom ? (
-        <button
-          className="public-room-toggle"
-          type="button"
-          aria-pressed={isRoomPublic}
-          onClick={togglePublicRoom}
-          disabled={busy || roomVisibilityPending || roomVisibilityCooldown}
-        >
-          <span>Make Room Public</span>
-          <input type="checkbox" checked={isRoomPublic} readOnly tabIndex={-1} aria-hidden="true" />
-        </button>
-      ) : null}
       {canLeaveGame ? (
-        <button className="leave-game-button" type="button" onClick={leaveGame} disabled={busy}>
+        <button type="button" onClick={leaveGame} disabled={busy}>
           Leave
         </button>
       ) : null}
@@ -2216,7 +1987,7 @@ function App() {
   );
   const legalView = <section className="blank-page" aria-label={routePath === TOS_PATH ? "Terms of Service" : "Privacy Policy"} />;
   let pageView = setupView;
-  if (!authReady && (showingSetup || showingGame || showingGameReview || showingProfile || showingAiWaiting)) {
+  if (!authReady && (showingSetup || showingGame || showingGameReview || showingProfile)) {
     pageView = loadingView;
   } else if (routePath === LOGIN_PATH || routePath === SIGNUP_PATH) {
     pageView = authPageView;
@@ -2224,10 +1995,6 @@ function App() {
     pageView = authRequiredView;
   } else if (showingGame) {
     pageView = gameStarted ? gameView : loadingView;
-  } else if (showingAiWaiting && !isAuthenticated) {
-    pageView = authRequiredView;
-  } else if (showingAiWaiting) {
-    pageView = aiWaitingView;
   } else if (showingGameReview && !isAuthenticated) {
     pageView = authRequiredView;
   } else if (showingJoin) {
@@ -2298,12 +2065,6 @@ function App() {
         </nav>
         <span>Connect4web by Michael D</span>
       </footer>
-
-      {toast ? (
-        <div className={`toast toast-${toast.type}`} role="status" aria-live="polite">
-          {toast.message}
-        </div>
-      ) : null}
 
       {authOpen ? (
         <div className="modal-backdrop" role="presentation">
