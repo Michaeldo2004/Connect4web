@@ -94,6 +94,108 @@ test("profile games open a dedicated move review", () => {
   assert.match(appSource, /<span>\{move\.move_number\}<\/span>/);
 });
 
+test("move evaluation requests are shared, disabled, toasted, and polled", () => {
+  assert.match(appSource, /const MOVE_ANALYSIS_POLL_MS = 2000;/);
+  assert.match(appSource, /const \[reviewAnalysisStatus, setReviewAnalysisStatus\] = useState\("not_requested"\);/);
+  assert.match(appSource, /const \[reviewAnalysisAvailable, setReviewAnalysisAvailable\] = useState\(true\);/);
+  assert.match(appSource, /const \[reviewAnalysisRequestPending, setReviewAnalysisRequestPending\] = useState\(false\);/);
+  assert.match(appSource, /const showToast = useCallback\(\(toastMessage, type = "info"\) =>/);
+  assert.match(appSource, /normalizeMoveAnalysisStatus\(data\.analysis_status\)/);
+  assert.match(appSource, /typeof data\.analysis_error === "string"/);
+  assert.match(appSource, /api\/profile\/games\/\$\{encodeURIComponent\(gameReviewId\)\}\/analysis/);
+  assert.match(appSource, /method: "POST"/);
+  assert.match(appSource, /reviewAnalysisRequestControllerRef\.current/);
+  assert.match(appSource, /reviewAnalysisUnavailable = reviewLoading \|\| Boolean\(reviewError\) \|\| reviewMoves\.length === 0/);
+  assert.match(appSource, /reviewAnalysisButtonDisabled = !reviewAnalysisAvailable \|\| reviewAnalysisUnavailable \|\| reviewAnalysisRequestPending \|\| reviewAnalysisActive \|\| reviewAnalysisComplete/);
+  assert.match(appSource, /Move evaluation queued \(position \$\{queuePosition\}\)\./);
+  assert.match(appSource, /Move evaluation is running\./);
+  assert.match(appSource, /window\.setTimeout\(pollAnalysis, MOVE_ANALYSIS_POLL_MS\)/);
+  assert.match(appSource, /controller\.abort\(\)/);
+  assert.match(appSource, /className="profile-review-actions"/);
+  assert.match(appSource, /className="evaluate-moves-button"/);
+  assert.match(appSource, />\s*Evaluate moves\s*</);
+  assert.match(appSource, />\s*Back to games\s*</);
+  assert.match(cssSource, /\.profile-review-actions/);
+  assert.match(cssSource, /\.evaluate-moves-button:disabled/);
+  assert.match(cssSource, /\.toast-info/);
+  assert.match(appSource, /data\.analysis_available !== false/);
+  assert.match(appSource, /className="review-analysis-notice" role="status"/);
+  assert.match(cssSource, /\.review-analysis-notice/);
+});
+
+test("review routes avoid live sockets and API failures are parsed safely", () => {
+  assert.match(appSource, /const SOCKET_TRANSPORTS = getSocketTransports\(\);/);
+  assert.match(appSource, /const SOCKET_PATHS = new Set\(\[SETUP_PATH, GAME_PATH, JOIN_PATH, AI_WAITING_PATH\]\);/);
+  assert.match(appSource, /if \(!socketRouteActive\) \{\s*setSocketClient\(null\);\s*return undefined;/);
+  assert.match(appSource, /io\(SOCKET_URL, \{ transports: SOCKET_TRANSPORTS \}\)/);
+  assert.doesNotMatch(appSource, /transports: \["websocket"\]/);
+  assert.match(appSource, /async function readJsonResponse\(response\)/);
+  assert.match(appSource, /const data = await readJsonResponse\(response\);/);
+  assert.doesNotMatch(appSource, /response\.json\(\)/);
+  assert.match(appSource, /result\?\.status === "error"/);
+});
+
+test("multiplayer room creation is correlated, acknowledged, and recoverable", () => {
+  assert.match(appSource, /const MULTIPLAYER_CREATE_TIMEOUT_MS = 10000;/);
+  assert.match(appSource, /function createMultiplayerRequestId\(\)/);
+  assert.match(appSource, /window\.crypto\?\.randomUUID/);
+  assert.match(appSource, /function savePendingGame\(mode, difficulty, ownerName = "", requestId = ""\)/);
+  assert.match(appSource, /const pendingGame = \{ mode, difficulty, ownerName, requestId \};/);
+  assert.match(appSource, /function loadPendingGame\(\)/);
+  assert.doesNotMatch(appSource, /function takePendingGame\(\)/);
+  assert.match(appSource, /existingPendingGame\?\.mode === GAME_MODE_MULTIPLAYER && existingPendingGame\.requestId/);
+  assert.match(appSource, /savePendingGame\(GAME_MODE_MULTIPLAYER, null, accountName, requestId\)/);
+  assert.match(appSource, /function emitPendingMultiplayerCreate\(pendingGame = loadPendingGame\(\)\)/);
+  assert.match(appSource, /const persistedGame = savePendingGame\([\s\S]*requestId,[\s\S]*\);\s*multiplayerCreateInFlightRequestRef\.current = requestId;/);
+  assert.match(appSource, /nextSocket\.timeout\(MULTIPLAYER_CREATE_TIMEOUT_MS\)\.emit\(\s*"create_multiplayer_game"/);
+  assert.match(appSource, /authPayload\(\{ ownerName: persistedGame\.ownerName, requestId \}\)/);
+  assert.match(appSource, /if \(!response \|\| response\.ok === false\)/);
+  assert.match(appSource, /handleMultiplayerGameCreated\(response, requestId\)/);
+  assert.match(appSource, /nextSocket\.on\("multiplayer_game_created", handleMultiplayerGameCreated\)/);
+  assert.match(appSource, /completedMultiplayerCreateRequestRef\.current === responseRequestId/);
+  assert.match(appSource, /completedMultiplayerCreateGameRef\.current === data\.gameId/);
+  assert.match(appSource, /const timeoutMessage = "Room creation timed out\. Try Create game again\.";[\s\S]*setBusy\(false\);/);
+  assert.match(appSource, /function handleDisconnect\(\)[\s\S]*Room creation will retry after reconnecting\.[\s\S]*setBusy\(false\);/);
+  assert.doesNotMatch(appSource, /nextSocket\.on\("connect_error", \(\) => \{\s*clearPendingGame\(\);/);
+});
+
+test("multiplayer setup clears stale state and reports explicit rejection", () => {
+  assert.match(appSource, /const clearLocalGame = useCallback\(\(\) => \{[\s\S]*setGameStarted\(false\);/);
+  assert.match(appSource, /function handleGameLeft\(\) \{[\s\S]*clearPendingGame\(\);[\s\S]*clearLocalGame\(\);[\s\S]*redirectTo\(SETUP_PATH, true\);/);
+  const setupIntentIndex = appSource.indexOf("if (routePath === SETUP_PATH && selectedSetupMode === GAME_MODE_MULTIPLAYER)");
+  const staleModeIndex = appSource.indexOf("if (gameMode === GAME_MODE_MULTIPLAYER)", setupIntentIndex);
+  assert.ok(setupIntentIndex >= 0 && staleModeIndex > setupIntentIndex);
+  assert.match(appSource, /const rejectionMessage = data\?\.message \|\| "Could not create game";\s*setMessage\(rejectionMessage\);\s*showToast\(rejectionMessage, "error"\);/);
+  assert.match(appSource, /function chooseDifficulty\(difficulty\) \{[\s\S]*clearPendingGame\(\);/);
+  assert.match(appSource, /async function logout\(\) \{[\s\S]*clearPendingGame\(\);/);
+});
+
+test("completed move evaluation renders an accessible highlighted log", () => {
+  assert.match(appSource, /function getReviewMoveFeedback\(move\)/);
+  assert.match(appSource, /if \(move\?\.reconstructed\) \{\s*return null;/);
+  assert.match(appSource, /Array\.isArray\(move\?\.move_analysis\)/);
+  assert.match(appSource, /typeof nestedAnalysis\.feedback !== "string"/);
+  assert.match(appSource, /return nestedAnalysis\.feedback\.trim\(\);/);
+  assert.match(appSource, /className="review-evaluation-log"/);
+  assert.match(appSource, /role="region"\s*aria-label="Move evaluation table"\s*tabIndex=\{0\}/);
+  assert.match(appSource, /<th scope="col">Turn<\/th>/);
+  assert.match(appSource, /<th scope="col">Move<\/th>/);
+  assert.match(appSource, /<th scope="col">Feedback<\/th>/);
+  assert.match(appSource, /getReviewMoveLabel\(move, reviewGame\?\.playerNumber\)/);
+  assert.match(appSource, /return "Your Move";/);
+  assert.match(appSource, /return "Opponent's Move";/);
+  assert.match(appSource, /const feedback = getReviewMoveFeedback\(move\);/);
+  assert.match(appSource, /data-label="Feedback"/);
+  assert.match(appSource, /\{feedback \|\| "Unavailable"\}/);
+  assert.match(appSource, /aria-current=\{isCurrentMove \? "step" : undefined\}/);
+  assert.match(appSource, /className="review-board-row" role="row"/);
+  assert.doesNotMatch(appSource, /played_score|best_score|worst_score|best_column|worst_column/);
+  assert.doesNotMatch(appSource, /analysis\.rating|move\.rating|formatAnalyzedMove/);
+  assert.match(cssSource, /\.review-evaluation-table-wrap/);
+  assert.match(cssSource, /\.review-evaluation-row\.current/);
+  assert.match(cssSource, /\.review-evaluation-unavailable/);
+});
+
 test("join route supports public room discovery", () => {
   assert.match(appSource, /const \[publicGames, setPublicGames\] = useState\(\[\]\);/);
   assert.match(appSource, /const \[joiningPublicGameId, setJoiningPublicGameId\] = useState\(""\);/);

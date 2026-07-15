@@ -59,15 +59,16 @@ def get_best_move(board, piece, max_depth=5, time_limit=3, transposition_table=N
 
 
 def get_move_scores(board, piece, max_depth=4, time_limit=30):
-    """Return fixed-depth minimax scores for every legal move in a position."""
+    """Return center-priority best/worst columns and every legal move score."""
     valid_moves = ordered_moves(board)
     if not valid_moves:
-        return None, {}
+        return None, None, {}
 
     opponent_piece = 2 if piece == 1 else 1
     deadline = time.monotonic() + time_limit
     transposition_table = {}
     scores = {}
+    timed_out = False
     for col in valid_moves:
         temp_board = board.copy()
         drop_piece(temp_board, col, piece)
@@ -84,13 +85,34 @@ def get_move_scores(board, piece, max_depth=4, time_limit=30):
                 transposition_table,
             )
         except SearchTimeout:
-            # A completed analysis job must produce a result for every move.
-            # Static scoring is a deterministic fallback if its total budget expires.
-            score = evaluate_board(temp_board, piece)
+            timed_out = True
+            break
         scores[int(col)] = int(score)
 
+    if timed_out:
+        # Never compare fixed-depth minimax values with static heuristic values.
+        # If the shared position budget expires, rescore every legal root move
+        # with the same deterministic terminal/static evaluator.
+        scores = {}
+        for col in valid_moves:
+            temp_board = board.copy()
+            drop_piece(temp_board, col, piece)
+            reply_moves = ordered_moves(temp_board)
+            terminal_score = get_terminal_score(
+                temp_board,
+                0,
+                piece,
+                opponent_piece,
+                reply_moves,
+            )
+            score = terminal_score if terminal_score is not None else evaluate_board(temp_board, piece)
+            scores[int(col)] = int(score)
+
+    # ``valid_moves`` is already center-first. Python's max/min keep the first
+    # item on ties, giving both recommendations deterministic center priority.
     best_col = max(valid_moves, key=lambda col: scores[int(col)])
-    return int(best_col), scores
+    worst_col = min(valid_moves, key=lambda col: scores[int(col)])
+    return int(best_col), int(worst_col), scores
 
 
 def search_best_move(board, piece, opponent_piece, search_depth, deadline, transposition_table):

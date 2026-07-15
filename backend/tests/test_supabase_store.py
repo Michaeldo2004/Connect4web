@@ -34,6 +34,11 @@ class FakeClient:
         return FakeQuery(self.rows)
 
 
+class MissingMoveAnalysisColumnError(Exception):
+    code = "42703"
+    message = "column move_analysis_1.worst_column does not exist"
+
+
 class RecordingQuery:
     def __init__(self, client, table_name):
         self.client = client
@@ -77,13 +82,30 @@ class RecordingClient:
 
 
 class MoveHistoryClient:
-    def __init__(self, membership, moves):
+    def __init__(self, membership, moves, missing_analysis_columns=False):
         self.membership = membership
         self.moves = moves
+        self.missing_analysis_columns = missing_analysis_columns
+        self.selections = {}
+        self.selection_history = []
 
     def table(self, table_name):
         rows = self.membership if table_name == "game_players" else self.moves
-        return FakeQuery(rows)
+        client = self
+
+        class MoveHistoryQuery(FakeQuery):
+            def select(self, selection):
+                client.selections[table_name] = selection
+                client.selection_history.append((table_name, selection))
+                if (
+                    client.missing_analysis_columns
+                    and table_name in {"game_moves", "move_analysis"}
+                    and ("worst_column" in selection or "worst_score" in selection)
+                ):
+                    raise MissingMoveAnalysisColumnError()
+                return self
+
+        return MoveHistoryQuery(rows)
 
 
 class SupabaseStoreTests(unittest.TestCase):
@@ -116,7 +138,8 @@ class SupabaseStoreTests(unittest.TestCase):
 
         self.assertEqual(payload["id"], str(uuid.UUID(game_id)))
         self.assertEqual(payload["winner_player_number"], 1)
-        self.assertEqual(payload["analysis_status"], "not_requested")
+        self.assertNotIn("analysis_status", payload)
+        self.assertNotIn("analysis_error", payload)
         self.assertIsNotNone(payload["ended_at"])
         self.assertEqual(payload["final_board"], [[0, 0, 0, 0, 0, 0, 0] for _ in range(6)])
 
@@ -179,6 +202,8 @@ class SupabaseStoreTests(unittest.TestCase):
         self.assertEqual(player_rows[0]["profile_id"], "profile-1")
         self.assertTrue(player_rows[1]["is_ai"])
         self.assertTrue(all(row["game_id"] == str(uuid.UUID(game_id)) for row in player_rows))
+        self.assertEqual(client.operations[0]["payload"]["analysis_status"], "not_requested")
+        self.assertIsNone(client.operations[0]["payload"]["analysis_error"])
 
     def test_add_game_player_records_upserts_multiplayer_players(self):
         game_id = uuid.uuid4().hex
@@ -207,6 +232,9 @@ class SupabaseStoreTests(unittest.TestCase):
         self.assertEqual({row["player_number"] for row in player_rows}, {1, 2})
         self.assertEqual({row["profile_id"] for row in player_rows}, {"profile-1", "profile-2"})
         self.assertTrue(all(row["game_id"] == str(uuid.UUID(game_id)) for row in player_rows))
+        game_update = client.operations[2]["payload"]
+        self.assertNotIn("analysis_status", game_update)
+        self.assertNotIn("analysis_error", game_update)
 
     def test_record_move_increments_move_number_even_when_disabled(self):
         game_id = uuid.uuid4().hex
@@ -305,13 +333,68 @@ class SupabaseStoreTests(unittest.TestCase):
     def test_fetch_game_moves_requires_membership_and_returns_move_rows(self):
         game_id = str(uuid.uuid4())
         moves = [
-            {"move_number": 1, "player_number": 1, "column_played": 3, "board_before": [], "board_after": []},
-            {"move_number": 2, "player_number": 2, "column_played": 2, "board_before": [], "board_after": []},
+            {
+                "move_number": 1,
+                "player_number": 1,
+                "column_played": 3,
+                "board_before": [],
+                "board_after": [],
+                "move_analysis": [{
+                    "rating": "great",
+                    "played_score": 80,
+                    "best_score": 80,
+                    "worst_score": -800,
+                    "best_column": 3,
+                    "worst_column": 0,
+                }],
+            },
+            {
+                "move_number": 2,
+                "player_number": 2,
+                "column_played": 2,
+                "board_before": [],
+                "board_after": [],
+                "move_analysis": {"rating": "mistake", "played_score": -20},
+            },
         ]
-        client = MoveHistoryClient([{"game_id": game_id, "games": {"status": "draw"}}], moves)
+        membership = [{"game_id": game_id, "games": {
+            "status": "draw",
+            "analysis_status": "complete",
+            "analysis_error": None,
+        }}]
+        client = MoveHistoryClient(membership, moves)
 
         with patch.object(supabase_store, "get_client", return_value=client):
-            self.assertEqual(supabase_store.fetch_game_moves("profile-1", game_id), moves)
+            self.assertEqual(supabase_store.fetch_game_moves("profile-1", game_id), {
+                "moves": [
+                    {
+                        "move_number": 1,
+                        "player_number": 1,
+                        "column_played": 3,
+                        "board_before": [],
+                        "board_after": [],
+                        "move_analysis": [{"feedback": "Great Move"}],
+                    },
+                    {
+                        "move_number": 2,
+                        "player_number": 2,
+                        "column_played": 2,
+                        "board_before": [],
+                        "board_after": [],
+                        "move_analysis": [{"feedback": "Mistake"}],
+                    },
+                ],
+                "analysis_status": "complete",
+                "analysis_error": None,
+                "analysis_available": True,
+                "analysis_unavailable_reason": None,
+            })
+        analysis_selection = client.selections["game_moves"]
+        self.assertIn("worst_column", analysis_selection)
+        self.assertIn("worst_score", analysis_selection)
+        self.assertIn("rating", analysis_selection)
+        self.assertNotIn("played_score", analysis_selection)
+        self.assertNotIn("best_score", analysis_selection)
 
         unauthorized_client = MoveHistoryClient([], moves)
         with patch.object(supabase_store, "get_client", return_value=unauthorized_client):
@@ -321,6 +404,93 @@ class SupabaseStoreTests(unittest.TestCase):
         with patch.object(supabase_store, "get_client", return_value=active_client):
             self.assertIsNone(supabase_store.fetch_game_moves("profile-1", game_id))
 
+    def test_public_review_move_maps_feedback_without_leaking_raw_analysis(self):
+        expected_feedback = {
+            "blunder": "Blunder",
+            "mistake": "Mistake",
+            "ok": "OK",
+            "great": "Great Move",
+        }
+
+        for rating, feedback in expected_feedback.items():
+            with self.subTest(rating=rating):
+                public_move = supabase_store.public_review_move({
+                    "id": 10,
+                    "move_number": 1,
+                    "player_number": 1,
+                    "column_played": 3,
+                    "move_analysis": [{
+                        "rating": rating,
+                        "played_score": -100,
+                        "best_score": 500,
+                        "worst_score": -100,
+                        "played_column": 3,
+                        "best_column": 4,
+                        "worst_column": 0,
+                        "minimax_depth": 4,
+                    }],
+                })
+
+                self.assertEqual(public_move["move_analysis"], [{"feedback": feedback}])
+                serialized = repr(public_move)
+                for private_field in (
+                    "rating",
+                    "score",
+                    "played_column",
+                    "best_column",
+                    "worst_column",
+                    "minimax_depth",
+                ):
+                    self.assertNotIn(private_field, serialized)
+
+    def test_fetch_game_moves_falls_back_to_history_when_analysis_schema_is_old(self):
+        game_id = str(uuid.uuid4())
+        moves = [{
+            "id": 10,
+            "move_number": 1,
+            "player_number": 1,
+            "column_played": 3,
+            "board_before": [],
+            "board_after": [],
+        }]
+        membership = [{"game_id": game_id, "games": {
+            "status": "draw",
+            "analysis_status": "complete",
+            "analysis_error": None,
+        }}]
+        client = MoveHistoryClient(membership, moves, missing_analysis_columns=True)
+
+        with patch.object(supabase_store, "get_client", return_value=client):
+            review = supabase_store.fetch_game_moves("profile-1", game_id)
+
+        self.assertEqual(review["moves"], moves)
+        self.assertFalse(review["analysis_available"])
+        self.assertEqual(
+            review["analysis_unavailable_reason"],
+            supabase_store.MOVE_ANALYSIS_SCHEMA_UPDATE_MESSAGE,
+        )
+        self.assertTrue(any("worst_column" in selection for _, selection in client.selection_history))
+        self.assertEqual(client.selections["game_moves"], "id,move_number,player_number,column_played,board_before,board_after")
+
+    def test_fetch_game_analysis_source_reports_old_analysis_schema(self):
+        game_id = str(uuid.uuid4())
+        moves = [{"id": 10, "move_number": 1, "player_number": 1, "column_played": 3}]
+        membership = [{"game_id": game_id, "games": {
+            "status": "draw",
+            "analysis_status": "not_requested",
+            "analysis_error": None,
+        }}]
+        client = MoveHistoryClient(membership, moves, missing_analysis_columns=True)
+
+        with patch.object(supabase_store, "get_client", return_value=client):
+            source = supabase_store.fetch_game_analysis_source("profile-1", game_id)
+
+        self.assertFalse(source["analysis_available"])
+        self.assertEqual(
+            source["analysis_unavailable_reason"],
+            supabase_store.MOVE_ANALYSIS_SCHEMA_UPDATE_MESSAGE,
+        )
+
     def test_move_analysis_status_and_rows_are_persisted(self):
         game_id = str(uuid.uuid4())
         client = RecordingClient()
@@ -329,8 +499,10 @@ class SupabaseStoreTests(unittest.TestCase):
             "minimax_depth": 4,
             "played_column": 2,
             "best_column": 3,
+            "worst_column": 0,
             "played_score": 10,
             "best_score": 200,
+            "worst_score": -800,
             "rating": "blunder",
         }]
 
@@ -347,6 +519,8 @@ class SupabaseStoreTests(unittest.TestCase):
         ])
         inserted = client.operations[2]["payload"][0]
         self.assertEqual(inserted["game_id"], game_id)
+        self.assertEqual(inserted["worst_column"], 0)
+        self.assertEqual(inserted["worst_score"], -800)
         self.assertNotIn("score_loss", inserted)
 
     def test_repair_move_history_restores_missing_opponent_move(self):

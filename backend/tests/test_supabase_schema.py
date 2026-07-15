@@ -4,12 +4,19 @@ from pathlib import Path
 
 
 SCHEMA_PATH = Path(__file__).resolve().parents[2] / "docs" / "supabase_schema.sql"
+MIGRATION_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "docs"
+    / "migrations"
+    / "20260714_move_analysis_worst_move_and_ratings.sql"
+)
 
 
 class SupabaseSchemaTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.schema = SCHEMA_PATH.read_text(encoding="utf-8")
+        cls.migration = MIGRATION_PATH.read_text(encoding="utf-8")
 
     def test_schema_file_exists(self):
         self.assertTrue(SCHEMA_PATH.exists())
@@ -70,6 +77,74 @@ class SupabaseSchemaTests(unittest.TestCase):
         self.assertIn("references public.game_moves(id, game_id) on delete cascade", self.schema)
         self.assertIn("constraint move_analysis_unique_depth unique (move_id, minimax_depth)", self.schema)
 
+    def test_move_analysis_records_worst_move_and_uses_current_ratings(self):
+        for column_name in [
+            "worst_column int not null",
+            "worst_score int not null",
+        ]:
+            self.assertIn(column_name, self.schema)
+        self.assertIn(
+            "constraint move_analysis_worst_column_check check (worst_column between 0 and 6)",
+            self.schema,
+        )
+        self.assertRegex(
+            self.schema,
+            r"rating in \('blunder', 'mistake', 'ok', 'great'\)",
+        )
+        for legacy_rating in ["average", "good", "perfect"]:
+            self.assertNotRegex(
+                self.schema,
+                rf"rating in \([^\)]*'{legacy_rating}'",
+            )
+
+    def test_move_analysis_migration_invalidates_legacy_derived_rows(self):
+        self.assertTrue(MIGRATION_PATH.exists())
+        self.assertIn("add column if not exists worst_column int", self.migration)
+        self.assertIn("add column if not exists worst_score int", self.migration)
+        self.assertIn(
+            "delete from public.move_analysis",
+            self.migration,
+        )
+        self.assertIn(
+            "analysis_status = 'not_requested'",
+            self.migration,
+        )
+        self.assertIn("analysis_requested_at = null", self.migration)
+        self.assertIn("analysis_completed_at = null", self.migration)
+        self.assertIn("analysis_error = null", self.migration)
+        self.assertNotIn("coalesce(worst_column, played_column)", self.migration)
+        self.assertNotIn("when 'average' then", self.migration)
+        self.assertRegex(
+            self.migration,
+            r"rating in \('blunder', 'mistake', 'ok', 'great'\)",
+        )
+
+    def test_move_analysis_migration_is_safe_to_rerun(self):
+        self.assertIn("begin;", self.migration)
+        self.assertIn("commit;", self.migration)
+        self.assertEqual(self.migration.count("add column if not exists"), 2)
+        self.assertIn("create temporary table move_analysis_migration_state", self.migration)
+        self.assertIn("where needs_reanalysis", self.migration)
+        self.assertIn("where worst_column is null", self.migration)
+        self.assertIn("or worst_score is null", self.migration)
+        self.assertIn(
+            "drop constraint if exists move_analysis_rating_check",
+            self.migration,
+        )
+        self.assertIn(
+            "drop constraint if exists move_analysis_worst_column_check",
+            self.migration,
+        )
+
+    def test_move_analysis_has_no_direct_participant_read_policy(self):
+        policy_name = "users can read their move analysis"
+        self.assertNotIn(f'create policy "{policy_name}"', self.schema)
+        self.assertIn(
+            f'drop policy if exists "{policy_name}"',
+            self.migration,
+        )
+        self.assertIn("on public.move_analysis;", self.migration)
+
     def test_rls_is_enabled_and_read_policies_exist(self):
         for table_name in [
             "profiles",
@@ -86,7 +161,6 @@ class SupabaseSchemaTests(unittest.TestCase):
             "users can read their games",
             "users can read their game players",
             "users can read their game moves",
-            "users can read their move analysis",
             "users can read their own stats",
         ]:
             self.assertRegex(self.schema, rf'create policy "{re.escape(policy_name)}"')

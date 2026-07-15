@@ -16,6 +16,7 @@ Connect-4/
 |   |   |-- test_auth_layer.py
 |   |   |-- test_backend_config.py
 |   |   |-- test_game_locks.py
+|   |   |-- test_minimax_analysis.py
 |   |   |-- test_socket_game.py
 |   |   |-- test_supabase_store.py
 |   |   `-- test_supabase_schema.py
@@ -27,6 +28,8 @@ Connect-4/
 |   |-- requirements.txt
 |   `-- supabase_store.py
 |-- docs/
+|   |-- migrations/
+|   |   `-- 20260714_move_analysis_worst_move_and_ratings.sql
 |   |-- API.md
 |   |-- PROJECT_STRUCTURE.md
 |   |-- SETUP.md
@@ -48,8 +51,8 @@ Connect-4/
 
 ## Runtime Split
 
-`frontend/` renders setup at `/` by default, renders manual/public room joining at `/join` by default, redirects selected games to `/game/{id}` by default, renders win/draw completed game history and profile stats at `/profiles` by default, renders validated persisted board-state reviews at `/game/{id}/review`, renders `/404` for invalid review pages before returning home, renders placeholder blank pages at `/tos` and `/privacypolicy` by default, shows the auth popup, and sends gameplay events to the env-configured Flask-SocketIO URL with the Supabase access token.
+`frontend/` renders setup at `/` by default, manual/public room joining at `/join`, active games at `/game/{id}`, completed history and profile stats at `/profiles`, and persisted board-state reviews at `/game/{id}/review`. Reviews can request the shared evaluator, poll its persisted status, render `Turn | Move | Feedback`, and highlight the row matching the selected board turn. Profile, review, auth, legal, and not-found routes are REST-only and do not open gameplay Socket.IO connections. The frontend never receives numerical minimax details or the raw server-side rating.
 
-`backend/` owns the Flask health API, profile-history API, Socket.IO AI games, two-player rooms, public waiting-room listing, disconnect timers, rematch voting, leave-room events, board rules, AI logic, optional Supabase persistence, CLI evaluation files, tests, and Python dependencies.
+`backend/` owns the Flask health/profile/review APIs, authenticated shared move-analysis requests, the prioritized minimax evaluator queue, server-only ratings, legacy-schema review fallback, Socket.IO AI games, two-player rooms, public waiting-room listing, disconnect timers, rematch voting, leave-room events, board rules, optional Supabase persistence, CLI evaluation files, tests, and Python dependencies.
 
-`docs/supabase_schema.sql` is the database draft for Supabase auth/profile game history and lazy post-game move analysis. Runtime sync is backend-only and no-ops when Supabase env vars are missing.
+`docs/supabase_schema.sql` is the canonical fresh-install schema for Supabase auth, profile history, shared game review, and lazy post-game move analysis. Existing installations that predate worst-move fields use `docs/migrations/20260714_move_analysis_worst_move_and_ratings.sql`; the migration invalidates incompatible derived rows and removes direct client access to raw analysis. Runtime sync is backend-only and no-ops when Supabase env vars are missing.

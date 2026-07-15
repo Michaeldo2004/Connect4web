@@ -93,15 +93,18 @@ create table public.move_analysis (
   minimax_depth int not null,
   played_column int not null,
   best_column int not null,
+  worst_column int not null,
   played_score int not null,
   best_score int not null,
+  worst_score int not null,
   score_loss int generated always as (best_score - played_score) stored,
   rating text not null,
   created_at timestamptz not null default now(),
   constraint move_analysis_depth_check check (minimax_depth > 0),
   constraint move_analysis_played_column_check check (played_column between 0 and 6),
   constraint move_analysis_best_column_check check (best_column between 0 and 6),
-  constraint move_analysis_rating_check check (rating in ('blunder', 'average', 'good', 'perfect')),
+  constraint move_analysis_worst_column_check check (worst_column between 0 and 6),
+  constraint move_analysis_rating_check check (rating in ('blunder', 'mistake', 'ok', 'great')),
   constraint move_analysis_move_game_fk foreign key (move_id, game_id)
     references public.game_moves(id, game_id) on delete cascade,
   constraint move_analysis_unique_depth unique (move_id, minimax_depth)
@@ -274,12 +277,6 @@ using (public.is_game_participant(game_id));
 
 create policy "users can read their game moves"
 on public.game_moves
-for select
-to authenticated
-using (public.is_game_participant(game_id));
-
-create policy "users can read their move analysis"
-on public.move_analysis
 for select
 to authenticated
 using (public.is_game_participant(game_id));

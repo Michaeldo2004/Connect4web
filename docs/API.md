@@ -58,23 +58,96 @@ GET /api/profile/games/{gameId}/moves
 
 Requires `Authorization: Bearer <supabase-access-token>`. The authenticated user must be a participant in the game.
 
-Returns the recorded moves in ascending order:
+Returns the shared analysis state and recorded moves in ascending order. When
+analysis is complete, each move includes only its server-classified feedback
+label. Numerical minimax values and the raw rating stay server-side. The
+`move_analysis` table has no authenticated-client SELECT policy; only the
+backend service role reads or writes raw analysis rows.
 
 ```json
 {
+  "analysis_status": "complete",
+  "analysis_error": null,
+  "analysis_available": true,
+  "analysis_unavailable_reason": null,
   "moves": [
     {
       "move_number": 1,
       "player_number": 1,
       "column_played": 3,
       "board_before": [[0, 0, 0, 0, 0, 0, 0]],
-      "board_after": [[0, 0, 0, 1, 0, 0, 0]]
+      "board_after": [[0, 0, 0, 1, 0, 0, 0]],
+      "move_analysis": [
+        {
+          "feedback": "Great Move"
+        }
+      ]
     }
   ]
 }
 ```
 
-The frontend review is available at `/game/{gameId}/review`. It only loads completed games, opens on move 1, and supports previous/next navigation and direct move selection. Invalid, in-progress, or missing games redirect to `/404`, which returns home after three seconds. Move evaluation is not included yet.
+`analysis_status` is one of `not_requested`, `processing`, `complete`, or
+`failed`. `analysis_error` is populated only after a failed job. If an existing
+database has not received the required move-analysis migration, the endpoint
+still returns board history with `analysis_available: false`; evaluation stays
+disabled until the schema update is applied.
+
+Public feedback is one of `Blunder`, `Mistake`, `OK`, or `Great Move`. The
+backend maps its internal persisted rating to this label before serialization.
+The review table renders only `Turn | Move | Feedback`; it never receives or
+renders scores, best/worst columns, minimax depth, score loss, or raw rating.
+
+An unexpected datastore failure returns JSON HTTP 503 instead of a Flask HTML
+error page:
+
+```json
+{
+  "message": "Game review is temporarily unavailable. Please try again.",
+  "code": "game_review_unavailable"
+}
+```
+
+To request move analysis (or safely repeat the request):
+
+```text
+POST /api/profile/games/{gameId}/analysis
+```
+
+The request uses the same bearer-token and participant checks. It is
+idempotent: completed analysis returns `complete`; an existing job returns its
+current `queued` or `running` state; and a failed analysis can be requested
+again. A newly accepted job returns HTTP 202:
+
+```json
+{
+  "gameId": "game-id",
+  "status": "queued",
+  "queuePosition": 1,
+  "priority": "move_analysis"
+}
+```
+
+If the required database migration is missing, the request returns HTTP 503
+without queueing a job:
+
+```json
+{
+  "message": "Move evaluation is temporarily unavailable while the review database is updated.",
+  "code": "move_analysis_schema_update_required"
+}
+```
+
+A repaired/reconstructed move without a persistent move id returns HTTP 422
+with code `incomplete_move_history` instead of starting a job that cannot be
+saved.
+
+Poll `GET /api/profile/games/{gameId}/moves` for the persisted
+`analysis_status`; reload its moves when that status becomes `complete`.
+
+Analysis is game-scoped, so either participant in a multiplayer game sees the
+same status and results. The frontend review is available at
+`/game/{gameId}/review` and only loads completed games.
 
 ## Socket.IO Gameplay
 
@@ -101,7 +174,7 @@ Create, join, move, reset, leave, and rematch events reject missing or invalid t
 ```text
 create_game { difficulty, accessToken }
 join_game { gameId, playerId, accessToken }
-create_multiplayer_game { ownerName?, accessToken }
+create_multiplayer_game { ownerName?, requestId?, accessToken }
 list_public_games { accessToken }
 set_room_public { gameId, playerId, public, accessToken }
 join_multiplayer_game { gameId, playerId?, publicJoin?, accessToken }
@@ -116,7 +189,7 @@ leave_game { gameId, playerId, accessToken }
 ```text
 game_created { gameId, playerId, playerNumber, aiNumber, board, status, message, difficulty, mode, currentPlayer }
 game_joined { gameId, playerNumber?, aiNumber?, board, status, message, difficulty, mode, currentPlayer }
-multiplayer_game_created { gameId, playerId, playerNumber, playersConnected, board, status, message, mode }
+multiplayer_game_created { gameId, playerId, playerNumber, playersConnected, board, status, message, mode, requestId?, recovered? }
 multiplayer_game_joined { gameId, playerId, playerNumber, playersConnected, board, status, message, mode }
 board_updated { gameId, playerId?, playerNumber?, aiNumber?, board, status, message, aiMove, aiThinking?, difficulty, mode, currentPlayer?, playersConnected?, disconnectDeadline?, playAgainAccepted?, publicRoom? }
 play_again_updated { gameId, board, status, message, difficulty, mode, currentPlayer, playersConnected, playAgainAccepted }
@@ -125,8 +198,43 @@ player_left { gameId, message }
 game_left { gameId }
 invalid_move { gameId, board, status, message, difficulty, mode }
 join_rejected { gameId, message }
-create_rejected { message }
+create_rejected { message, requestId? }
 ```
+
+`create_multiplayer_game` supports a Socket.IO acknowledgement. Clients should
+generate and retain one `requestId` for a room-creation attempt until the server
+acknowledges success or rejection. Retrying that ID as the same authenticated
+profile recovers the same active in-memory room instead of creating a duplicate.
+
+Successful acknowledgement:
+
+```json
+{
+  "ok": true,
+  "requestId": "client-generated-uuid",
+  "recovered": false,
+  "gameId": "generated-game-id",
+  "playerId": "generated-player-id",
+  "status": "waiting",
+  "mode": "multiplayer"
+}
+```
+
+Rejected acknowledgement:
+
+```json
+{
+  "ok": false,
+  "requestId": "client-generated-uuid",
+  "code": "create_rejected",
+  "message": "Could not create game"
+}
+```
+
+The emitted `multiplayer_game_created` and `create_rejected` events remain
+available for compatibility. Request-ID recovery lasts for the lifetime of the
+active in-memory game state; it does not make live matches survive a backend
+restart.
 
 ### `create_game`
 
@@ -423,7 +531,15 @@ Invalid moves emit `invalid_move`.
 
 ## REST
 
-React gameplay uses Socket.IO. REST exposes `GET /api/health`, `GET /api/profile/games`, and `POST /api/new-game`.
+React gameplay uses Socket.IO. REST exposes:
+
+```text
+GET  /api/health
+POST /api/new-game
+GET  /api/profile/games
+GET  /api/profile/games/{gameId}/moves
+POST /api/profile/games/{gameId}/analysis
+```
 
 ## Difficulty Values
 

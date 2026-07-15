@@ -9,6 +9,7 @@ const PENDING_MULTIPLAYER_JOIN_KEY = "connect4_pending_multiplayer_join";
 const AI_WAITING_KEY = "connect4_ai_waiting";
 const THEME_KEY = "connect4_theme";
 const SOCKET_URL = getEnvString("VITE_BACKEND_URL", "http://localhost:5000").replace(/\/+$/, "");
+const SOCKET_TRANSPORTS = getSocketTransports();
 const SETUP_PATH = getEnvRoute("VITE_SETUP_PATH", "/");
 const GAME_PATH = getEnvRoute("VITE_GAME_PATH", "/game");
 const JOIN_PATH = getEnvRoute("VITE_JOIN_PATH", "/join");
@@ -21,8 +22,13 @@ const NOT_FOUND_PATH = "/404";
 const TOS_PATH = getEnvRoute("VITE_TOS_PATH", "/tos");
 const PRIVACY_POLICY_PATH = getEnvRoute("VITE_PRIVACY_POLICY_PATH", "/privacypolicy");
 const APP_PATHS = new Set([SETUP_PATH, GAME_PATH, JOIN_PATH, LOGIN_PATH, SIGNUP_PATH, PROFILE_PATH, AI_WAITING_PATH, GAME_REVIEW_PATH, NOT_FOUND_PATH, TOS_PATH, PRIVACY_POLICY_PATH]);
+const SOCKET_PATHS = new Set([SETUP_PATH, GAME_PATH, JOIN_PATH, AI_WAITING_PATH]);
 const ROWS = 6;
 const COLS = 7;
+const MOVE_ANALYSIS_POLL_MS = 2000;
+const MOVE_ANALYSIS_ACTIVE_STATUSES = new Set(["queued", "running", "processing"]);
+const MOVE_ANALYSIS_COMPLETE_STATUSES = new Set(["complete", "evaluated"]);
+const MULTIPLAYER_CREATE_TIMEOUT_MS = 10000;
 
 const PLAYER = 1;
 const AI = 2;
@@ -60,6 +66,29 @@ function getEnvRoute(name, fallback) {
   }
 
   return path.replace(/\/+$/, "");
+}
+
+function getSocketTransports() {
+  const configured = getEnvString("VITE_SOCKET_TRANSPORTS", "polling")
+    .split(",")
+    .map((transport) => transport.trim().toLowerCase())
+    .filter((transport, index, transports) => (
+      ["polling", "websocket"].includes(transport) && transports.indexOf(transport) === index
+    ));
+  return configured.length > 0 ? configured : ["polling"];
+}
+
+async function readJsonResponse(response) {
+  const body = await response.text();
+  if (!body) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(body);
+  } catch {
+    return {};
+  }
 }
 
 function createAuthClient() {
@@ -249,6 +278,60 @@ function splitIntoRows(items, rowSize) {
   return rows;
 }
 
+function normalizeMoveAnalysisStatus(status) {
+  if (typeof status !== "string" || status.trim() === "") {
+    return "not_requested";
+  }
+
+  return status.trim().toLowerCase();
+}
+
+function isMoveAnalysisActive(status) {
+  return MOVE_ANALYSIS_ACTIVE_STATUSES.has(normalizeMoveAnalysisStatus(status));
+}
+
+function isMoveAnalysisComplete(status) {
+  return MOVE_ANALYSIS_COMPLETE_STATUSES.has(normalizeMoveAnalysisStatus(status));
+}
+
+function getReviewMoveOwner(move, viewerPlayerNumber) {
+  if (!viewerPlayerNumber) {
+    return `Player ${move.player_number}`;
+  }
+
+  return move.player_number === viewerPlayerNumber ? "You" : "Opponent";
+}
+
+function getReviewMoveLabel(move, viewerPlayerNumber) {
+  const owner = getReviewMoveOwner(move, viewerPlayerNumber);
+  if (owner === "You") {
+    return "Your Move";
+  }
+  if (owner === "Opponent") {
+    return "Opponent's Move";
+  }
+  return `${owner}'s Move`;
+}
+
+function getReviewMoveFeedback(move) {
+  if (move?.reconstructed) {
+    return null;
+  }
+
+  const nestedAnalysis = Array.isArray(move?.move_analysis)
+    ? move.move_analysis[0]
+    : move?.move_analysis;
+  if (!nestedAnalysis || typeof nestedAnalysis !== "object") {
+    return null;
+  }
+
+  if (typeof nestedAnalysis.feedback !== "string" || nestedAnalysis.feedback.trim() === "") {
+    return null;
+  }
+
+  return nestedAnalysis.feedback.trim();
+}
+
 function saveSession(gameId, playerId) {
   window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ gameId, playerId }));
 }
@@ -311,14 +394,43 @@ function clearAiWaitingSession() {
   window.localStorage.removeItem(AI_WAITING_KEY);
 }
 
-function savePendingGame(mode, difficulty) {
-  window.sessionStorage.setItem(PENDING_GAME_KEY, JSON.stringify({ mode, difficulty }));
+function createMultiplayerRequestId() {
+  try {
+    if (typeof window.crypto?.randomUUID === "function") {
+      return window.crypto.randomUUID();
+    }
+  } catch {
+    // Fall through to a browser-compatible request ID for older environments.
+  }
+
+  return `multiplayer-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-function takePendingGame() {
+function savePendingGame(mode, difficulty, ownerName = "", requestId = "") {
+  const pendingGame = { mode, difficulty, ownerName, requestId };
+  window.sessionStorage.setItem(PENDING_GAME_KEY, JSON.stringify(pendingGame));
+  return pendingGame;
+}
+
+function clearPendingGame(requestId = "") {
+  if (requestId) {
+    try {
+      const pendingGame = JSON.parse(window.sessionStorage.getItem(PENDING_GAME_KEY));
+      if (pendingGame?.requestId && pendingGame.requestId !== requestId) {
+        return false;
+      }
+    } catch {
+      // Invalid pending state is safe to discard below.
+    }
+  }
+
+  window.sessionStorage.removeItem(PENDING_GAME_KEY);
+  return true;
+}
+
+function loadPendingGame() {
   try {
     const pendingGame = JSON.parse(window.sessionStorage.getItem(PENDING_GAME_KEY));
-    window.sessionStorage.removeItem(PENDING_GAME_KEY);
     if (pendingGame?.mode) {
       return pendingGame;
     }
@@ -502,6 +614,11 @@ function App() {
   const [reviewWinningPieces, setReviewWinningPieces] = useState([]);
   const [reviewLoading, setReviewLoading] = useState(false);
   const [reviewError, setReviewError] = useState("");
+  const [reviewAnalysisStatus, setReviewAnalysisStatus] = useState("not_requested");
+  const [reviewAnalysisError, setReviewAnalysisError] = useState("");
+  const [reviewAnalysisAvailable, setReviewAnalysisAvailable] = useState(true);
+  const [reviewAnalysisUnavailableReason, setReviewAnalysisUnavailableReason] = useState("");
+  const [reviewAnalysisRequestPending, setReviewAnalysisRequestPending] = useState(false);
   const [authReady, setAuthReady] = useState(!supabaseClient);
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState("");
@@ -510,9 +627,34 @@ function App() {
   const boardRef = useRef(board);
   const toastTimerRef = useRef(null);
   const roomVisibilityTimerRef = useRef(null);
+  const reviewAnalysisPollTimerRef = useRef(null);
+  const reviewAnalysisRequestControllerRef = useRef(null);
   const playerNumberRef = useRef(playerNumber);
   const aiNumberRef = useRef(aiNumber);
   const pendingMoveRef = useRef(null);
+  const emitPendingMultiplayerCreateRef = useRef(null);
+  const multiplayerCreateInFlightRequestRef = useRef("");
+  const completedMultiplayerCreateRequestRef = useRef("");
+  const completedMultiplayerCreateGameRef = useRef("");
+  const rejectedMultiplayerCreateRequestRef = useRef("");
+
+  const showToast = useCallback((toastMessage, type = "info") => {
+    if (toastTimerRef.current) {
+      window.clearTimeout(toastTimerRef.current);
+    }
+    setToast({ message: toastMessage, type });
+    toastTimerRef.current = window.setTimeout(() => {
+      setToast(null);
+      toastTimerRef.current = null;
+    }, 3500);
+  }, []);
+
+  useEffect(() => () => {
+    if (toastTimerRef.current) {
+      window.clearTimeout(toastTimerRef.current);
+      toastTimerRef.current = null;
+    }
+  }, []);
 
   const gameOver = useMemo(() => {
     return ["human_win", "ai_win", "player1_win", "player2_win", "draw"].includes(status);
@@ -544,6 +686,26 @@ function App() {
     ? "Draw"
     : reviewGame?.winnerName || (reviewGame?.winnerPlayerNumber ? `Player ${reviewGame.winnerPlayerNumber} Wins` : "Completed game");
   const reviewBoard = reviewMoves[reviewMoveIndex]?.board_after || emptyBoard();
+  const reviewAnalysisActive = isMoveAnalysisActive(reviewAnalysisStatus);
+  const reviewAnalysisComplete = isMoveAnalysisComplete(reviewAnalysisStatus);
+  const socketRouteActive = SOCKET_PATHS.has(routePath);
+  const reviewAnalysisUnavailable = reviewLoading || Boolean(reviewError) || reviewMoves.length === 0;
+  const reviewAnalysisButtonDisabled = !reviewAnalysisAvailable || reviewAnalysisUnavailable || reviewAnalysisRequestPending || reviewAnalysisActive || reviewAnalysisComplete;
+  const reviewAnalysisStatusMessage = reviewLoading
+    ? "Loading move evaluation status."
+    : !reviewAnalysisAvailable
+      ? reviewAnalysisUnavailableReason || "Move evaluation is temporarily unavailable."
+      : reviewAnalysisUnavailable
+      ? "Move history is unavailable."
+      : reviewAnalysisRequestPending
+        ? "Requesting move evaluation."
+        : reviewAnalysisActive
+          ? "Move evaluation is queued or running."
+          : reviewAnalysisComplete
+            ? "Move evaluation is complete."
+            : reviewAnalysisStatus === "failed"
+              ? `Move evaluation failed. ${reviewAnalysisError || "You can retry the request."}`
+              : "Move evaluation has not been requested.";
 
   useEffect(() => {
     window.localStorage.setItem(THEME_KEY, theme);
@@ -637,6 +799,7 @@ function App() {
     setBoard(emptyBoard());
     setStatus("setup");
     setMessage("Choose difficulty");
+    setGameStarted(false);
     setPlayerMoves([]);
     setAiMoves([]);
     setGameId(null);
@@ -751,7 +914,7 @@ function App() {
     setUserProfile(data || null);
   }, []);
 
-  const loadProfileGames = useCallback(async () => {
+  const loadProfileGames = useCallback(async ({ signal } = {}) => {
     if (!authSession?.access_token) {
       setProfileGames([]);
       return;
@@ -764,52 +927,188 @@ function App() {
         headers: {
           Authorization: `Bearer ${authSession.access_token}`,
         },
+        signal,
       });
-      const data = await response.json();
+      const data = await readJsonResponse(response);
+      if (signal?.aborted) {
+        return;
+      }
       if (!response.ok) {
         throw new Error(data?.message || "Could not load profile games");
       }
       setProfileGames(data.games || []);
     } catch (error) {
+      if (error.name === "AbortError" || signal?.aborted) {
+        return;
+      }
       setProfileError(error.message);
       setProfileGames([]);
     } finally {
-      setProfileLoading(false);
+      if (!signal?.aborted) {
+        setProfileLoading(false);
+      }
     }
   }, [authSession]);
 
-  const loadGameReview = useCallback(async (selectedGameId) => {
+  const loadGameReview = useCallback(async (selectedGameId, { background = false, signal } = {}) => {
     if (!authSession?.access_token || !selectedGameId) {
       setReviewMoves([]);
-      return;
+      setReviewAnalysisStatus("not_requested");
+      setReviewAnalysisError("");
+      setReviewAnalysisAvailable(true);
+      setReviewAnalysisUnavailableReason("");
+      return null;
     }
 
-    setReviewLoading(true);
-    setReviewError("");
-    setReviewMoveIndex(0);
+    if (!background) {
+      setReviewLoading(true);
+      setReviewError("");
+      setReviewMoveIndex(0);
+      setReviewAnalysisStatus("not_requested");
+      setReviewAnalysisError("");
+      setReviewAnalysisAvailable(true);
+      setReviewAnalysisUnavailableReason("");
+    }
     try {
       const response = await fetch(`${SOCKET_URL}/api/profile/games/${encodeURIComponent(selectedGameId)}/moves`, {
         headers: {
           Authorization: `Bearer ${authSession.access_token}`,
         },
+        signal,
       });
-      const data = await response.json();
+      const data = await readJsonResponse(response);
+      if (signal?.aborted) {
+        return null;
+      }
       if (!response.ok) {
-        redirectTo(NOT_FOUND_PATH, true);
-        return;
+        if (response.status === 404) {
+          redirectTo(NOT_FOUND_PATH, true);
+          return { status: "not_found", analysisError: data?.message || "Game history not found" };
+        }
+        throw new Error(data?.message || "Could not load game review");
       }
       if (!Array.isArray(data.moves) || data.moves.length === 0) {
         redirectTo(NOT_FOUND_PATH, true);
-        return;
+        return { status: "not_found", analysisError: "Game history not found" };
       }
-      setReviewMoves(data.moves);
+
+      const analysisStatus = normalizeMoveAnalysisStatus(data.analysis_status);
+      const analysisError = typeof data.analysis_error === "string" ? data.analysis_error : "";
+      const analysisAvailable = data.analysis_available !== false;
+      const analysisUnavailableReason = typeof data.analysis_unavailable_reason === "string"
+        ? data.analysis_unavailable_reason
+        : "";
+      if (!background || isMoveAnalysisComplete(analysisStatus) || analysisStatus === "failed") {
+        setReviewMoves(data.moves);
+      }
+      setReviewAnalysisStatus(analysisStatus);
+      setReviewAnalysisError(analysisError);
+      setReviewAnalysisAvailable(analysisAvailable);
+      setReviewAnalysisUnavailableReason(analysisUnavailableReason);
+      return { status: analysisStatus, analysisError, analysisAvailable, analysisUnavailableReason };
     } catch (error) {
-      setReviewError(error.message);
-      setReviewMoves([]);
+      if (error.name === "AbortError" || signal?.aborted) {
+        return null;
+      }
+      if (!background) {
+        setReviewError(error.message);
+        setReviewMoves([]);
+      }
+      return { status: "error", analysisError: error.message };
     } finally {
-      setReviewLoading(false);
+      if (!background && !signal?.aborted) {
+        setReviewLoading(false);
+      }
     }
   }, [authSession, redirectTo]);
+
+  const requestMoveEvaluation = useCallback(async () => {
+    if (
+      !authSession?.access_token
+      || !gameReviewId
+      || reviewLoading
+      || reviewError
+      || reviewMoves.length === 0
+      || !reviewAnalysisAvailable
+      || reviewAnalysisRequestPending
+      || reviewAnalysisRequestControllerRef.current
+      || isMoveAnalysisActive(reviewAnalysisStatus)
+      || isMoveAnalysisComplete(reviewAnalysisStatus)
+    ) {
+      return;
+    }
+
+    const controller = new AbortController();
+    reviewAnalysisRequestControllerRef.current = controller;
+    setReviewAnalysisRequestPending(true);
+    setReviewAnalysisError("");
+    try {
+      const response = await fetch(`${SOCKET_URL}/api/profile/games/${encodeURIComponent(gameReviewId)}/analysis`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${authSession.access_token}`,
+        },
+        signal: controller.signal,
+      });
+      const data = await readJsonResponse(response);
+      if (!response.ok) {
+        throw new Error(data?.message || "Could not request move evaluation");
+      }
+
+      const nextStatus = normalizeMoveAnalysisStatus(data.status);
+      if (isMoveAnalysisComplete(nextStatus)) {
+        setReviewAnalysisStatus("complete");
+        const refreshedReview = await loadGameReview(gameReviewId, { background: true, signal: controller.signal });
+        if (!controller.signal.aborted) {
+          if (!isMoveAnalysisComplete(refreshedReview?.status)) {
+            throw new Error(refreshedReview?.analysisError || "Could not load completed move evaluation");
+          }
+          showToast("Move evaluation is already complete.", "success");
+        }
+        return;
+      }
+      if (nextStatus === "failed") {
+        throw new Error(data?.message || data?.analysis_error || "Move evaluation failed");
+      }
+
+      const activeStatus = isMoveAnalysisActive(nextStatus) ? nextStatus : "processing";
+      setReviewAnalysisStatus(activeStatus);
+      if (activeStatus === "queued") {
+        const queuePosition = Number(data.queuePosition || data.queue_position || 0);
+        showToast(
+          queuePosition > 0
+            ? `Move evaluation queued (position ${queuePosition}).`
+            : "Move evaluation queued.",
+          "info",
+        );
+      } else {
+        showToast("Move evaluation is running.", "info");
+      }
+    } catch (error) {
+      if (error.name === "AbortError" || controller.signal.aborted) {
+        return;
+      }
+      setReviewAnalysisStatus("failed");
+      setReviewAnalysisError(error.message);
+      showToast(error.message || "Move evaluation failed. You can retry.", "error");
+    } finally {
+      if (reviewAnalysisRequestControllerRef.current === controller) {
+        reviewAnalysisRequestControllerRef.current = null;
+        setReviewAnalysisRequestPending(false);
+      }
+    }
+  }, [
+    authSession,
+    gameReviewId,
+    loadGameReview,
+    reviewError,
+    reviewLoading,
+    reviewMoves.length,
+    reviewAnalysisAvailable,
+    reviewAnalysisRequestPending,
+    reviewAnalysisStatus,
+    showToast,
+  ]);
 
   useEffect(() => {
     if (!authSession) {
@@ -823,23 +1122,99 @@ function App() {
 
   useEffect(() => {
     if ((routePath === PROFILE_PATH || routePath === GAME_REVIEW_PATH) && authSession) {
-      loadProfileGames();
+      const controller = new AbortController();
+      loadProfileGames({ signal: controller.signal });
+      return () => controller.abort();
     }
+    return undefined;
   }, [authSession, loadProfileGames, routePath]);
 
   useEffect(() => {
+    const controller = new AbortController();
     if (routePath === GAME_REVIEW_PATH && authSession) {
       if (gameReviewId) {
-        loadGameReview(gameReviewId);
+        loadGameReview(gameReviewId, { signal: controller.signal }).then((result) => {
+          if (!controller.signal.aborted && result?.status === "failed") {
+            showToast(result.analysisError || "Move evaluation failed. You can retry.", "error");
+          }
+        });
       } else {
         redirectTo(NOT_FOUND_PATH, true);
       }
-      return;
+      return () => controller.abort();
     }
 
     setReviewMoves([]);
     setReviewError("");
-  }, [authSession, gameReviewId, loadGameReview, redirectTo, routePath]);
+    setReviewAnalysisStatus("not_requested");
+    setReviewAnalysisError("");
+    setReviewAnalysisAvailable(true);
+    setReviewAnalysisUnavailableReason("");
+    return () => controller.abort();
+  }, [authSession, gameReviewId, loadGameReview, redirectTo, routePath, showToast]);
+
+  useEffect(() => {
+    setReviewAnalysisRequestPending(false);
+    return () => {
+      if (reviewAnalysisRequestControllerRef.current) {
+        reviewAnalysisRequestControllerRef.current.abort();
+        reviewAnalysisRequestControllerRef.current = null;
+      }
+    };
+  }, [authSession?.access_token, gameReviewId, routePath]);
+
+  useEffect(() => {
+    if (
+      routePath !== GAME_REVIEW_PATH
+      || !authSession?.access_token
+      || !gameReviewId
+      || !isMoveAnalysisActive(reviewAnalysisStatus)
+    ) {
+      return undefined;
+    }
+
+    let cancelled = false;
+    const controller = new AbortController();
+    const pollAnalysis = async () => {
+      const result = await loadGameReview(gameReviewId, {
+        background: true,
+        signal: controller.signal,
+      });
+      if (cancelled || controller.signal.aborted) {
+        return;
+      }
+      if (result?.analysisAvailable === false) {
+        showToast(result.analysisUnavailableReason || "Move evaluation is temporarily unavailable.", "error");
+        return;
+      }
+      if (isMoveAnalysisComplete(result?.status)) {
+        showToast("Move evaluation complete.", "success");
+        return;
+      }
+      if (result?.status === "failed") {
+        showToast(result.analysisError || "Move evaluation failed. You can retry.", "error");
+        return;
+      }
+      if (result?.status === "error") {
+        const errorMessage = result.analysisError || "Could not refresh move evaluation. You can retry.";
+        setReviewAnalysisStatus("failed");
+        setReviewAnalysisError(errorMessage);
+        showToast(errorMessage, "error");
+        return;
+      }
+      reviewAnalysisPollTimerRef.current = window.setTimeout(pollAnalysis, MOVE_ANALYSIS_POLL_MS);
+    };
+
+    reviewAnalysisPollTimerRef.current = window.setTimeout(pollAnalysis, MOVE_ANALYSIS_POLL_MS);
+    return () => {
+      cancelled = true;
+      controller.abort();
+      if (reviewAnalysisPollTimerRef.current) {
+        window.clearTimeout(reviewAnalysisPollTimerRef.current);
+        reviewAnalysisPollTimerRef.current = null;
+      }
+    };
+  }, [authSession, gameReviewId, loadGameReview, reviewAnalysisStatus, routePath, showToast]);
 
   useEffect(() => {
     if (routePath !== NOT_FOUND_PATH) {
@@ -851,7 +1226,12 @@ function App() {
   }, [redirectTo, routePath]);
 
   useEffect(() => {
-    const nextSocket = io(SOCKET_URL, { transports: ["websocket"] });
+    if (!socketRouteActive) {
+      setSocketClient(null);
+      return undefined;
+    }
+
+    const nextSocket = io(SOCKET_URL, { transports: SOCKET_TRANSPORTS });
     setSocketClient(nextSocket);
 
     function handleConnect() {
@@ -866,15 +1246,16 @@ function App() {
         nextSocket.emit("check_ai_waiting", authPayload(waitingSession));
         return;
       }
-      const pendingGame = takePendingGame();
+      const pendingGame = loadPendingGame();
       if (pendingGame) {
         clearSession();
         clearMultiplayerSession();
         if (pendingGame.mode === GAME_MODE_MULTIPLAYER) {
-          nextSocket.emit("create_multiplayer_game", authPayload());
+          emitPendingMultiplayerCreate(pendingGame);
           return;
         }
 
+        clearPendingGame();
         nextSocket.emit("create_game", authPayload({ difficulty: pendingGame.difficulty || DEFAULT_DIFFICULTY }));
         return;
       }
@@ -966,7 +1347,7 @@ function App() {
       redirectTo(gamePath(data.gameId), true);
     }
 
-    function handleMultiplayerGameStarted(data) {
+    function applyMultiplayerGameStarted(data) {
       clearSession();
       saveMultiplayerSession(data.gameId, data.playerId);
       setGameId(data.gameId);
@@ -992,7 +1373,43 @@ function App() {
       setBusy(false);
       setJoiningPublicGameId("");
       redirectTo(gamePath(data.gameId));
-      console.log(`Player ${data.playerNumber} connected`);
+    }
+
+    function handleMultiplayerGameCreated(data, fallbackRequestId = "") {
+      if (!data?.gameId || !data?.playerId) {
+        return false;
+      }
+
+      const responseRequestId = data.requestId || fallbackRequestId;
+      if (
+        (responseRequestId && completedMultiplayerCreateRequestRef.current === responseRequestId)
+        || completedMultiplayerCreateGameRef.current === data.gameId
+      ) {
+        return true;
+      }
+
+      const pendingGame = loadPendingGame();
+      if (!pendingGame || pendingGame.mode !== GAME_MODE_MULTIPLAYER) {
+        return false;
+      }
+      if (responseRequestId && pendingGame.requestId && responseRequestId !== pendingGame.requestId) {
+        return false;
+      }
+
+      const completedRequestId = responseRequestId || pendingGame.requestId;
+      completedMultiplayerCreateRequestRef.current = completedRequestId;
+      completedMultiplayerCreateGameRef.current = data.gameId;
+      rejectedMultiplayerCreateRequestRef.current = "";
+      multiplayerCreateInFlightRequestRef.current = "";
+      clearPendingGame(completedRequestId);
+      applyMultiplayerGameStarted(data);
+      return true;
+    }
+
+    function handleMultiplayerGameJoined(data) {
+      clearPendingGame();
+      multiplayerCreateInFlightRequestRef.current = "";
+      applyMultiplayerGameStarted(data);
     }
 
     function handleJoinRejected(data) {
@@ -1014,14 +1431,100 @@ function App() {
     }
 
     function handleCreateRejected(data) {
+      const pendingGame = loadPendingGame();
+      if (data?.requestId && (!pendingGame || pendingGame.mode !== GAME_MODE_MULTIPLAYER)) {
+        return;
+      }
+      if (data?.requestId && pendingGame?.requestId && data.requestId !== pendingGame.requestId) {
+        return;
+      }
+
+      const rejectedRequestId = data?.requestId || pendingGame?.requestId || "";
+      if (rejectedRequestId && rejectedMultiplayerCreateRequestRef.current === rejectedRequestId) {
+        return;
+      }
+      rejectedMultiplayerCreateRequestRef.current = rejectedRequestId;
+      multiplayerCreateInFlightRequestRef.current = "";
+      clearPendingGame(rejectedRequestId);
       clearAiWaitingSession();
       setAiWaitingQueueId("");
       setAiWaitingPosition(0);
       clearSession();
       clearMultiplayerSession();
       clearLocalGame();
-      setMessage(data?.message || "Could not create game");
+      const rejectionMessage = data?.message || "Could not create game";
+      setMessage(rejectionMessage);
+      showToast(rejectionMessage, "error");
       redirectTo(SETUP_PATH, true);
+    }
+
+    function emitPendingMultiplayerCreate(pendingGame = loadPendingGame()) {
+      if (!nextSocket.connected || pendingGame?.mode !== GAME_MODE_MULTIPLAYER) {
+        return false;
+      }
+
+      const requestId = pendingGame.requestId || createMultiplayerRequestId();
+      if (multiplayerCreateInFlightRequestRef.current === requestId) {
+        return false;
+      }
+
+      const persistedGame = savePendingGame(
+        GAME_MODE_MULTIPLAYER,
+        null,
+        pendingGame.ownerName || "Account",
+        requestId,
+      );
+      multiplayerCreateInFlightRequestRef.current = requestId;
+      rejectedMultiplayerCreateRequestRef.current = "";
+      setStatus("waiting");
+      setMessage("Creating multiplayer room...");
+      setBusy(true);
+
+      nextSocket.timeout(MULTIPLAYER_CREATE_TIMEOUT_MS).emit(
+        "create_multiplayer_game",
+        authPayload({ ownerName: persistedGame.ownerName, requestId }),
+        (timeoutError, response) => {
+          if (multiplayerCreateInFlightRequestRef.current === requestId) {
+            multiplayerCreateInFlightRequestRef.current = "";
+          }
+
+          const currentPendingGame = loadPendingGame();
+          if (
+            !currentPendingGame
+            || currentPendingGame.mode !== GAME_MODE_MULTIPLAYER
+            || currentPendingGame.requestId !== requestId
+          ) {
+            return;
+          }
+
+          if (timeoutError) {
+            const timeoutMessage = "Room creation timed out. Try Create game again.";
+            setStatus("error");
+            setMessage(timeoutMessage);
+            setBusy(false);
+            showToast(timeoutMessage, "error");
+            return;
+          }
+
+          if (!response || response.ok === false) {
+            handleCreateRejected({
+              ...response,
+              requestId: response?.requestId || requestId,
+              message: response?.message || "Could not create game",
+            });
+            return;
+          }
+
+          if (!handleMultiplayerGameCreated(response, requestId)) {
+            const invalidResponseMessage = "Room creation did not finish. Try Create game again.";
+            setStatus("error");
+            setMessage(invalidResponseMessage);
+            setBusy(false);
+            showToast(invalidResponseMessage, "error");
+          }
+        },
+      );
+      return true;
     }
 
     function handleAiWaiting(data) {
@@ -1078,7 +1581,24 @@ function App() {
     function handleGameLeft() {
       clearSession();
       clearMultiplayerSession();
+      clearPendingGame();
+      multiplayerCreateInFlightRequestRef.current = "";
+      clearLocalGame();
       redirectTo(SETUP_PATH, true);
+    }
+
+    function handleDisconnect() {
+      const pendingGame = loadPendingGame();
+      if (pendingGame?.mode !== GAME_MODE_MULTIPLAYER) {
+        return;
+      }
+
+      if (multiplayerCreateInFlightRequestRef.current === pendingGame.requestId) {
+        multiplayerCreateInFlightRequestRef.current = "";
+      }
+      setStatus("error");
+      setMessage("Connection interrupted. Room creation will retry after reconnecting.");
+      setBusy(false);
     }
 
     function handleInvalidMove(data) {
@@ -1098,14 +1618,6 @@ function App() {
     function handlePublicGames(data) {
       setPublicGames(data?.games || []);
       setPublicGamesLoading(false);
-    }
-
-    function showToast(message, type) {
-      if (toastTimerRef.current) {
-        window.clearTimeout(toastTimerRef.current);
-      }
-      setToast({ message, type });
-      toastTimerRef.current = window.setTimeout(() => setToast(null), 3500);
     }
 
     function startRoomVisibilityCooldown(duration = 5000) {
@@ -1137,11 +1649,13 @@ function App() {
       showToast(data?.message || "Could not update room visibility", "error");
     }
 
+    emitPendingMultiplayerCreateRef.current = emitPendingMultiplayerCreate;
     nextSocket.on("connect", handleConnect);
+    nextSocket.on("disconnect", handleDisconnect);
     nextSocket.on("game_created", handleGameCreated);
     nextSocket.on("game_joined", handleGameJoined);
-    nextSocket.on("multiplayer_game_created", handleMultiplayerGameStarted);
-    nextSocket.on("multiplayer_game_joined", handleMultiplayerGameStarted);
+    nextSocket.on("multiplayer_game_created", handleMultiplayerGameCreated);
+    nextSocket.on("multiplayer_game_joined", handleMultiplayerGameJoined);
     nextSocket.on("join_rejected", handleJoinRejected);
     nextSocket.on("create_rejected", handleCreateRejected);
     nextSocket.on("ai_waiting", handleAiWaiting);
@@ -1155,21 +1669,22 @@ function App() {
     nextSocket.on("room_public_update_failed", handleRoomPublicUpdateFailed);
     nextSocket.on("invalid_move", handleInvalidMove);
     nextSocket.on("connect_error", () => {
+      multiplayerCreateInFlightRequestRef.current = "";
       setStatus("error");
       setMessage(`Flask SocketIO is not responding at ${SOCKET_URL}`);
       setBusy(false);
     });
 
     return () => {
-      if (toastTimerRef.current) {
-        window.clearTimeout(toastTimerRef.current);
-      }
       if (roomVisibilityTimerRef.current) {
         window.clearTimeout(roomVisibilityTimerRef.current);
       }
+      if (emitPendingMultiplayerCreateRef.current === emitPendingMultiplayerCreate) {
+        emitPendingMultiplayerCreateRef.current = null;
+      }
       nextSocket.disconnect();
     };
-  }, [applyServerBoard, authPayload, clearLocalGame, redirectTo]);
+  }, [applyServerBoard, authPayload, clearLocalGame, redirectTo, showToast, socketRouteActive]);
 
   useEffect(() => {
     if (routePath !== AI_WAITING_PATH || !aiWaitingQueueId || !socketClient?.connected) {
@@ -1199,12 +1714,9 @@ function App() {
       return;
     }
 
-    if (!socketClient?.connected) {
-      setStatus("error");
-      setMessage(`Flask SocketIO is not responding at ${SOCKET_URL}`);
-      return;
-    }
-
+    clearAiWaitingSession();
+    setAiWaitingQueueId("");
+    setAiWaitingPosition(0);
     clearSession();
     clearMultiplayerSession();
     pendingMoveRef.current = null;
@@ -1220,10 +1732,22 @@ function App() {
     setGameId(null);
     setPlayerId(null);
     setStatus("waiting");
-    setMessage("Creating multiplayer room...");
     setGameStarted(false);
     setBusy(true);
-    socketClient.emit("create_multiplayer_game", authPayload({ ownerName: accountName }));
+
+    const existingPendingGame = loadPendingGame();
+    const requestId = existingPendingGame?.mode === GAME_MODE_MULTIPLAYER && existingPendingGame.requestId
+      ? existingPendingGame.requestId
+      : createMultiplayerRequestId();
+    const pendingGame = savePendingGame(GAME_MODE_MULTIPLAYER, null, accountName, requestId);
+
+    if (!socketClient?.connected || !emitPendingMultiplayerCreateRef.current) {
+      setMessage("Connecting to create multiplayer room...");
+      socketClient?.connect();
+      return;
+    }
+
+    emitPendingMultiplayerCreateRef.current(pendingGame);
   }
 
   function joinMultiplayerGame(requestedGameIdOverride = "", publicJoin = false) {
@@ -1242,6 +1766,8 @@ function App() {
 
     clearSession();
     clearMultiplayerSession();
+    clearPendingGame();
+    multiplayerCreateInFlightRequestRef.current = "";
     setGameMode(GAME_MODE_MULTIPLAYER);
     setPlayerNumber(null);
     setAiNumber(AI);
@@ -1299,6 +1825,11 @@ function App() {
       return;
     }
 
+    if (routePath === SETUP_PATH && selectedSetupMode === GAME_MODE_MULTIPLAYER) {
+      startMultiplayerGame();
+      return;
+    }
+
     if (gameMode === GAME_MODE_MULTIPLAYER) {
       if (gameId && playerId) {
         setBusy(true);
@@ -1308,11 +1839,6 @@ function App() {
         setAiMoves([]);
         socketClient.emit("reset_game", authPayload({ gameId, playerId }));
       }
-      return;
-    }
-
-    if (!gameStarted && selectedSetupMode === GAME_MODE_MULTIPLAYER) {
-      startMultiplayerGame();
       return;
     }
 
@@ -1377,6 +1903,8 @@ function App() {
 
     clearSession();
     clearMultiplayerSession();
+    clearPendingGame();
+    multiplayerCreateInFlightRequestRef.current = "";
     clearLocalGame();
     setSelectedDifficulty(difficulty);
     setSelectedSetupMode(GAME_MODE_AI);
@@ -1389,11 +1917,15 @@ function App() {
 
     clearSession();
     clearMultiplayerSession();
+    clearPendingGame();
+    multiplayerCreateInFlightRequestRef.current = "";
     clearLocalGame();
     setSelectedSetupMode(GAME_MODE_MULTIPLAYER);
   }
 
   function showJoinGamePage() {
+    clearPendingGame();
+    multiplayerCreateInFlightRequestRef.current = "";
     redirectTo(JOIN_PATH);
   }
 
@@ -1490,6 +2022,8 @@ function App() {
   function returnToMainMenu() {
     clearSession();
     clearMultiplayerSession();
+    clearPendingGame();
+    multiplayerCreateInFlightRequestRef.current = "";
     window.location.replace(SETUP_PATH);
   }
 
@@ -1608,6 +2142,8 @@ function App() {
     clearSession();
     clearMultiplayerSession();
     clearAiWaitingSession();
+    clearPendingGame();
+    multiplayerCreateInFlightRequestRef.current = "";
     clearLocalGame();
     setAuthSession(null);
     redirectTo(LOGIN_PATH, true);
@@ -1914,9 +2450,24 @@ function App() {
           <span>Game review</span>
           <strong>{reviewGame ? `${reviewWinnerLabel}${reviewGame.winnerName ? " Wins" : ""}` : "Completed game"}</strong>
         </div>
-        <button type="button" onClick={() => redirectTo(PROFILE_PATH)}>
-          Back to games
-        </button>
+        <div className="profile-review-actions">
+          <button
+            className="evaluate-moves-button"
+            type="button"
+            onClick={requestMoveEvaluation}
+            disabled={reviewAnalysisButtonDisabled}
+            aria-describedby="move-evaluation-status"
+            title={reviewAnalysisStatusMessage}
+          >
+            Evaluate moves
+          </button>
+          <button type="button" onClick={() => redirectTo(PROFILE_PATH)}>
+            Back to games
+          </button>
+          <span className="sr-only" id="move-evaluation-status" aria-live="polite">
+            {reviewAnalysisStatusMessage}
+          </span>
+        </div>
       </div>
       <section className="status-panel review-status-panel" aria-label="Game review details">
         <div>
@@ -1944,6 +2495,11 @@ function App() {
           </strong>
         </div>
       </section>
+      {!reviewLoading && !reviewError && !reviewAnalysisAvailable ? (
+        <p className="review-analysis-notice" role="status">
+          {reviewAnalysisUnavailableReason || "Move evaluation is temporarily unavailable."}
+        </p>
+      ) : null}
       {reviewLoading ? (
         <ProfileLoadingSkeleton />
       ) : reviewError ? (
@@ -1966,8 +2522,9 @@ function App() {
             </button>
             <div className="board-area review-board-area">
               <div className="board review-board" role="grid" aria-label={`Board after move ${reviewMoves[reviewMoveIndex].move_number}`}>
-                {reviewBoard.flatMap((row, rowIndex) =>
-                  row.map((cell, columnIndex) => {
+                {reviewBoard.map((row, rowIndex) => (
+                  <div className="review-board-row" role="row" key={`review-board-row-${rowIndex}`}>
+                    {row.map((cell, columnIndex) => {
                     const pieceKey = `${rowIndex}-${columnIndex}`;
                     const isDropping = reviewAnimatedPieces.includes(pieceKey);
                     const isWinning = reviewWinningPieces.includes(pieceKey);
@@ -1983,8 +2540,9 @@ function App() {
                         <span key={isDropping ? `review-drop-${reviewAnimationRun}` : "review-piece"} />
                       </div>
                     );
-                  }),
-                )}
+                    })}
+                  </div>
+                ))}
               </div>
             </div>
             <button
@@ -2024,6 +2582,49 @@ function App() {
               </div>
             ))}
           </div>
+          {reviewAnalysisAvailable && reviewAnalysisComplete ? (
+            <section className="review-evaluation-log" aria-labelledby="review-evaluation-title">
+              <h2 id="review-evaluation-title">Move evaluation</h2>
+              <div
+                className="review-evaluation-table-wrap"
+                role="region"
+                aria-label="Move evaluation table"
+                tabIndex={0}
+              >
+                <table className="review-evaluation-table">
+                  <caption className="sr-only">
+                    Move feedback for each turn
+                  </caption>
+                  <thead>
+                    <tr>
+                      <th scope="col">Turn</th>
+                      <th scope="col">Move</th>
+                      <th scope="col">Feedback</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {reviewMoves.map((move, moveIndex) => {
+                      const feedback = getReviewMoveFeedback(move);
+                      const isCurrentMove = moveIndex === reviewMoveIndex;
+                      return (
+                        <tr
+                          className={`review-evaluation-row${isCurrentMove ? " current" : ""}`}
+                          key={`evaluation-${move.move_number}`}
+                          aria-current={isCurrentMove ? "step" : undefined}
+                        >
+                          <th scope="row" data-label="Turn">Turn {move.move_number}</th>
+                          <td data-label="Move">{getReviewMoveLabel(move, reviewGame?.playerNumber)}</td>
+                          <td className={!feedback ? "review-evaluation-unavailable" : undefined} data-label="Feedback">
+                            {feedback || "Unavailable"}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          ) : null}
         </>
       )}
     </section>

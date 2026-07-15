@@ -6,12 +6,30 @@ from pathlib import Path
 
 COMPLETED_STATUSES = {"human_win", "ai_win", "player1_win", "player2_win", "draw"}
 GAME_OVER_STATUSES = COMPLETED_STATUSES | {"abandoned"}
+MOVE_ANALYSIS_SCHEMA_UPDATE_MESSAGE = (
+    "Move evaluation is temporarily unavailable while the review database is updated."
+)
 WINNER_BY_STATUS = {
     "human_win": 1,
     "ai_win": 2,
     "player1_win": 1,
     "player2_win": 2,
 }
+MOVE_ANALYSIS_FEEDBACK = {
+    "blunder": "Blunder",
+    "mistake": "Mistake",
+    "ok": "OK",
+    "great": "Great Move",
+}
+PUBLIC_REVIEW_MOVE_FIELDS = (
+    "id",
+    "move_number",
+    "player_number",
+    "column_played",
+    "board_before",
+    "board_after",
+    "reconstructed",
+)
 
 _env_loaded = False
 _client_checked = False
@@ -83,6 +101,35 @@ def db_game_id(game_id):
         return None
 
 
+def is_missing_move_analysis_columns(error):
+    """Recognize the PostgREST error raised by the pre-worst-move schema."""
+    code = str(getattr(error, "code", "") or "")
+    message = " ".join((
+        str(getattr(error, "message", "") or ""),
+        str(error),
+    )).lower()
+    return (
+        (code == "42703" or "42703" in message)
+        and ("worst_column" in message or "worst_score" in message)
+    )
+
+
+def move_analysis_schema_ready(client, game_id):
+    """Check required derived-data columns without reading the server-only rating."""
+    try:
+        (
+            client.table("move_analysis")
+            .select("worst_column,worst_score")
+            .eq("game_id", game_id)
+            .execute()
+        )
+        return True
+    except Exception as error:
+        if is_missing_move_analysis_columns(error):
+            return False
+        raise
+
+
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
@@ -108,6 +155,9 @@ def winner_for_status(status, game=None):
 
 
 def game_payload(game_id, game):
+    # Analysis lifecycle fields are deliberately excluded. This payload is
+    # reused by ordinary game and membership repairs, which must not erase a
+    # completed review. Creation/reset add explicit analysis defaults below.
     status = game.get("status", "playing")
     finished = status in GAME_OVER_STATUSES
     payload = {
@@ -118,12 +168,17 @@ def game_payload(game_id, game):
         "winner_player_number": winner_for_status(status, game),
         "final_board": board_to_json(game.get("board")) if finished else None,
         "ended_at": now_iso() if finished else None,
+    }
+    return {key: value for key, value in payload.items() if value is not None or key != "id"}
+
+
+def reset_analysis_payload():
+    return {
         "analysis_status": "not_requested",
         "analysis_requested_at": None,
         "analysis_completed_at": None,
         "analysis_error": None,
     }
-    return {key: value for key, value in payload.items() if value is not None or key != "id"}
 
 
 def game_player_payloads(game_id, game):
@@ -172,7 +227,9 @@ def create_game_record(game_id, game):
         return False
 
     def action(client):
-        client.table("games").insert(game_payload(game_id, game)).execute()
+        payload = game_payload(game_id, game)
+        payload.update(reset_analysis_payload())
+        client.table("games").insert(payload).execute()
         player_payloads = game_player_payloads(game_id, game)
         if player_payloads:
             client.table("game_players").insert(player_payloads).execute()
@@ -241,8 +298,10 @@ def replace_move_analysis(game_id, rows):
             "minimax_depth": row["minimax_depth"],
             "played_column": row["played_column"],
             "best_column": row["best_column"],
+            "worst_column": row["worst_column"],
             "played_score": row["played_score"],
             "best_score": row["best_score"],
+            "worst_score": row["worst_score"],
             "rating": row["rating"],
         }
         for row in rows
@@ -279,6 +338,7 @@ def reset_game_record(game_id, game):
         payload = game_payload(game_id, game)
         payload.pop("id", None)
         payload["started_at"] = now_iso()
+        payload.update(reset_analysis_payload())
         client.table("games").update(payload).eq("id", db_id).execute()
 
     return execute_safely(action)
@@ -357,6 +417,30 @@ def repair_move_history(moves, final_board=None):
     return repaired
 
 
+def public_review_move(move, include_analysis=True):
+    """Return a review move without exposing evaluator inputs or raw ratings."""
+    public_move = {
+        field: move[field]
+        for field in PUBLIC_REVIEW_MOVE_FIELDS
+        if field in move
+    }
+    if not include_analysis:
+        return public_move
+
+    nested_analysis = move.get("move_analysis") or []
+    if isinstance(nested_analysis, dict):
+        nested_analysis = [nested_analysis]
+
+    public_move["move_analysis"] = []
+    for analysis in nested_analysis:
+        if not isinstance(analysis, dict):
+            continue
+        feedback = MOVE_ANALYSIS_FEEDBACK.get(analysis.get("rating"))
+        if feedback:
+            public_move["move_analysis"].append({"feedback": feedback})
+    return public_move
+
+
 def fetch_completed_games(profile_id):
     client = get_client()
     if client is None or not profile_id:
@@ -416,7 +500,10 @@ def fetch_game_moves(profile_id, game_id):
 
     membership = (
         client.table("game_players")
-        .select("game_id,games!inner(status,final_board,winner_player_number)")
+        .select(
+            "game_id,games!inner("
+            "status,final_board,winner_player_number,analysis_status,analysis_error)"
+        )
         .eq("profile_id", profile_id)
         .eq("game_id", db_id)
         .execute()
@@ -430,17 +517,44 @@ def fetch_game_moves(profile_id, game_id):
     if game_data.get("status") not in COMPLETED_STATUSES:
         return None
 
-    response = (
-        client.table("game_moves")
-        .select(
-            "id,move_number,player_number,column_played,board_before,board_after,"
-            "move_analysis(minimax_depth,played_column,best_column,played_score,best_score,score_loss,rating)"
+    move_fields = "id,move_number,player_number,column_played,board_before,board_after"
+    analysis_available = True
+    try:
+        response = (
+            client.table("game_moves")
+            .select(
+                f"{move_fields},"
+                "move_analysis(rating,worst_column,worst_score)"
+            )
+            .eq("game_id", db_id)
+            .order("move_number")
+            .execute()
         )
-        .eq("game_id", db_id)
-        .order("move_number")
-        .execute()
-    )
-    return repair_move_history(response.data or [], game_data.get("final_board"))
+    except Exception as error:
+        if not is_missing_move_analysis_columns(error):
+            raise
+        # Existing deployments can still show a useful board/history while the
+        # migration is pending. Do not return legacy analysis because its rating
+        # and worst-move semantics are not equivalent to the current evaluator.
+        analysis_available = False
+        response = (
+            client.table("game_moves")
+            .select(move_fields)
+            .eq("game_id", db_id)
+            .order("move_number")
+            .execute()
+        )
+    repaired_moves = repair_move_history(response.data or [], game_data.get("final_board"))
+    return {
+        "moves": [
+            public_review_move(move, include_analysis=analysis_available)
+            for move in repaired_moves
+        ],
+        "analysis_status": game_data.get("analysis_status") or "not_requested",
+        "analysis_error": game_data.get("analysis_error"),
+        "analysis_available": analysis_available,
+        "analysis_unavailable_reason": None if analysis_available else MOVE_ANALYSIS_SCHEMA_UPDATE_MESSAGE,
+    }
 
 
 def fetch_game_analysis_source(profile_id, game_id):
@@ -464,6 +578,8 @@ def fetch_game_analysis_source(profile_id, game_id):
     if game_data.get("status") not in COMPLETED_STATUSES:
         return None
 
+    analysis_available = move_analysis_schema_ready(client, db_id)
+
     response = (
         client.table("game_moves")
         .select("id,move_number,player_number,column_played,board_before,board_after")
@@ -474,5 +590,7 @@ def fetch_game_analysis_source(profile_id, game_id):
     return {
         "analysis_status": game_data.get("analysis_status") or "not_requested",
         "analysis_error": game_data.get("analysis_error"),
+        "analysis_available": analysis_available,
+        "analysis_unavailable_reason": None if analysis_available else MOVE_ANALYSIS_SCHEMA_UPDATE_MESSAGE,
         "moves": repair_move_history(response.data or [], game_data.get("final_board")),
     }

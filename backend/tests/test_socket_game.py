@@ -1,6 +1,6 @@
-import unittest
 import threading
-from unittest.mock import patch
+import unittest
+from unittest.mock import call, patch
 
 import app as app_module
 from app import app, games, socketio
@@ -257,7 +257,7 @@ class SocketGameTests(unittest.TestCase):
             "column_played": 2,
             "board_before": [[0 for _ in range(7)] for _ in range(6)],
         }]
-        with patch.object(app_module, "get_move_scores", return_value=(3, {2: 10, 3: 200})):
+        with patch.object(app_module, "get_move_scores", return_value=(3, 0, {0: -50, 2: 10, 3: 200})):
             rows = app_module.run_move_analysis(moves, 4, 30)
 
         self.assertEqual(rows, [{
@@ -265,10 +265,60 @@ class SocketGameTests(unittest.TestCase):
             "minimax_depth": 4,
             "played_column": 2,
             "best_column": 3,
+            "worst_column": 0,
             "played_score": 10,
             "best_score": 200,
-            "rating": "blunder",
+            "worst_score": -50,
+            "rating": "ok",
         }])
+
+    def test_move_analysis_rating_rules_use_best_then_worst_precedence(self):
+        self.assertEqual(app_module.analysis_rating(50, 50, -100), "great")
+        self.assertEqual(app_module.analysis_rating(0, 0, 0), "great")
+        self.assertEqual(app_module.analysis_rating(-100, 50, -100), "blunder")
+        self.assertEqual(app_module.analysis_rating(-10, 50, -100), "mistake")
+        self.assertEqual(app_module.analysis_rating(10, 50, -100), "ok")
+
+    def test_move_analysis_fails_instead_of_completing_with_skipped_moves(self):
+        reconstructed_move = {
+            "move_number": 2,
+            "player_number": 2,
+            "column_played": 4,
+            "board_before": [[0 for _ in range(7)] for _ in range(6)],
+            "reconstructed": True,
+        }
+
+        with patch.object(app_module, "get_move_scores") as get_scores:
+            with self.assertRaisesRegex(ValueError, "Move 2 could not be analyzed"):
+                app_module.run_move_analysis([reconstructed_move], 4, 30)
+
+        get_scores.assert_not_called()
+
+    def test_move_analysis_marks_failed_when_complete_status_cannot_persist(self):
+        job = {
+            "game_id": "analysis-1",
+            "moves": [{"id": 10}],
+            "minimax_depth": 4,
+            "time_limit": 30,
+        }
+        app_module.analysis_jobs_by_game[job["game_id"]] = job
+
+        with patch.object(app_module, "run_move_analysis", return_value=[{"move_id": 10}]), patch.object(
+            app_module.supabase_store,
+            "replace_move_analysis",
+            return_value=True,
+        ), patch.object(
+            app_module.supabase_store,
+            "set_game_analysis_status",
+            side_effect=[False, True],
+        ) as set_status, patch.object(app_module, "finish_ai_job"):
+            app_module.complete_move_analysis(job)
+
+        self.assertEqual(set_status.call_args_list, [
+            call("analysis-1", "complete"),
+            call("analysis-1", "failed", "Could not complete move analysis"),
+        ])
+        self.assertNotIn("analysis-1", app_module.analysis_jobs_by_game)
 
     def test_ai_admission_waiting_room_promotes_front_player(self):
         with patch.object(app_module, "AI_ADMISSION_CAPACITY", 0):
@@ -512,6 +562,138 @@ class SocketGameTests(unittest.TestCase):
         self.assertEqual(payload["playerNumber"], 1)
         self.assertEqual(payload["playersConnected"], 1)
         self.assertEqual(payload["status"], "waiting")
+
+    def test_multiplayer_create_ack_contains_created_game(self):
+        ack = self.client.emit(
+            "create_multiplayer_game",
+            {"requestId": "create-request-1"},
+            callback=True,
+        )
+        event = find_event(self.client, "multiplayer_game_created")
+
+        self.assertTrue(ack["ok"])
+        self.assertFalse(ack["recovered"])
+        self.assertEqual(ack["requestId"], "create-request-1")
+        self.assertEqual(ack["gameId"], event["gameId"])
+        self.assertEqual(ack["playerId"], event["playerId"])
+        self.assertEqual(ack["status"], "waiting")
+        self.assertEqual(ack["mode"], "multiplayer")
+
+    def test_multiplayer_create_retry_rebinds_authenticated_creator(self):
+        request_payload = {
+            "requestId": "lost-create-response",
+            "accessToken": "profile-one-token",
+            "ownerName": "Player One",
+        }
+
+        def authenticate(data):
+            return {"profile_id": data.get("accessToken"), "email": "one@example.com"}, None
+
+        app.config["AUTH_REQUIRED"] = True
+        retry_client = None
+        with patch.object(app_module, "authenticate_payload", side_effect=authenticate), \
+                patch.object(app_module.supabase_store, "create_game_record", return_value=False) as create_record:
+            # Simulate a response that the creator never receives. The original
+            # socket disconnects before consuming the emitted success event.
+            self.client.emit("create_multiplayer_game", request_payload)
+            self.assertEqual(len(games), 1)
+            original_game_id, original_game = next(iter(games.items()))
+            original_player_id = original_game["creator_player_id"]
+            original_socket_id = original_game["players"][original_player_id]["socket_id"]
+            self.client.disconnect()
+            self.assertFalse(original_game["players"][original_player_id]["connected"])
+
+            retry_client = socketio.test_client(app)
+            retry_ack = retry_client.emit(
+                "create_multiplayer_game",
+                request_payload,
+                callback=True,
+            )
+            retry_event = find_event(retry_client, "multiplayer_game_created")
+            socketio.emit("recovery_probe", {"gameId": original_game_id}, to=original_game_id)
+            recovery_probe = find_event(retry_client, "recovery_probe")
+            self.assertEqual(create_record.call_count, 1)
+
+        try:
+            self.assertTrue(retry_ack["ok"])
+            self.assertTrue(retry_ack["recovered"])
+            self.assertEqual(retry_ack["requestId"], request_payload["requestId"])
+            self.assertEqual(retry_ack["gameId"], original_game_id)
+            self.assertEqual(retry_ack["playerId"], original_player_id)
+            self.assertEqual(retry_event["gameId"], original_game_id)
+            self.assertEqual(retry_event["playerId"], original_player_id)
+            self.assertTrue(retry_event["recovered"])
+            self.assertEqual(len(games), 1)
+            self.assertTrue(original_game["players"][original_player_id]["connected"])
+            self.assertIsNotNone(original_game["players"][original_player_id]["socket_id"])
+            self.assertNotEqual(original_game["players"][original_player_id]["socket_id"], original_socket_id)
+            self.assertEqual(recovery_probe["gameId"], original_game_id)
+        finally:
+            if retry_client is not None and retry_client.is_connected():
+                retry_client.disconnect()
+
+    def test_multiplayer_create_request_id_is_isolated_by_profile(self):
+        def authenticate(data):
+            return {"profile_id": data.get("accessToken"), "email": None}, None
+
+        app.config["AUTH_REQUIRED"] = True
+        second_client = socketio.test_client(app)
+        try:
+            with patch.object(app_module, "authenticate_payload", side_effect=authenticate):
+                first_ack = self.client.emit(
+                    "create_multiplayer_game",
+                    {"requestId": "shared-request", "accessToken": "profile-one"},
+                    callback=True,
+                )
+                second_ack = second_client.emit(
+                    "create_multiplayer_game",
+                    {"requestId": "shared-request", "accessToken": "profile-two"},
+                    callback=True,
+                )
+
+            self.assertTrue(first_ack["ok"])
+            self.assertTrue(second_ack["ok"])
+            self.assertFalse(first_ack["recovered"])
+            self.assertFalse(second_ack["recovered"])
+            self.assertNotEqual(first_ack["gameId"], second_ack["gameId"])
+            self.assertNotEqual(first_ack["playerId"], second_ack["playerId"])
+            self.assertEqual(len(games), 2)
+        finally:
+            second_client.disconnect()
+
+    def test_multiplayer_create_rejection_has_useful_ack_and_event(self):
+        with patch.object(app_module, "authenticate_payload", return_value=(None, "Invalid session")):
+            ack = self.client.emit(
+                "create_multiplayer_game",
+                {"requestId": "rejected-request", "accessToken": "bad-token"},
+                callback=True,
+            )
+        event = find_event(self.client, "create_rejected")
+
+        self.assertEqual(ack, {
+            "ok": False,
+            "requestId": "rejected-request",
+            "code": "authentication_failed",
+            "message": "Invalid session",
+        })
+        self.assertEqual(event, {
+            "message": "Invalid session",
+            "requestId": "rejected-request",
+        })
+        self.assertEqual(games, {})
+
+    def test_multiplayer_create_without_request_id_preserves_legacy_behavior(self):
+        first_ack = self.client.emit("create_multiplayer_game", callback=True)
+        second_ack = self.client.emit("create_multiplayer_game", callback=True)
+
+        self.assertTrue(first_ack["ok"])
+        self.assertTrue(second_ack["ok"])
+        self.assertIsNone(first_ack["requestId"])
+        self.assertIsNone(second_ack["requestId"])
+        self.assertFalse(first_ack["recovered"])
+        self.assertFalse(second_ack["recovered"])
+        self.assertNotEqual(first_ack["gameId"], second_ack["gameId"])
+        self.assertEqual(len(games), 2)
 
     def test_second_multiplayer_socket_joins_as_player_two(self):
         self.client.emit("create_multiplayer_game")
