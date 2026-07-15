@@ -1,6 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createClient } from "@supabase/supabase-js";
 import { io } from "socket.io-client";
+import { matchPath, Route, Routes, useLocation, useNavigate } from "react-router-dom";
+
+const AuthRoute = lazy(() => import("./routes/AuthRoute.jsx"));
+const ProfileRoute = lazy(() => import("./routes/ProfileRoute.jsx"));
+const ReviewRoute = lazy(() => import("./routes/ReviewRoute.jsx"));
 
 const STORAGE_KEY = "connect4_game_session";
 const MULTIPLAYER_STORAGE_KEY = "connect4_multiplayer_session";
@@ -21,7 +26,23 @@ const GAME_REVIEW_PATH = `${GAME_PATH}/review`;
 const NOT_FOUND_PATH = "/404";
 const TOS_PATH = getEnvRoute("VITE_TOS_PATH", "/tos");
 const PRIVACY_POLICY_PATH = getEnvRoute("VITE_PRIVACY_POLICY_PATH", "/privacypolicy");
-const APP_PATHS = new Set([SETUP_PATH, GAME_PATH, JOIN_PATH, LOGIN_PATH, SIGNUP_PATH, PROFILE_PATH, AI_WAITING_PATH, GAME_REVIEW_PATH, NOT_FOUND_PATH, TOS_PATH, PRIVACY_POLICY_PATH]);
+const ABOUT_PATH = "/about";
+const CONTACT_PATH = "/contact";
+const APP_PATHS = new Set([
+  SETUP_PATH,
+  GAME_PATH,
+  JOIN_PATH,
+  LOGIN_PATH,
+  SIGNUP_PATH,
+  PROFILE_PATH,
+  AI_WAITING_PATH,
+  GAME_REVIEW_PATH,
+  NOT_FOUND_PATH,
+  TOS_PATH,
+  PRIVACY_POLICY_PATH,
+  ABOUT_PATH,
+  CONTACT_PATH,
+]);
 const SOCKET_PATHS = new Set([SETUP_PATH, GAME_PATH, JOIN_PATH, AI_WAITING_PATH]);
 const ROWS = 6;
 const COLS = 7;
@@ -29,6 +50,7 @@ const MOVE_ANALYSIS_POLL_MS = 2000;
 const MOVE_ANALYSIS_ACTIVE_STATUSES = new Set(["queued", "running", "processing"]);
 const MOVE_ANALYSIS_COMPLETE_STATUSES = new Set(["complete", "evaluated"]);
 const MULTIPLAYER_CREATE_TIMEOUT_MS = 10000;
+const MULTIPLAYER_RECONCILE_TERMINAL_STATUSES = new Set(["cancelled", "expired", "completed", "invalid"]);
 
 const PLAYER = 1;
 const AI = 2;
@@ -72,9 +94,10 @@ function getSocketTransports() {
   const configured = getEnvString("VITE_SOCKET_TRANSPORTS", "polling")
     .split(",")
     .map((transport) => transport.trim().toLowerCase())
-    .filter((transport, index, transports) => (
-      ["polling", "websocket"].includes(transport) && transports.indexOf(transport) === index
-    ));
+    .filter(
+      (transport, index, transports) =>
+        ["polling", "websocket"].includes(transport) && transports.indexOf(transport) === index,
+    );
   return configured.length > 0 ? configured : ["polling"];
 }
 
@@ -318,9 +341,7 @@ function getReviewMoveFeedback(move) {
     return null;
   }
 
-  const nestedAnalysis = Array.isArray(move?.move_analysis)
-    ? move.move_analysis[0]
-    : move?.move_analysis;
+  const nestedAnalysis = Array.isArray(move?.move_analysis) ? move.move_analysis[0] : move?.move_analysis;
   if (!nestedAnalysis || typeof nestedAnalysis !== "object") {
     return null;
   }
@@ -330,6 +351,44 @@ function getReviewMoveFeedback(move) {
   }
 
   return nestedAnalysis.feedback.trim();
+}
+
+const EVALUATION_CATEGORIES = ["Blunder", "Mistake", "OK", "Great Move"];
+
+function buildEvaluationCounts(moves) {
+  const counts = {
+    1: Object.fromEntries(EVALUATION_CATEGORIES.map((category) => [category, 0])),
+    2: Object.fromEntries(EVALUATION_CATEGORIES.map((category) => [category, 0])),
+  };
+  moves.forEach((move) => {
+    const feedback = getReviewMoveFeedback(move);
+    if (counts[move.player_number] && feedback in counts[move.player_number]) {
+      counts[move.player_number][feedback] += 1;
+    }
+  });
+  return counts;
+}
+
+function EvaluationSummaryTable({ playerNumber, playerName, counts }) {
+  return (
+    <section
+      className={`review-player-summary player-${playerNumber}`}
+      aria-label={`${playerName} move evaluation summary`}
+    >
+      <h2>{playerName}</h2>
+      <table>
+        <caption className="sr-only">Move quality totals for {playerName}</caption>
+        <tbody>
+          {EVALUATION_CATEGORIES.map((category) => (
+            <tr key={category}>
+              <th scope="row">{category}</th>
+              <td>{counts[category]}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </section>
+  );
 }
 
 function saveSession(gameId, playerId) {
@@ -406,8 +465,8 @@ function createMultiplayerRequestId() {
   return `multiplayer-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-function savePendingGame(mode, difficulty, ownerName = "", requestId = "") {
-  const pendingGame = { mode, difficulty, ownerName, requestId };
+function savePendingGame(mode, difficulty, ownerName = "", requestId = "", profileId = "") {
+  const pendingGame = { mode, difficulty, ownerName, requestId, profileId };
   window.sessionStorage.setItem(PENDING_GAME_KEY, JSON.stringify(pendingGame));
   return pendingGame;
 }
@@ -428,10 +487,18 @@ function clearPendingGame(requestId = "") {
   return true;
 }
 
-function loadPendingGame() {
+function loadPendingGame(expectedProfileId = "") {
   try {
     const pendingGame = JSON.parse(window.sessionStorage.getItem(PENDING_GAME_KEY));
     if (pendingGame?.mode) {
+      if (
+        pendingGame.mode === GAME_MODE_MULTIPLAYER &&
+        expectedProfileId &&
+        pendingGame.profileId !== expectedProfileId
+      ) {
+        window.sessionStorage.removeItem(PENDING_GAME_KEY);
+        return null;
+      }
       return pendingGame;
     }
   } catch {
@@ -509,12 +576,22 @@ function formatWinRate(wins, total) {
   return `${Math.round((wins / total) * 100)}%`;
 }
 
-function isGamePath(pathname) {
-  return pathname === GAME_PATH || pathname.startsWith(`${GAME_PATH}/`);
+function formatRoomCode(roomId) {
+  if (!roomId) {
+    return "-";
+  }
+
+  return roomId.length > 16 ? `${roomId.slice(0, 8)}…${roomId.slice(-4)}` : roomId;
 }
 
-function isGameReviewPath(pathname) {
-  return pathname.startsWith(`${GAME_PATH}/`) && pathname.endsWith("/review");
+function getPieceLabel(piece) {
+  if (piece === PLAYER) {
+    return "Yellow piece";
+  }
+  if (piece === AI) {
+    return "Red piece";
+  }
+  return "Empty";
 }
 
 function gamePath(gameId) {
@@ -525,42 +602,37 @@ function gameReviewPath(gameId) {
   return gameId ? `${GAME_PATH}/${encodeURIComponent(gameId)}/review` : GAME_REVIEW_PATH;
 }
 
-function getRouteGameId() {
-  if (!isGamePath(window.location.pathname) || window.location.pathname === GAME_PATH || isGameReviewPath(window.location.pathname)) {
-    return null;
-  }
-
-  const [gameId] = window.location.pathname.slice(GAME_PATH.length + 1).split("/");
-  return gameId ? decodeURIComponent(gameId) : null;
+function getRouteGameId(pathname) {
+  return matchPath({ path: `${GAME_PATH}/:gameId`, end: true }, pathname)?.params.gameId || null;
 }
 
-function getGameReviewId() {
-  if (!isGameReviewPath(window.location.pathname)) {
-    return null;
-  }
-
-  const reviewPath = window.location.pathname.slice(GAME_PATH.length + 1, -"/review".length);
-  const [gameId] = reviewPath.split("/");
-  return gameId ? decodeURIComponent(gameId) : null;
+function getGameReviewId(pathname) {
+  return matchPath({ path: `${GAME_PATH}/:gameId/review`, end: true }, pathname)?.params.gameId || null;
 }
 
-function getCurrentPath() {
-  if (isGameReviewPath(window.location.pathname)) {
+function getCurrentPath(pathname) {
+  if (matchPath({ path: `${GAME_PATH}/:gameId/review`, end: true }, pathname)) {
     return GAME_REVIEW_PATH;
   }
 
-  if (isGamePath(window.location.pathname)) {
+  if (matchPath({ path: `${GAME_PATH}/:gameId?`, end: true }, pathname)) {
     return GAME_PATH;
   }
 
-  return APP_PATHS.has(window.location.pathname) ? window.location.pathname : SETUP_PATH;
+  return APP_PATHS.has(pathname) ? pathname : NOT_FOUND_PATH;
 }
 
 function App() {
-  const [routePath, setRoutePath] = useState(getCurrentPath);
+  const location = useLocation();
+  const navigate = useNavigate();
+  const routePath = useMemo(() => getCurrentPath(location.pathname), [location.pathname]);
   const [board, setBoard] = useState(emptyBoard);
   const [status, setStatus] = useState("setup");
-  const [message, setMessage] = useState(() => ([GAME_PATH, GAME_REVIEW_PATH].includes(getCurrentPath()) ? "Loading game..." : "Choose difficulty"));
+  const [message, setMessage] = useState(() =>
+    [GAME_PATH, GAME_REVIEW_PATH].includes(getCurrentPath(window.location.pathname))
+      ? "Loading game..."
+      : "Choose difficulty",
+  );
   const [busy, setBusy] = useState(false);
   const [gameStarted, setGameStarted] = useState(false);
   const [selectedDifficulty, setSelectedDifficulty] = useState(DEFAULT_DIFFICULTY);
@@ -622,6 +694,8 @@ function App() {
   const [authReady, setAuthReady] = useState(!supabaseClient);
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState("");
+  const [authNotice, setAuthNotice] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [theme, setTheme] = useState(getInitialTheme);
 
   const boardRef = useRef(board);
@@ -632,11 +706,24 @@ function App() {
   const playerNumberRef = useRef(playerNumber);
   const aiNumberRef = useRef(aiNumber);
   const pendingMoveRef = useRef(null);
-  const emitPendingMultiplayerCreateRef = useRef(null);
+  const reconcilePendingMultiplayerCreateRef = useRef(null);
   const multiplayerCreateInFlightRequestRef = useRef("");
-  const completedMultiplayerCreateRequestRef = useRef("");
-  const completedMultiplayerCreateGameRef = useRef("");
+  const multiplayerReconcileInFlightRequestRef = useRef("");
+  const multiplayerJoinInFlightRef = useRef(null);
+  const multiplayerJoinTimeoutRef = useRef(null);
   const rejectedMultiplayerCreateRequestRef = useRef("");
+  const authModalRef = useRef(null);
+  const authTriggerRef = useRef(null);
+
+  const resetMultiplayerCreationTracking = useCallback(() => {
+    multiplayerCreateInFlightRequestRef.current = "";
+    multiplayerReconcileInFlightRequestRef.current = "";
+    multiplayerJoinInFlightRef.current = null;
+    if (multiplayerJoinTimeoutRef.current) {
+      window.clearTimeout(multiplayerJoinTimeoutRef.current);
+      multiplayerJoinTimeoutRef.current = null;
+    }
+  }, []);
 
   const showToast = useCallback((toastMessage, type = "info") => {
     if (toastTimerRef.current) {
@@ -649,12 +736,15 @@ function App() {
     }, 3500);
   }, []);
 
-  useEffect(() => () => {
-    if (toastTimerRef.current) {
-      window.clearTimeout(toastTimerRef.current);
-      toastTimerRef.current = null;
-    }
-  }, []);
+  useEffect(
+    () => () => {
+      if (toastTimerRef.current) {
+        window.clearTimeout(toastTimerRef.current);
+        toastTimerRef.current = null;
+      }
+    },
+    [],
+  );
 
   const gameOver = useMemo(() => {
     return ["human_win", "ai_win", "player1_win", "player2_win", "draw"].includes(status);
@@ -680,32 +770,40 @@ function App() {
       winRate: formatWinRate(stats.wins, stats.total),
     };
   }, [profileGames]);
-  const gameReviewId = getGameReviewId();
+  const gameReviewId = getGameReviewId(location.pathname);
   const reviewGame = profileGames.find((game) => game.id === gameReviewId) || null;
-  const reviewWinnerLabel = reviewGame?.status === "draw"
-    ? "Draw"
-    : reviewGame?.winnerName || (reviewGame?.winnerPlayerNumber ? `Player ${reviewGame.winnerPlayerNumber} Wins` : "Completed game");
+  const reviewWinnerLabel =
+    reviewGame?.status === "draw"
+      ? "Draw"
+      : reviewGame?.winnerName ||
+        (reviewGame?.winnerPlayerNumber ? `Player ${reviewGame.winnerPlayerNumber} Wins` : "Completed game");
   const reviewBoard = reviewMoves[reviewMoveIndex]?.board_after || emptyBoard();
+  const reviewEvaluationCounts = useMemo(() => buildEvaluationCounts(reviewMoves), [reviewMoves]);
   const reviewAnalysisActive = isMoveAnalysisActive(reviewAnalysisStatus);
   const reviewAnalysisComplete = isMoveAnalysisComplete(reviewAnalysisStatus);
   const socketRouteActive = SOCKET_PATHS.has(routePath);
   const reviewAnalysisUnavailable = reviewLoading || Boolean(reviewError) || reviewMoves.length === 0;
-  const reviewAnalysisButtonDisabled = !reviewAnalysisAvailable || reviewAnalysisUnavailable || reviewAnalysisRequestPending || reviewAnalysisActive || reviewAnalysisComplete;
+  const reviewAnalysisButtonDisabled =
+    !reviewAnalysisAvailable ||
+    reviewAnalysisUnavailable ||
+    reviewAnalysisRequestPending ||
+    reviewAnalysisActive ||
+    reviewAnalysisComplete;
   const reviewAnalysisStatusMessage = reviewLoading
     ? "Loading move evaluation status."
     : !reviewAnalysisAvailable
       ? reviewAnalysisUnavailableReason || "Move evaluation is temporarily unavailable."
       : reviewAnalysisUnavailable
-      ? "Move history is unavailable."
-      : reviewAnalysisRequestPending
-        ? "Requesting move evaluation."
-        : reviewAnalysisActive
-          ? "Move evaluation is queued or running."
-          : reviewAnalysisComplete
-            ? "Move evaluation is complete."
-            : reviewAnalysisStatus === "failed"
-              ? `Move evaluation failed. ${reviewAnalysisError || "You can retry the request."}`
-              : "Move evaluation has not been requested.";
+        ? "Move history is unavailable."
+        : reviewAnalysisRequestPending
+          ? "Requesting move evaluation."
+          : reviewAnalysisActive
+            ? "Move evaluation is queued or running."
+            : reviewAnalysisComplete
+              ? "Move evaluation is complete."
+              : reviewAnalysisStatus === "failed"
+                ? `Move evaluation failed. ${reviewAnalysisError || "You can retry the request."}`
+                : "Move evaluation has not been requested.";
 
   useEffect(() => {
     window.localStorage.setItem(THEME_KEY, theme);
@@ -721,9 +819,7 @@ function App() {
     const currentBoard = reviewMoves[reviewMoveIndex]?.board_after || emptyBoard();
     const previousBoard = reviewMoves[reviewMoveIndex - 1]?.board_after || emptyBoard();
     setReviewAnimatedPieces(findChangedPieces(previousBoard, currentBoard));
-    setReviewWinningPieces(
-      reviewMoveIndex === reviewMoves.length - 1 ? findWinningPieces(currentBoard) : [],
-    );
+    setReviewWinningPieces(reviewMoveIndex === reviewMoves.length - 1 ? findWinningPieces(currentBoard) : []);
     setReviewAnimationRun((currentRun) => currentRun + 1);
   }, [reviewMoves, reviewMoveIndex]);
 
@@ -765,24 +861,21 @@ function App() {
     };
   }, []);
 
-  const redirectTo = useCallback((path, replace = false) => {
-    if (window.location.pathname !== path) {
-      window.history[replace ? "replaceState" : "pushState"]({}, "", path);
-    }
-    setRoutePath(getCurrentPath());
-  }, []);
-
   useEffect(() => {
-    function handlePopState() {
-      setRoutePath(getCurrentPath());
+    if (!authReady || !authSession?.user?.id) {
+      return;
     }
 
-    window.addEventListener("popstate", handlePopState);
+    resetMultiplayerCreationTracking();
+    loadPendingGame(authSession.user.id);
+  }, [authReady, authSession?.user?.id, resetMultiplayerCreationTracking]);
 
-    return () => {
-      window.removeEventListener("popstate", handlePopState);
-    };
-  }, []);
+  const redirectTo = useCallback(
+    (path, replace = false) => {
+      navigate(path, { replace });
+    },
+    [navigate],
+  );
 
   useEffect(() => {
     if (routePath === LOGIN_PATH) {
@@ -791,6 +884,62 @@ function App() {
       setAuthMode("signup");
     }
   }, [routePath]);
+
+  useEffect(() => {
+    if (routePath !== JOIN_PATH) {
+      return;
+    }
+
+    const invitedRoomId = sanitizeRoomIdInput(new URLSearchParams(location.search).get("room") || "");
+    if (invitedRoomId) {
+      setJoinGameId(invitedRoomId);
+    }
+  }, [location.search, routePath]);
+
+  useEffect(() => {
+    if (!authOpen || !authModalRef.current) {
+      return undefined;
+    }
+
+    const dialog = authModalRef.current;
+    const previousOverflow = document.body.style.overflow;
+    const focusableSelector = "button:not([disabled]), input:not([disabled]), a[href]";
+    const focusableElements = Array.from(dialog.querySelectorAll(focusableSelector));
+    focusableElements[0]?.focus();
+    document.body.style.overflow = "hidden";
+
+    function handleModalKeyDown(event) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeAuthModal();
+        return;
+      }
+
+      if (event.key !== "Tab") {
+        return;
+      }
+
+      const currentFocusableElements = Array.from(dialog.querySelectorAll(focusableSelector));
+      const firstElement = currentFocusableElements[0];
+      const lastElement = currentFocusableElements[currentFocusableElements.length - 1];
+      if (!firstElement || !lastElement) {
+        event.preventDefault();
+      } else if (event.shiftKey && document.activeElement === firstElement) {
+        event.preventDefault();
+        lastElement.focus();
+      } else if (!event.shiftKey && document.activeElement === lastElement) {
+        event.preventDefault();
+        firstElement.focus();
+      }
+    }
+
+    dialog.addEventListener("keydown", handleModalKeyDown);
+    return () => {
+      dialog.removeEventListener("keydown", handleModalKeyDown);
+      document.body.style.overflow = previousOverflow;
+      authTriggerRef.current?.focus?.();
+    };
+  }, [authOpen]);
 
   const clearLocalGame = useCallback(() => {
     pendingMoveRef.current = null;
@@ -847,7 +996,12 @@ function App() {
     const nextPlayerNumber = data.playerNumber || playerNumberRef.current || PLAYER;
     const nextAiNumber = data.aiNumber || aiNumberRef.current || AI;
     const playerColumn = findMoveColumn(previousBoard, data.board, nextPlayerNumber);
-    const aiColumn = data.mode !== GAME_MODE_MULTIPLAYER ? findMoveColumn(previousBoard, data.board, nextAiNumber) : null;
+    const opponentNumber = nextPlayerNumber === PLAYER ? AI : PLAYER;
+    const opponentColumn = findMoveColumn(
+      previousBoard,
+      data.board,
+      data.mode === GAME_MODE_MULTIPLAYER ? opponentNumber : nextAiNumber,
+    );
     const winningLine = findWinningPieces(data.board);
 
     pendingMoveRef.current = null;
@@ -882,17 +1036,20 @@ function App() {
       setPlayerMoves((currentMoves) => [playerColumn, ...currentMoves]);
     }
 
-    if (aiColumn !== null) {
-      setAiMoves((currentMoves) => [aiColumn, ...currentMoves]);
+    if (opponentColumn !== null) {
+      setAiMoves((currentMoves) => [opponentColumn, ...currentMoves]);
     }
   }, []);
 
-  const authPayload = useCallback((payload = {}) => {
-    return {
-      ...payload,
-      accessToken: authSession?.access_token || "",
-    };
-  }, [authSession]);
+  const authPayload = useCallback(
+    (payload = {}) => {
+      return {
+        ...payload,
+        accessToken: authSession?.access_token || "",
+      };
+    },
+    [authSession],
+  );
 
   const loadUserProfile = useCallback(async (session) => {
     if (!supabaseClient || !session?.user?.id) {
@@ -914,126 +1071,131 @@ function App() {
     setUserProfile(data || null);
   }, []);
 
-  const loadProfileGames = useCallback(async ({ signal } = {}) => {
-    if (!authSession?.access_token) {
-      setProfileGames([]);
-      return;
-    }
-
-    setProfileLoading(true);
-    setProfileError("");
-    try {
-      const response = await fetch(`${SOCKET_URL}/api/profile/games`, {
-        headers: {
-          Authorization: `Bearer ${authSession.access_token}`,
-        },
-        signal,
-      });
-      const data = await readJsonResponse(response);
-      if (signal?.aborted) {
+  const loadProfileGames = useCallback(
+    async ({ signal } = {}) => {
+      if (!authSession?.access_token) {
+        setProfileGames([]);
         return;
       }
-      if (!response.ok) {
-        throw new Error(data?.message || "Could not load profile games");
-      }
-      setProfileGames(data.games || []);
-    } catch (error) {
-      if (error.name === "AbortError" || signal?.aborted) {
-        return;
-      }
-      setProfileError(error.message);
-      setProfileGames([]);
-    } finally {
-      if (!signal?.aborted) {
-        setProfileLoading(false);
-      }
-    }
-  }, [authSession]);
 
-  const loadGameReview = useCallback(async (selectedGameId, { background = false, signal } = {}) => {
-    if (!authSession?.access_token || !selectedGameId) {
-      setReviewMoves([]);
-      setReviewAnalysisStatus("not_requested");
-      setReviewAnalysisError("");
-      setReviewAnalysisAvailable(true);
-      setReviewAnalysisUnavailableReason("");
-      return null;
-    }
-
-    if (!background) {
-      setReviewLoading(true);
-      setReviewError("");
-      setReviewMoveIndex(0);
-      setReviewAnalysisStatus("not_requested");
-      setReviewAnalysisError("");
-      setReviewAnalysisAvailable(true);
-      setReviewAnalysisUnavailableReason("");
-    }
-    try {
-      const response = await fetch(`${SOCKET_URL}/api/profile/games/${encodeURIComponent(selectedGameId)}/moves`, {
-        headers: {
-          Authorization: `Bearer ${authSession.access_token}`,
-        },
-        signal,
-      });
-      const data = await readJsonResponse(response);
-      if (signal?.aborted) {
-        return null;
-      }
-      if (!response.ok) {
-        if (response.status === 404) {
-          redirectTo(NOT_FOUND_PATH, true);
-          return { status: "not_found", analysisError: data?.message || "Game history not found" };
+      setProfileLoading(true);
+      setProfileError("");
+      try {
+        const response = await fetch(`${SOCKET_URL}/api/profile/games`, {
+          headers: {
+            Authorization: `Bearer ${authSession.access_token}`,
+          },
+          signal,
+        });
+        const data = await readJsonResponse(response);
+        if (signal?.aborted) {
+          return;
         }
-        throw new Error(data?.message || "Could not load game review");
+        if (!response.ok) {
+          throw new Error(data?.message || "Could not load profile games");
+        }
+        setProfileGames(data.games || []);
+      } catch (error) {
+        if (error.name === "AbortError" || signal?.aborted) {
+          return;
+        }
+        setProfileError(error.message);
+        setProfileGames([]);
+      } finally {
+        if (!signal?.aborted) {
+          setProfileLoading(false);
+        }
       }
-      if (!Array.isArray(data.moves) || data.moves.length === 0) {
-        redirectTo(NOT_FOUND_PATH, true);
-        return { status: "not_found", analysisError: "Game history not found" };
-      }
+    },
+    [authSession],
+  );
 
-      const analysisStatus = normalizeMoveAnalysisStatus(data.analysis_status);
-      const analysisError = typeof data.analysis_error === "string" ? data.analysis_error : "";
-      const analysisAvailable = data.analysis_available !== false;
-      const analysisUnavailableReason = typeof data.analysis_unavailable_reason === "string"
-        ? data.analysis_unavailable_reason
-        : "";
-      if (!background || isMoveAnalysisComplete(analysisStatus) || analysisStatus === "failed") {
-        setReviewMoves(data.moves);
-      }
-      setReviewAnalysisStatus(analysisStatus);
-      setReviewAnalysisError(analysisError);
-      setReviewAnalysisAvailable(analysisAvailable);
-      setReviewAnalysisUnavailableReason(analysisUnavailableReason);
-      return { status: analysisStatus, analysisError, analysisAvailable, analysisUnavailableReason };
-    } catch (error) {
-      if (error.name === "AbortError" || signal?.aborted) {
+  const loadGameReview = useCallback(
+    async (selectedGameId, { background = false, signal } = {}) => {
+      if (!authSession?.access_token || !selectedGameId) {
+        setReviewMoves([]);
+        setReviewAnalysisStatus("not_requested");
+        setReviewAnalysisError("");
+        setReviewAnalysisAvailable(true);
+        setReviewAnalysisUnavailableReason("");
         return null;
       }
+
       if (!background) {
-        setReviewError(error.message);
-        setReviewMoves([]);
+        setReviewLoading(true);
+        setReviewError("");
+        setReviewMoveIndex(0);
+        setReviewAnalysisStatus("not_requested");
+        setReviewAnalysisError("");
+        setReviewAnalysisAvailable(true);
+        setReviewAnalysisUnavailableReason("");
       }
-      return { status: "error", analysisError: error.message };
-    } finally {
-      if (!background && !signal?.aborted) {
-        setReviewLoading(false);
+      try {
+        const response = await fetch(`${SOCKET_URL}/api/profile/games/${encodeURIComponent(selectedGameId)}/moves`, {
+          headers: {
+            Authorization: `Bearer ${authSession.access_token}`,
+          },
+          signal,
+        });
+        const data = await readJsonResponse(response);
+        if (signal?.aborted) {
+          return null;
+        }
+        if (!response.ok) {
+          if (response.status === 404) {
+            redirectTo(NOT_FOUND_PATH, true);
+            return { status: "not_found", analysisError: data?.message || "Game history not found" };
+          }
+          throw new Error(data?.message || "Could not load game review");
+        }
+        if (!Array.isArray(data.moves) || data.moves.length === 0) {
+          redirectTo(NOT_FOUND_PATH, true);
+          return { status: "not_found", analysisError: "Game history not found" };
+        }
+
+        const analysisStatus = normalizeMoveAnalysisStatus(data.analysis_status);
+        const analysisError = typeof data.analysis_error === "string" ? data.analysis_error : "";
+        const analysisAvailable = data.analysis_available !== false;
+        const analysisUnavailableReason =
+          typeof data.analysis_unavailable_reason === "string" ? data.analysis_unavailable_reason : "";
+        if (!background || isMoveAnalysisComplete(analysisStatus) || analysisStatus === "failed") {
+          setReviewMoves(data.moves);
+        }
+        setReviewAnalysisStatus(analysisStatus);
+        setReviewAnalysisError(analysisError);
+        setReviewAnalysisAvailable(analysisAvailable);
+        setReviewAnalysisUnavailableReason(analysisUnavailableReason);
+        return { status: analysisStatus, analysisError, analysisAvailable, analysisUnavailableReason };
+      } catch (error) {
+        if (error.name === "AbortError" || signal?.aborted) {
+          return null;
+        }
+        if (!background) {
+          setReviewError(error.message);
+          setReviewMoves([]);
+        }
+        return { status: "error", analysisError: error.message };
+      } finally {
+        if (!background && !signal?.aborted) {
+          setReviewLoading(false);
+        }
       }
-    }
-  }, [authSession, redirectTo]);
+    },
+    [authSession, redirectTo],
+  );
 
   const requestMoveEvaluation = useCallback(async () => {
     if (
-      !authSession?.access_token
-      || !gameReviewId
-      || reviewLoading
-      || reviewError
-      || reviewMoves.length === 0
-      || !reviewAnalysisAvailable
-      || reviewAnalysisRequestPending
-      || reviewAnalysisRequestControllerRef.current
-      || isMoveAnalysisActive(reviewAnalysisStatus)
-      || isMoveAnalysisComplete(reviewAnalysisStatus)
+      !authSession?.access_token ||
+      !gameReviewId ||
+      reviewLoading ||
+      reviewError ||
+      reviewMoves.length === 0 ||
+      !reviewAnalysisAvailable ||
+      reviewAnalysisRequestPending ||
+      reviewAnalysisRequestControllerRef.current ||
+      isMoveAnalysisActive(reviewAnalysisStatus) ||
+      isMoveAnalysisComplete(reviewAnalysisStatus)
     ) {
       return;
     }
@@ -1076,9 +1238,7 @@ function App() {
       if (activeStatus === "queued") {
         const queuePosition = Number(data.queuePosition || data.queue_position || 0);
         showToast(
-          queuePosition > 0
-            ? `Move evaluation queued (position ${queuePosition}).`
-            : "Move evaluation queued.",
+          queuePosition > 0 ? `Move evaluation queued (position ${queuePosition}).` : "Move evaluation queued.",
           "info",
         );
       } else {
@@ -1165,10 +1325,10 @@ function App() {
 
   useEffect(() => {
     if (
-      routePath !== GAME_REVIEW_PATH
-      || !authSession?.access_token
-      || !gameReviewId
-      || !isMoveAnalysisActive(reviewAnalysisStatus)
+      routePath !== GAME_REVIEW_PATH ||
+      !authSession?.access_token ||
+      !gameReviewId ||
+      !isMoveAnalysisActive(reviewAnalysisStatus)
     ) {
       return undefined;
     }
@@ -1239,19 +1399,19 @@ function App() {
         return;
       }
 
-      const routeGameId = getRouteGameId();
+      const routeGameId = getRouteGameId(location.pathname);
       const waitingSession = loadAiWaitingSession();
       if (waitingSession) {
         setAiWaitingQueueId(waitingSession.queueId);
         nextSocket.emit("check_ai_waiting", authPayload(waitingSession));
         return;
       }
-      const pendingGame = loadPendingGame();
+      const pendingGame = loadPendingGame(authSession?.user?.id || "");
       if (pendingGame) {
         clearSession();
         clearMultiplayerSession();
         if (pendingGame.mode === GAME_MODE_MULTIPLAYER) {
-          emitPendingMultiplayerCreate(pendingGame);
+          reconcilePendingMultiplayerCreate(pendingGame);
           return;
         }
 
@@ -1309,9 +1469,15 @@ function App() {
       setMessage(data.message);
       setSelectedDifficulty(data.difficulty || DEFAULT_DIFFICULTY);
       setPlayerMoves([]);
-      setAiMoves([]);
+      const openingAiColumn =
+        data.mode !== GAME_MODE_MULTIPLAYER ? findMoveColumn(emptyBoard(), data.board, data.aiNumber || AI) : null;
+      setAiMoves(openingAiColumn !== null ? [openingAiColumn] : []);
       setGameStarted(true);
-      setBusy(data.mode !== GAME_MODE_MULTIPLAYER && data.currentPlayer === (data.aiNumber || AI) && data.status === "playing");
+      setBusy(
+        data.mode !== GAME_MODE_MULTIPLAYER &&
+          data.currentPlayer === (data.aiNumber || AI) &&
+          data.status === "playing",
+      );
       redirectTo(gamePath(data.gameId));
     }
 
@@ -1375,44 +1541,77 @@ function App() {
       redirectTo(gamePath(data.gameId));
     }
 
-    function handleMultiplayerGameCreated(data, fallbackRequestId = "") {
-      if (!data?.gameId || !data?.playerId) {
-        return false;
-      }
+    function loadCurrentPendingGame() {
+      return loadPendingGame(authSession?.user?.id || "");
+    }
 
-      const responseRequestId = data.requestId || fallbackRequestId;
-      if (
-        (responseRequestId && completedMultiplayerCreateRequestRef.current === responseRequestId)
-        || completedMultiplayerCreateGameRef.current === data.gameId
-      ) {
-        return true;
-      }
+    function releasePendingMultiplayerCreation(message) {
+      resetMultiplayerCreationTracking();
+      setStatus("error");
+      setMessage(message);
+      setBusy(false);
+      showToast(message, "error");
+    }
 
-      const pendingGame = loadPendingGame();
+    function handleMultiplayerGameCreated(data) {
+      const pendingGame = loadCurrentPendingGame();
       if (!pendingGame || pendingGame.mode !== GAME_MODE_MULTIPLAYER) {
-        return false;
+        return;
       }
-      if (responseRequestId && pendingGame.requestId && responseRequestId !== pendingGame.requestId) {
-        return false;
+      if (data?.requestId && data.requestId !== pendingGame.requestId) {
+        return;
       }
 
-      const completedRequestId = responseRequestId || pendingGame.requestId;
-      completedMultiplayerCreateRequestRef.current = completedRequestId;
-      completedMultiplayerCreateGameRef.current = data.gameId;
-      rejectedMultiplayerCreateRequestRef.current = "";
-      multiplayerCreateInFlightRequestRef.current = "";
-      clearPendingGame(completedRequestId);
-      applyMultiplayerGameStarted(data);
-      return true;
+      if (multiplayerCreateInFlightRequestRef.current === pendingGame.requestId) {
+        multiplayerCreateInFlightRequestRef.current = "";
+      }
+      reconcilePendingMultiplayerCreate(pendingGame);
     }
 
     function handleMultiplayerGameJoined(data) {
-      clearPendingGame();
-      multiplayerCreateInFlightRequestRef.current = "";
+      const pendingGame = loadCurrentPendingGame();
+      const joinAttempt = multiplayerJoinInFlightRef.current;
+      const correlatedRequestId =
+        data?.requestId || (joinAttempt?.gameId === data?.gameId ? joinAttempt.requestId : "");
+
+      if (pendingGame?.mode === GAME_MODE_MULTIPLAYER) {
+        if (!correlatedRequestId || correlatedRequestId !== pendingGame.requestId) {
+          return;
+        }
+        clearPendingGame(correlatedRequestId);
+        resetMultiplayerCreationTracking();
+        rejectedMultiplayerCreateRequestRef.current = "";
+      } else if (data?.requestId) {
+        // Ignore a late correlated join after the user explicitly cancelled it.
+        return;
+      }
+
       applyMultiplayerGameStarted(data);
     }
 
     function handleJoinRejected(data) {
+      const pendingGame = loadCurrentPendingGame();
+      const joinAttempt = multiplayerJoinInFlightRef.current;
+      const correlatedRequestId =
+        data?.requestId || (joinAttempt?.gameId === data?.gameId ? joinAttempt.requestId : "");
+
+      if (pendingGame?.mode === GAME_MODE_MULTIPLAYER && correlatedRequestId) {
+        if (correlatedRequestId !== pendingGame.requestId) {
+          return;
+        }
+
+        const rejectionMessage = data?.message || "Could not rejoin the created room. Try again.";
+        const terminalRejection =
+          data?.terminal === true ||
+          MULTIPLAYER_RECONCILE_TERMINAL_STATUSES.has(String(data?.status || "").toLowerCase());
+        if (terminalRejection) {
+          handleCreateRejected({ ...data, requestId: correlatedRequestId });
+        } else {
+          releasePendingMultiplayerCreation(rejectionMessage);
+        }
+        return;
+      }
+
       clearSession();
       clearMultiplayerSession();
       clearAiWaitingSession();
@@ -1421,7 +1620,7 @@ function App() {
       clearLocalGame();
       setMessage(data?.message || "Game not found");
       setJoiningPublicGameId("");
-      if (getCurrentPath() === JOIN_PATH) {
+      if (getCurrentPath(window.location.pathname) === JOIN_PATH) {
         setBusy(false);
         nextSocket.emit("list_public_games", authPayload());
         redirectTo(JOIN_PATH, true);
@@ -1431,11 +1630,24 @@ function App() {
     }
 
     function handleCreateRejected(data) {
-      const pendingGame = loadPendingGame();
+      const pendingGame = loadCurrentPendingGame();
       if (data?.requestId && (!pendingGame || pendingGame.mode !== GAME_MODE_MULTIPLAYER)) {
         return;
       }
       if (data?.requestId && pendingGame?.requestId && data.requestId !== pendingGame.requestId) {
+        return;
+      }
+      if (
+        pendingGame?.mode === GAME_MODE_MULTIPLAYER &&
+        !data?.requestId &&
+        multiplayerCreateInFlightRequestRef.current !== pendingGame.requestId
+      ) {
+        return;
+      }
+
+      const rejectionMessage = data?.message || "Could not create game";
+      if (data?.code === "persistence_unavailable" && pendingGame?.mode === GAME_MODE_MULTIPLAYER) {
+        releasePendingMultiplayerCreation(rejectionMessage);
         return;
       }
 
@@ -1444,7 +1656,7 @@ function App() {
         return;
       }
       rejectedMultiplayerCreateRequestRef.current = rejectedRequestId;
-      multiplayerCreateInFlightRequestRef.current = "";
+      resetMultiplayerCreationTracking();
       clearPendingGame(rejectedRequestId);
       clearAiWaitingSession();
       setAiWaitingQueueId("");
@@ -1452,13 +1664,12 @@ function App() {
       clearSession();
       clearMultiplayerSession();
       clearLocalGame();
-      const rejectionMessage = data?.message || "Could not create game";
       setMessage(rejectionMessage);
       showToast(rejectionMessage, "error");
       redirectTo(SETUP_PATH, true);
     }
 
-    function emitPendingMultiplayerCreate(pendingGame = loadPendingGame()) {
+    function emitPendingMultiplayerCreate(pendingGame = loadCurrentPendingGame()) {
       if (!nextSocket.connected || pendingGame?.mode !== GAME_MODE_MULTIPLAYER) {
         return false;
       }
@@ -1473,6 +1684,7 @@ function App() {
         null,
         pendingGame.ownerName || "Account",
         requestId,
+        pendingGame.profileId || authSession?.user?.id || "",
       );
       multiplayerCreateInFlightRequestRef.current = requestId;
       rejectedMultiplayerCreateRequestRef.current = "";
@@ -1480,50 +1692,167 @@ function App() {
       setMessage("Creating multiplayer room...");
       setBusy(true);
 
-      nextSocket.timeout(MULTIPLAYER_CREATE_TIMEOUT_MS).emit(
-        "create_multiplayer_game",
-        authPayload({ ownerName: persistedGame.ownerName, requestId }),
-        (timeoutError, response) => {
-          if (multiplayerCreateInFlightRequestRef.current === requestId) {
-            multiplayerCreateInFlightRequestRef.current = "";
+      nextSocket
+        .timeout(MULTIPLAYER_CREATE_TIMEOUT_MS)
+        .emit(
+          "create_multiplayer_game",
+          authPayload({ ownerName: persistedGame.ownerName, requestId }),
+          (timeoutError, response) => {
+            if (multiplayerCreateInFlightRequestRef.current === requestId) {
+              multiplayerCreateInFlightRequestRef.current = "";
+            }
+
+            const currentPendingGame = loadCurrentPendingGame();
+            if (
+              !currentPendingGame ||
+              currentPendingGame.mode !== GAME_MODE_MULTIPLAYER ||
+              currentPendingGame.requestId !== requestId
+            ) {
+              return;
+            }
+
+            if (timeoutError) {
+              if (
+                multiplayerReconcileInFlightRequestRef.current === requestId ||
+                multiplayerJoinInFlightRef.current?.requestId === requestId
+              ) {
+                return;
+              }
+              releasePendingMultiplayerCreation("Room creation timed out. Try Create game again.");
+              return;
+            }
+
+            if (response?.ok === false) {
+              handleCreateRejected({
+                ...response,
+                requestId: response.requestId || requestId,
+                message: response.message || "Could not create game",
+              });
+              return;
+            }
+
+            reconcilePendingMultiplayerCreate(currentPendingGame);
+          },
+        );
+      return true;
+    }
+
+    function joinReconciledMultiplayerGame(pendingGame, reconciliation) {
+      if (
+        !nextSocket.connected ||
+        !reconciliation?.gameId ||
+        !reconciliation?.playerId ||
+        pendingGame?.mode !== GAME_MODE_MULTIPLAYER
+      ) {
+        return false;
+      }
+
+      const requestId = pendingGame.requestId;
+      const currentJoin = multiplayerJoinInFlightRef.current;
+      if (currentJoin?.requestId === requestId && currentJoin.gameId === reconciliation.gameId) {
+        return false;
+      }
+
+      multiplayerJoinInFlightRef.current = { requestId, gameId: reconciliation.gameId };
+      setStatus("waiting");
+      setMessage("Joining multiplayer room...");
+      setBusy(true);
+      nextSocket.emit(
+        "join_multiplayer_game",
+        authPayload({
+          gameId: reconciliation.gameId,
+          playerId: reconciliation.playerId,
+          requestId,
+        }),
+      );
+
+      if (multiplayerJoinTimeoutRef.current) {
+        window.clearTimeout(multiplayerJoinTimeoutRef.current);
+      }
+      multiplayerJoinTimeoutRef.current = window.setTimeout(() => {
+        if (multiplayerJoinInFlightRef.current?.requestId !== requestId) {
+          return;
+        }
+        multiplayerJoinInFlightRef.current = null;
+        multiplayerJoinTimeoutRef.current = null;
+        releasePendingMultiplayerCreation("Joining the created room timed out. Try Create game again.");
+      }, MULTIPLAYER_CREATE_TIMEOUT_MS);
+      return true;
+    }
+
+    function reconcilePendingMultiplayerCreate(pendingGame = loadCurrentPendingGame()) {
+      if (!nextSocket.connected || pendingGame?.mode !== GAME_MODE_MULTIPLAYER) {
+        return false;
+      }
+
+      const requestId = pendingGame.requestId || createMultiplayerRequestId();
+      if (multiplayerReconcileInFlightRequestRef.current === requestId) {
+        return false;
+      }
+
+      const persistedGame = savePendingGame(
+        GAME_MODE_MULTIPLAYER,
+        null,
+        pendingGame.ownerName || "Account",
+        requestId,
+        pendingGame.profileId || authSession?.user?.id || "",
+      );
+      multiplayerReconcileInFlightRequestRef.current = requestId;
+      setStatus("waiting");
+      setMessage("Checking for an existing multiplayer room...");
+      setBusy(true);
+
+      nextSocket
+        .timeout(MULTIPLAYER_CREATE_TIMEOUT_MS)
+        .emit("reconcile_multiplayer_creation", authPayload({ requestId }), (timeoutError, response) => {
+          if (multiplayerReconcileInFlightRequestRef.current === requestId) {
+            multiplayerReconcileInFlightRequestRef.current = "";
           }
 
-          const currentPendingGame = loadPendingGame();
+          const currentPendingGame = loadCurrentPendingGame();
           if (
-            !currentPendingGame
-            || currentPendingGame.mode !== GAME_MODE_MULTIPLAYER
-            || currentPendingGame.requestId !== requestId
+            !currentPendingGame ||
+            currentPendingGame.mode !== GAME_MODE_MULTIPLAYER ||
+            currentPendingGame.requestId !== requestId
           ) {
             return;
           }
 
           if (timeoutError) {
-            const timeoutMessage = "Room creation timed out. Try Create game again.";
-            setStatus("error");
-            setMessage(timeoutMessage);
-            setBusy(false);
-            showToast(timeoutMessage, "error");
+            releasePendingMultiplayerCreation("Could not check room creation status. Try Create game again.");
             return;
           }
 
-          if (!response || response.ok === false) {
+          const reconciliationStatus = String(response?.status || "").toLowerCase();
+          if (response?.code === "persistence_unavailable") {
+            releasePendingMultiplayerCreation(
+              response.message || "Room recovery is temporarily unavailable. Try again.",
+            );
+            return;
+          }
+          if (response?.ok === false || MULTIPLAYER_RECONCILE_TERMINAL_STATUSES.has(reconciliationStatus)) {
             handleCreateRejected({
               ...response,
               requestId: response?.requestId || requestId,
-              message: response?.message || "Could not create game",
+              message: response?.message || "Could not recover the multiplayer room",
             });
             return;
           }
-
-          if (!handleMultiplayerGameCreated(response, requestId)) {
-            const invalidResponseMessage = "Room creation did not finish. Try Create game again.";
-            setStatus("error");
-            setMessage(invalidResponseMessage);
-            setBusy(false);
-            showToast(invalidResponseMessage, "error");
+          if (response?.requestId && response.requestId !== requestId) {
+            return;
           }
-        },
-      );
+
+          if (reconciliationStatus === "found" || (response?.gameId && response?.playerId)) {
+            joinReconciledMultiplayerGame(persistedGame, response);
+            return;
+          }
+          if (reconciliationStatus === "not_found") {
+            emitPendingMultiplayerCreate(persistedGame);
+            return;
+          }
+
+          releasePendingMultiplayerCreation(response?.message || "Room creation status was unavailable. Try again.");
+        });
       return true;
     }
 
@@ -1542,7 +1871,7 @@ function App() {
       setAiWaitingQueueId("");
       setAiWaitingPosition(0);
       setBusy(false);
-      if (getCurrentPath() === AI_WAITING_PATH) {
+      if (getCurrentPath(window.location.pathname) === AI_WAITING_PATH) {
         redirectTo(SETUP_PATH, true);
       }
     }
@@ -1582,20 +1911,18 @@ function App() {
       clearSession();
       clearMultiplayerSession();
       clearPendingGame();
-      multiplayerCreateInFlightRequestRef.current = "";
+      resetMultiplayerCreationTracking();
       clearLocalGame();
       redirectTo(SETUP_PATH, true);
     }
 
     function handleDisconnect() {
-      const pendingGame = loadPendingGame();
+      const pendingGame = loadPendingGame(authSession?.user?.id || "");
       if (pendingGame?.mode !== GAME_MODE_MULTIPLAYER) {
         return;
       }
 
-      if (multiplayerCreateInFlightRequestRef.current === pendingGame.requestId) {
-        multiplayerCreateInFlightRequestRef.current = "";
-      }
+      resetMultiplayerCreationTracking();
       setStatus("error");
       setMessage("Connection interrupted. Room creation will retry after reconnecting.");
       setBusy(false);
@@ -1649,7 +1976,7 @@ function App() {
       showToast(data?.message || "Could not update room visibility", "error");
     }
 
-    emitPendingMultiplayerCreateRef.current = emitPendingMultiplayerCreate;
+    reconcilePendingMultiplayerCreateRef.current = reconcilePendingMultiplayerCreate;
     nextSocket.on("connect", handleConnect);
     nextSocket.on("disconnect", handleDisconnect);
     nextSocket.on("game_created", handleGameCreated);
@@ -1669,7 +1996,7 @@ function App() {
     nextSocket.on("room_public_update_failed", handleRoomPublicUpdateFailed);
     nextSocket.on("invalid_move", handleInvalidMove);
     nextSocket.on("connect_error", () => {
-      multiplayerCreateInFlightRequestRef.current = "";
+      resetMultiplayerCreationTracking();
       setStatus("error");
       setMessage(`Flask SocketIO is not responding at ${SOCKET_URL}`);
       setBusy(false);
@@ -1679,12 +2006,22 @@ function App() {
       if (roomVisibilityTimerRef.current) {
         window.clearTimeout(roomVisibilityTimerRef.current);
       }
-      if (emitPendingMultiplayerCreateRef.current === emitPendingMultiplayerCreate) {
-        emitPendingMultiplayerCreateRef.current = null;
+      if (reconcilePendingMultiplayerCreateRef.current === reconcilePendingMultiplayerCreate) {
+        reconcilePendingMultiplayerCreateRef.current = null;
       }
       nextSocket.disconnect();
     };
-  }, [applyServerBoard, authPayload, clearLocalGame, redirectTo, showToast, socketRouteActive]);
+  }, [
+    applyServerBoard,
+    authPayload,
+    authSession,
+    clearLocalGame,
+    location.pathname,
+    redirectTo,
+    resetMultiplayerCreationTracking,
+    showToast,
+    socketRouteActive,
+  ]);
 
   useEffect(() => {
     if (routePath !== AI_WAITING_PATH || !aiWaitingQueueId || !socketClient?.connected) {
@@ -1692,10 +2029,13 @@ function App() {
     }
     const checkWaitingRoom = () => {
       const waitingSession = loadAiWaitingSession();
-      socketClient.emit("check_ai_waiting", authPayload({
-        queueId: aiWaitingQueueId,
-        difficulty: waitingSession?.difficulty || selectedDifficulty,
-      }));
+      socketClient.emit(
+        "check_ai_waiting",
+        authPayload({
+          queueId: aiWaitingQueueId,
+          difficulty: waitingSession?.difficulty || selectedDifficulty,
+        }),
+      );
     };
     const intervalId = window.setInterval(checkWaitingRoom, 20000);
     return () => window.clearInterval(intervalId);
@@ -1735,19 +2075,21 @@ function App() {
     setGameStarted(false);
     setBusy(true);
 
-    const existingPendingGame = loadPendingGame();
-    const requestId = existingPendingGame?.mode === GAME_MODE_MULTIPLAYER && existingPendingGame.requestId
-      ? existingPendingGame.requestId
-      : createMultiplayerRequestId();
-    const pendingGame = savePendingGame(GAME_MODE_MULTIPLAYER, null, accountName, requestId);
+    const profileId = authSession.user?.id || "";
+    const existingPendingGame = loadPendingGame(profileId);
+    const requestId =
+      existingPendingGame?.mode === GAME_MODE_MULTIPLAYER && existingPendingGame.requestId
+        ? existingPendingGame.requestId
+        : createMultiplayerRequestId();
+    const pendingGame = savePendingGame(GAME_MODE_MULTIPLAYER, null, accountName, requestId, profileId);
 
-    if (!socketClient?.connected || !emitPendingMultiplayerCreateRef.current) {
+    if (!socketClient?.connected || !reconcilePendingMultiplayerCreateRef.current) {
       setMessage("Connecting to create multiplayer room...");
       socketClient?.connect();
       return;
     }
 
-    emitPendingMultiplayerCreateRef.current(pendingGame);
+    reconcilePendingMultiplayerCreateRef.current(pendingGame);
   }
 
   function joinMultiplayerGame(requestedGameIdOverride = "", publicJoin = false) {
@@ -1767,7 +2109,7 @@ function App() {
     clearSession();
     clearMultiplayerSession();
     clearPendingGame();
-    multiplayerCreateInFlightRequestRef.current = "";
+    resetMultiplayerCreationTracking();
     setGameMode(GAME_MODE_MULTIPLAYER);
     setPlayerNumber(null);
     setAiNumber(AI);
@@ -1783,7 +2125,10 @@ function App() {
     setMessage("Joining multiplayer room...");
     setGameStarted(false);
     setBusy(true);
-    socketClient.emit("join_multiplayer_game", authPayload({ gameId: requestedGameId, publicJoin, playerName: accountName }));
+    socketClient.emit(
+      "join_multiplayer_game",
+      authPayload({ gameId: requestedGameId, publicJoin, playerName: accountName }),
+    );
   }
 
   function requestPublicGames() {
@@ -1904,7 +2249,7 @@ function App() {
     clearSession();
     clearMultiplayerSession();
     clearPendingGame();
-    multiplayerCreateInFlightRequestRef.current = "";
+    resetMultiplayerCreationTracking();
     clearLocalGame();
     setSelectedDifficulty(difficulty);
     setSelectedSetupMode(GAME_MODE_AI);
@@ -1918,14 +2263,14 @@ function App() {
     clearSession();
     clearMultiplayerSession();
     clearPendingGame();
-    multiplayerCreateInFlightRequestRef.current = "";
+    resetMultiplayerCreationTracking();
     clearLocalGame();
     setSelectedSetupMode(GAME_MODE_MULTIPLAYER);
   }
 
   function showJoinGamePage() {
     clearPendingGame();
-    multiplayerCreateInFlightRequestRef.current = "";
+    resetMultiplayerCreationTracking();
     redirectTo(JOIN_PATH);
   }
 
@@ -1940,41 +2285,57 @@ function App() {
     redirectTo(SETUP_PATH, true);
   }
 
-  const playColumn = useCallback((column) => {
-    if (!gameStarted || busy || gameOver || status !== "playing") {
-      return;
-    }
+  const playColumn = useCallback(
+    (column) => {
+      if (!gameStarted || busy || gameOver || status !== "playing") {
+        return;
+      }
 
-    if (gameMode === GAME_MODE_MULTIPLAYER) {
-      if (!socketClient?.connected || !gameId || !playerId || playerNumber !== currentPlayer) {
+      if (gameMode === GAME_MODE_MULTIPLAYER) {
+        if (!socketClient?.connected || !gameId || !playerId || playerNumber !== currentPlayer) {
+          return;
+        }
+
+        setBusy(true);
+        setMessage("Waiting for server...");
+        socketClient.emit("player_move", authPayload({ gameId, playerId, column }));
+        return;
+      }
+
+      const humanPiece = playerNumber || PLAYER;
+      if (!socketClient?.connected || !gameId || !playerId || currentPlayer !== humanPiece) {
         return;
       }
 
       setBusy(true);
-      setMessage("Waiting for server...");
+      setMessage("AI is thinking...");
+      const playerBoard = applyLocalMove(board, column, humanPiece);
+      const playerPieces = findChangedPieces(board, playerBoard);
+      pendingMoveRef.current = {
+        board: playerBoard,
+        startedAt: Date.now(),
+      };
+      setAnimatedPieces(playerPieces);
+      setAnimationRun((currentRun) => currentRun + 1);
+      setBoard(playerBoard);
+      setPlayerMoves((currentMoves) => [column, ...currentMoves]);
       socketClient.emit("player_move", authPayload({ gameId, playerId, column }));
-      return;
-    }
-
-    const humanPiece = playerNumber || PLAYER;
-    if (!socketClient?.connected || !gameId || !playerId || currentPlayer !== humanPiece) {
-      return;
-    }
-
-    setBusy(true);
-    setMessage("AI is thinking...");
-    const playerBoard = applyLocalMove(board, column, humanPiece);
-    const playerPieces = findChangedPieces(board, playerBoard);
-    pendingMoveRef.current = {
-      board: playerBoard,
-      startedAt: Date.now(),
-    };
-    setAnimatedPieces(playerPieces);
-    setAnimationRun((currentRun) => currentRun + 1);
-    setBoard(playerBoard);
-    setPlayerMoves((currentMoves) => [column, ...currentMoves]);
-    socketClient.emit("player_move", authPayload({ gameId, playerId, column }));
-  }, [authPayload, board, busy, currentPlayer, gameId, gameMode, gameOver, gameStarted, playerId, playerNumber, socketClient, status]);
+    },
+    [
+      authPayload,
+      board,
+      busy,
+      currentPlayer,
+      gameId,
+      gameMode,
+      gameOver,
+      gameStarted,
+      playerId,
+      playerNumber,
+      socketClient,
+      status,
+    ],
+  );
 
   useEffect(() => {
     function handleKeyDown(event) {
@@ -2023,7 +2384,7 @@ function App() {
     clearSession();
     clearMultiplayerSession();
     clearPendingGame();
-    multiplayerCreateInFlightRequestRef.current = "";
+    resetMultiplayerCreationTracking();
     window.location.replace(SETUP_PATH);
   }
 
@@ -2055,29 +2416,47 @@ function App() {
   }
 
   function openAuthModal(mode = "login") {
+    authTriggerRef.current = document.activeElement;
     setAuthMode(mode);
+    setAuthError("");
+    setAuthNotice("");
     setAuthOpen(true);
   }
 
   function closeAuthModal() {
     setAuthOpen(false);
     setAuthError("");
+    setAuthNotice("");
   }
 
   async function submitAuthForm(event) {
     event.preventDefault();
     setAuthError("");
+    setAuthNotice("");
 
     if (!supabaseClient) {
       setAuthError("Supabase auth is not configured");
       return;
     }
 
-    setAuthBusy(true);
     const email = authFields.email.trim();
     const password = authFields.password;
     const username = authFields.username.trim();
 
+    if (!email || !email.includes("@")) {
+      setAuthError("Enter a valid email address");
+      return;
+    }
+    if (!password) {
+      setAuthError("Password is required");
+      return;
+    }
+    if (authMode === "signup" && password.length < 6) {
+      setAuthError("Password must be at least 6 characters");
+      return;
+    }
+
+    setAuthBusy(true);
     try {
       if (authMode === "signup") {
         if (!username) {
@@ -2127,6 +2506,39 @@ function App() {
       if (routePath === LOGIN_PATH || routePath === SIGNUP_PATH) {
         redirectTo(SETUP_PATH, true);
       }
+    } catch {
+      setAuthError("Authentication is temporarily unavailable. Please try again.");
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function requestPasswordReset() {
+    setAuthError("");
+    setAuthNotice("");
+    if (!supabaseClient) {
+      setAuthError("Supabase auth is not configured");
+      return;
+    }
+
+    const email = authFields.email.trim();
+    if (!email || !email.includes("@")) {
+      setAuthError("Enter your email address first");
+      return;
+    }
+
+    setAuthBusy(true);
+    try {
+      const { error } = await supabaseClient.auth.resetPasswordForEmail(email, {
+        redirectTo: `${window.location.origin}${LOGIN_PATH}`,
+      });
+      if (error) {
+        setAuthError(error.message);
+        return;
+      }
+      setAuthNotice("Password reset email sent. Check your inbox for the login link.");
+    } catch {
+      setAuthError("Could not send a password reset email. Please try again.");
     } finally {
       setAuthBusy(false);
     }
@@ -2143,13 +2555,15 @@ function App() {
     clearMultiplayerSession();
     clearAiWaitingSession();
     clearPendingGame();
-    multiplayerCreateInFlightRequestRef.current = "";
+    resetMultiplayerCreationTracking();
     clearLocalGame();
     setAuthSession(null);
     redirectTo(LOGIN_PATH, true);
   }
 
   function updateAuthField(fieldName, value) {
+    setAuthError("");
+    setAuthNotice("");
     const sanitizers = {
       username: sanitizeUsernameInput,
       email: sanitizeEmailInput,
@@ -2162,6 +2576,28 @@ function App() {
     }));
   }
 
+  async function copyText(value, successMessage) {
+    try {
+      await navigator.clipboard.writeText(value);
+      showToast(successMessage, "success");
+    } catch {
+      showToast("Could not copy to your clipboard", "error");
+    }
+  }
+
+  function copyRoomInvite() {
+    if (!gameId) {
+      return;
+    }
+    const inviteUrl = `${window.location.origin}${JOIN_PATH}?room=${encodeURIComponent(gameId)}`;
+    copyText(inviteUrl, "Invite link copied");
+  }
+
+  function _copyGameResult() {
+    const resultText = `${displayMessage} — Connect 4${gameId ? ` (${formatRoomCode(gameId)})` : ""}`;
+    copyText(resultText, "Game result copied");
+  }
+
   const canDropPiece =
     gameStarted &&
     !busy &&
@@ -2169,13 +2605,7 @@ function App() {
     status === "playing" &&
     ((gameMode === GAME_MODE_AI && currentPlayer === (playerNumber || PLAYER)) ||
       (gameMode === GAME_MODE_MULTIPLAYER && playerNumber === currentPlayer && playersConnected === 2));
-  const showingSetup = routePath === SETUP_PATH;
-  const showingJoin = routePath === JOIN_PATH;
-  const showingAiWaiting = routePath === AI_WAITING_PATH;
   const showingGame = routePath === GAME_PATH;
-  const showingGameReview = routePath === GAME_REVIEW_PATH;
-  const showingProfile = routePath === PROFILE_PATH;
-  const showingLegalPage = routePath === TOS_PATH || routePath === PRIVACY_POLICY_PATH;
   let displayMessage = message;
   if (gameOver && gameMode === GAME_MODE_MULTIPLAYER && status !== "draw") {
     const winnerNumber = status === "player1_win" ? 1 : status === "player2_win" ? 2 : null;
@@ -2196,22 +2626,63 @@ function App() {
     displayMessage = `${message} Waiting ${disconnectSecondsLeft} seconds.`;
   }
 
-  const currentPlayerWon = gameOver && gameMode === GAME_MODE_MULTIPLAYER
-    && ((status === "player1_win" && playerNumber === 1) || (status === "player2_win" && playerNumber === 2));
+  const currentPlayerWon =
+    gameOver &&
+    gameMode === GAME_MODE_MULTIPLAYER &&
+    ((status === "player1_win" && playerNumber === 1) || (status === "player2_win" && playerNumber === 2));
   const statusClassName = currentPlayerWon
     ? "turn-status game-won"
-    : !gameOver && canDropPiece ? "turn-status your-turn" : "turn-status waiting-turn";
+    : !gameOver && canDropPiece
+      ? "turn-status your-turn"
+      : "turn-status waiting-turn";
   const canLeaveGame =
     gameStarted &&
     showingGame &&
     (gameMode !== GAME_MODE_MULTIPLAYER || (status === "waiting" && playersConnected === 1) || gameOver);
   const canRequestPlayAgain = gameStarted && gameMode === GAME_MODE_MULTIPLAYER && gameOver;
   const canTogglePublicRoom =
-    gameStarted && showingGame && gameMode === GAME_MODE_MULTIPLAYER && status === "waiting" && playersConnected === 1 && playerNumber === PLAYER;
-  const playerMoveLabel = gameMode === GAME_MODE_MULTIPLAYER ? "Your moves" : "Your moves";
-  const opponentMoveLabel = gameMode === GAME_MODE_MULTIPLAYER ? "Other player's moves" : "AI moves";
+    gameStarted &&
+    showingGame &&
+    gameMode === GAME_MODE_MULTIPLAYER &&
+    status === "waiting" &&
+    playersConnected === 1 &&
+    playerNumber === PLAYER;
   const isAuthenticated = Boolean(authSession);
-  const accountName = userProfile?.display_name || userProfile?.username || authSession?.user?.user_metadata?.username || "Account";
+  const accountName =
+    userProfile?.display_name || userProfile?.username || authSession?.user?.user_metadata?.username || "Account";
+  const playerOneName =
+    gameMode === GAME_MODE_MULTIPLAYER
+      ? multiplayerPlayerNames["1"] || (playerNumber === PLAYER ? "You" : "Opponent")
+      : playerNumber === PLAYER
+        ? accountName
+        : `${formatDifficulty(selectedDifficulty)} AI`;
+  const playerTwoName =
+    gameMode === GAME_MODE_MULTIPLAYER
+      ? multiplayerPlayerNames["2"] || (playerNumber === AI ? "You" : "Opponent")
+      : playerNumber === AI
+        ? accountName
+        : `${formatDifficulty(selectedDifficulty)} AI`;
+  const chronologicalPlayerMoves = [...playerMoves].reverse();
+  const chronologicalOpponentMoves = [...aiMoves].reverse();
+  const moveHistory = [];
+  const recordedMoveCount = chronologicalPlayerMoves.length + chronologicalOpponentMoves.length;
+  let playerMoveIndex = 0;
+  let opponentMoveIndex = 0;
+  for (let moveIndex = 0; moveIndex < recordedMoveCount; moveIndex += 1) {
+    const piece = moveIndex % 2 === 0 ? PLAYER : AI;
+    const isViewerMove = piece === (playerNumber || PLAYER);
+    const column = isViewerMove
+      ? chronologicalPlayerMoves[playerMoveIndex++]
+      : chronologicalOpponentMoves[opponentMoveIndex++];
+    if (column !== undefined) {
+      moveHistory.push({
+        turn: moveIndex + 1,
+        column,
+        piece,
+        owner: isViewerMove ? "You" : gameMode === GAME_MODE_MULTIPLAYER ? "Opponent" : "AI",
+      });
+    }
+  }
   const themeToggleLabel = theme === "dark" ? "Light" : "Dark";
   const toggleTheme = () => {
     setTheme((currentTheme) => (currentTheme === "dark" ? "light" : "dark"));
@@ -2224,7 +2695,11 @@ function App() {
           role="tab"
           aria-selected={authMode === "login"}
           className={authMode === "login" ? "selected" : ""}
-          onClick={() => setAuthMode("login")}
+          onClick={() => {
+            setAuthMode("login");
+            setAuthError("");
+            setAuthNotice("");
+          }}
         >
           Login
         </button>
@@ -2233,7 +2708,11 @@ function App() {
           role="tab"
           aria-selected={authMode === "signup"}
           className={authMode === "signup" ? "selected" : ""}
-          onClick={() => setAuthMode("signup")}
+          onClick={() => {
+            setAuthMode("signup");
+            setAuthError("");
+            setAuthNotice("");
+          }}
         >
           Sign up
         </button>
@@ -2251,7 +2730,11 @@ function App() {
               onChange={(event) => updateAuthField("username", event.target.value)}
               maxLength={USERNAME_MAX_LENGTH}
               inputMode="text"
+              pattern="[A-Za-z0-9_]+"
+              required
+              aria-invalid={Boolean(authError)}
             />
+            <small>Letters, numbers, and underscores only.</small>
           </label>
         ) : null}
         <label>
@@ -2264,23 +2747,53 @@ function App() {
             value={authFields.email}
             onChange={(event) => updateAuthField("email", event.target.value)}
             maxLength={EMAIL_MAX_LENGTH}
+            required
+            aria-invalid={Boolean(authError)}
           />
         </label>
         <label>
           Password
-          <input
-            type="password"
-            name="password"
-            autoComplete={authMode === "signup" ? "new-password" : "current-password"}
-            placeholder="Password"
-            value={authFields.password}
-            onChange={(event) => updateAuthField("password", event.target.value)}
-            maxLength={PASSWORD_MAX_LENGTH}
-          />
+          <span className="password-field">
+            <input
+              type={showPassword ? "text" : "password"}
+              name="password"
+              autoComplete={authMode === "signup" ? "new-password" : "current-password"}
+              placeholder="Password"
+              value={authFields.password}
+              onChange={(event) => updateAuthField("password", event.target.value)}
+              maxLength={PASSWORD_MAX_LENGTH}
+              minLength={authMode === "signup" ? 6 : undefined}
+              required
+              aria-invalid={Boolean(authError)}
+            />
+            <button
+              className="password-visibility-button"
+              type="button"
+              onClick={() => setShowPassword((visible) => !visible)}
+              aria-label={showPassword ? "Hide password" : "Show password"}
+            >
+              {showPassword ? "Hide" : "Show"}
+            </button>
+          </span>
+          {authMode === "signup" ? <small>Use at least 6 characters.</small> : null}
         </label>
-        {authError ? <strong className="auth-error">{authError}</strong> : null}
+        {authError ? (
+          <strong className="auth-error" role="alert">
+            {authError}
+          </strong>
+        ) : null}
+        {authNotice ? (
+          <strong className="auth-notice" role="status">
+            {authNotice}
+          </strong>
+        ) : null}
+        {authMode === "login" ? (
+          <button className="forgot-password-button" type="button" onClick={requestPasswordReset} disabled={authBusy}>
+            Forgot password?
+          </button>
+        ) : null}
         <button className="auth-submit-button" type="submit" disabled={authBusy}>
-          {authMode === "signup" ? "Create account" : "Login"}
+          {authBusy ? "Please wait..." : authMode === "signup" ? "Create account" : "Login"}
         </button>
       </form>
     </>
@@ -2304,10 +2817,14 @@ function App() {
       <div>
         <span className="ai-waiting-eyebrow">AI waiting room</span>
         <h1>AI player is currently busy right now.</h1>
-        <p>Your position in line: <strong>{aiWaitingPosition || "-"}</strong></p>
+        <p>
+          Your position in line: <strong>{aiWaitingPosition || "-"}</strong>
+        </p>
         <small>(checked every 20s)</small>
       </div>
-      <button type="button" onClick={leaveAiWaitingRoom}>Leave waiting room</button>
+      <button type="button" onClick={leaveAiWaitingRoom}>
+        Leave waiting room
+      </button>
     </section>
   );
   const setupView = !authReady ? (
@@ -2373,9 +2890,15 @@ function App() {
         </div>
       </div>
       <div className="setup-tips" aria-label="Game tips">
-        <span><strong>01</strong> Pick a mode</span>
-        <span><strong>02</strong> Connect four pieces</span>
-        <span><strong>03</strong> Review completed games</span>
+        <span>
+          <strong>01</strong> Pick a mode
+        </span>
+        <span>
+          <strong>02</strong> Connect four pieces
+        </span>
+        <span>
+          <strong>03</strong> Review completed games
+        </span>
       </div>
     </section>
   );
@@ -2440,15 +2963,15 @@ function App() {
       </section>
     </section>
   );
-  const loadingView = (
-    <GameLoadingSkeleton message={message} />
-  );
+  const loadingView = <GameLoadingSkeleton message={message} />;
   const profileReviewView = (
     <section className="profile-page profile-review-page">
       <div className="profile-header">
         <div>
           <span>Game review</span>
-          <strong>{reviewGame ? `${reviewWinnerLabel}${reviewGame.winnerName ? " Wins" : ""}` : "Completed game"}</strong>
+          <strong>
+            {reviewGame ? `${reviewWinnerLabel}${reviewGame.winnerName ? " Wins" : ""}` : "Completed game"}
+          </strong>
         </div>
         <div className="profile-review-actions">
           <button
@@ -2490,8 +3013,20 @@ function App() {
         </div>
         <div>
           <span>Move Order</span>
-          <strong className={reviewGame?.playerNumber === 1 ? "review-player-first" : reviewGame?.playerNumber === 2 ? "review-player-second" : ""}>
-            {reviewGame?.playerNumber === 1 ? "You moved first" : reviewGame?.playerNumber === 2 ? "You moved Second" : "-"}
+          <strong
+            className={
+              reviewGame?.playerNumber === 1
+                ? "review-player-first"
+                : reviewGame?.playerNumber === 2
+                  ? "review-player-second"
+                  : ""
+            }
+          >
+            {reviewGame?.playerNumber === 1
+              ? "You moved first"
+              : reviewGame?.playerNumber === 2
+                ? "You moved Second"
+                : "-"}
           </strong>
         </div>
       </section>
@@ -2510,50 +3045,70 @@ function App() {
         </section>
       ) : (
         <>
-          <div className="review-board-layout">
-            <button
-              className="review-navigation review-navigation-previous"
-              type="button"
-              onClick={() => setReviewMoveIndex((index) => Math.max(0, index - 1))}
-              disabled={reviewMoveIndex === 0}
-              aria-label="Previous move"
-            >
-              &lt;
-            </button>
-            <div className="board-area review-board-area">
-              <div className="board review-board" role="grid" aria-label={`Board after move ${reviewMoves[reviewMoveIndex].move_number}`}>
-                {reviewBoard.map((row, rowIndex) => (
-                  <div className="review-board-row" role="row" key={`review-board-row-${rowIndex}`}>
-                    {row.map((cell, columnIndex) => {
-                    const pieceKey = `${rowIndex}-${columnIndex}`;
-                    const isDropping = reviewAnimatedPieces.includes(pieceKey);
-                    const isWinning = reviewWinningPieces.includes(pieceKey);
+          <div className={`review-stage${reviewAnalysisAvailable && reviewAnalysisComplete ? " evaluated" : ""}`}>
+            {reviewAnalysisAvailable && reviewAnalysisComplete ? (
+              <EvaluationSummaryTable
+                playerNumber={1}
+                playerName={reviewGame?.playerNames?.["1"] || "Player 1"}
+                counts={reviewEvaluationCounts[1]}
+              />
+            ) : null}
+            <div className="review-board-layout">
+              <button
+                className="review-navigation review-navigation-previous"
+                type="button"
+                onClick={() => setReviewMoveIndex((index) => Math.max(0, index - 1))}
+                disabled={reviewMoveIndex === 0}
+                aria-label="Previous move"
+              >
+                &lt;
+              </button>
+              <div className="board-area review-board-area">
+                <div
+                  className="board review-board"
+                  role="grid"
+                  aria-label={`Board after move ${reviewMoves[reviewMoveIndex].move_number}`}
+                >
+                  {reviewBoard.map((row, rowIndex) => (
+                    <div className="review-board-row" role="row" key={`review-board-row-${rowIndex}`}>
+                      {row.map((cell, columnIndex) => {
+                        const pieceKey = `${rowIndex}-${columnIndex}`;
+                        const isDropping = reviewAnimatedPieces.includes(pieceKey);
+                        const isWinning = reviewWinningPieces.includes(pieceKey);
 
-                    return (
-                      <div
-                        key={pieceKey}
-                        className={`cell player-${cell}${isDropping ? " dropping" : ""}${isWinning ? " winning" : ""}`}
-                        style={isDropping ? { "--drop-start": `-${(rowIndex + 1) * 115}%` } : undefined}
-                        role="gridcell"
-                        aria-label={`Row ${rowIndex + 1}, column ${columnIndex + 1}`}
-                      >
-                        <span key={isDropping ? `review-drop-${reviewAnimationRun}` : "review-piece"} />
-                      </div>
-                    );
-                    })}
-                  </div>
-                ))}
+                        return (
+                          <div
+                            key={pieceKey}
+                            className={`cell player-${cell}${isDropping ? " dropping" : ""}${isWinning ? " winning" : ""}`}
+                            style={isDropping ? { "--drop-start": `-${(rowIndex + 1) * 115}%` } : undefined}
+                            role="gridcell"
+                            aria-label={`Row ${rowIndex + 1}, column ${columnIndex + 1}: ${getPieceLabel(cell)}${isWinning ? ", winning piece" : ""}`}
+                          >
+                            <span key={isDropping ? `review-drop-${reviewAnimationRun}` : "review-piece"} />
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ))}
+                </div>
               </div>
+              <button
+                className="review-navigation review-navigation-next"
+                type="button"
+                onClick={() => setReviewMoveIndex((index) => Math.min(reviewMoves.length - 1, index + 1))}
+                disabled={reviewMoveIndex === reviewMoves.length - 1}
+                aria-label="Next move"
+              >
+                &gt;
+              </button>
             </div>
-            <button
-              className="review-navigation review-navigation-next"
-              type="button"
-              onClick={() => setReviewMoveIndex((index) => Math.min(reviewMoves.length - 1, index + 1))}
-              disabled={reviewMoveIndex === reviewMoves.length - 1}
-              aria-label="Next move"
-            >
-              &gt;
-            </button>
+            {reviewAnalysisAvailable && reviewAnalysisComplete ? (
+              <EvaluationSummaryTable
+                playerNumber={2}
+                playerName={reviewGame?.playerNames?.["2"] || "Player 2"}
+                counts={reviewEvaluationCounts[2]}
+              />
+            ) : null}
           </div>
           <div className="review-move-list" aria-label="Game moves">
             {splitIntoRows(reviewMoves, 10).map((row, rowIndex) => (
@@ -2561,7 +3116,9 @@ function App() {
                 {row.map((move, index) => {
                   const moveIndex = rowIndex * 10 + index;
                   const moveOwner = reviewGame?.playerNumber
-                    ? move.player_number === reviewGame.playerNumber ? "You" : "Opponent"
+                    ? move.player_number === reviewGame.playerNumber
+                      ? "You"
+                      : "Opponent"
                     : `Player ${move.player_number}`;
                   return (
                     <span className="review-move-entry" key={move.move_number}>
@@ -2575,7 +3132,11 @@ function App() {
                         <span>{moveOwner}</span>
                         <span>{move.move_number}</span>
                       </button>
-                      {index < row.length - 1 ? <span className="review-move-separator" aria-hidden="true">&gt;</span> : null}
+                      {index < row.length - 1 ? (
+                        <span className="review-move-separator" aria-hidden="true">
+                          &gt;
+                        </span>
+                      ) : null}
                     </span>
                   );
                 })}
@@ -2592,9 +3153,7 @@ function App() {
                 tabIndex={0}
               >
                 <table className="review-evaluation-table">
-                  <caption className="sr-only">
-                    Move feedback for each turn
-                  </caption>
+                  <caption className="sr-only">Move feedback for each turn</caption>
                   <thead>
                     <tr>
                       <th scope="col">Turn</th>
@@ -2612,7 +3171,9 @@ function App() {
                           key={`evaluation-${move.move_number}`}
                           aria-current={isCurrentMove ? "step" : undefined}
                         >
-                          <th scope="row" data-label="Turn">Turn {move.move_number}</th>
+                          <th scope="row" data-label="Turn">
+                            Turn {move.move_number}
+                          </th>
                           <td data-label="Move">{getReviewMoveLabel(move, reviewGame?.playerNumber)}</td>
                           <td className={!feedback ? "review-evaluation-unavailable" : undefined} data-label="Feedback">
                             {feedback || "Unavailable"}
@@ -2674,7 +3235,11 @@ function App() {
           {profileGames.map((game) => (
             <article className="profile-game-row" key={game.id}>
               <div>
-                <span>{game.mode === GAME_MODE_MULTIPLAYER ? "Vs Player" : `AI - ${formatDifficulty(game.difficulty || DEFAULT_DIFFICULTY)}`}</span>
+                <span>
+                  {game.mode === GAME_MODE_MULTIPLAYER
+                    ? "Vs Player"
+                    : `AI - ${formatDifficulty(game.difficulty || DEFAULT_DIFFICULTY)}`}
+                </span>
                 <strong>{game.result}</strong>
               </div>
               <div>
@@ -2698,35 +3263,52 @@ function App() {
   );
   const gameView = (
     <>
-      <section className="status-panel">
-        <div>
-          <span>Status</span>
-          <strong className={statusClassName}>{displayMessage}</strong>
+      <section className="match-header" aria-label="Players and current turn">
+        <article className={`player-chip player-one${currentPlayer === PLAYER && !gameOver ? " active" : ""}`}>
+          <span className="piece-indicator" aria-hidden="true" />
+          <div>
+            <small>Player 1{playerNumber === PLAYER ? " · You" : ""}</small>
+            <strong>{playerOneName}</strong>
+          </div>
+        </article>
+        <div className={`match-turn-card ${statusClassName}`} aria-live="polite">
+          <span>{gameOver ? "Match complete" : status === "waiting" ? "Waiting room" : "Current turn"}</span>
+          <strong>{displayMessage}</strong>
         </div>
-        <div>
-          <span>Game Mode</span>
-          <strong>
-            {gameMode === GAME_MODE_MULTIPLAYER
-              ? `Vs Player - Player ${playerNumber || "-"}`
-              : `AI - ${formatDifficulty(selectedDifficulty)}`}
-          </strong>
-        </div>
-        <div>
-          <span>Room</span>
-          <strong>{gameId || "-"}</strong>
-        </div>
+        <article className={`player-chip player-two${currentPlayer === AI && !gameOver ? " active" : ""}`}>
+          <span className="piece-indicator" aria-hidden="true" />
+          <div>
+            <small>Player 2{playerNumber === AI ? " · You" : ""}</small>
+            <strong>{playerTwoName}</strong>
+          </div>
+        </article>
       </section>
 
-      <section className="play-layout">
-        <aside className="move-column">
-          <span>{playerMoveLabel}</span>
-          {playerMoves.length === 0 ? (
-            <strong>-</strong>
-          ) : (
-            playerMoves.map((move, index) => <strong key={`player-${index}`}>{move + 1}</strong>)
-          )}
-        </aside>
+      <details className="match-details">
+        <summary>
+          <span>Match details</span>
+          <strong>{formatRoomCode(gameId)}</strong>
+        </summary>
+        <div className="match-details-content">
+          <div>
+            <span>Mode</span>
+            <strong>
+              {gameMode === GAME_MODE_MULTIPLAYER ? "Vs Player" : `AI · ${formatDifficulty(selectedDifficulty)}`}
+            </strong>
+          </div>
+          <div>
+            <span>Full match ID</span>
+            <code>{gameId || "-"}</code>
+          </div>
+          {gameMode === GAME_MODE_MULTIPLAYER && gameId ? (
+            <button type="button" onClick={copyRoomInvite}>
+              Copy invite link
+            </button>
+          ) : null}
+        </div>
+      </details>
 
+      <section className="play-layout">
         <div className="board-area">
           <div className="column-controls" aria-label="Choose a column">
             {Array.from({ length: COLS }, (_, column) => (
@@ -2743,107 +3325,278 @@ function App() {
           </div>
 
           <div className="board" role="grid" aria-label="Connect 4 board">
-            {board.flatMap((row, rowIndex) =>
-              row.map((cell, columnIndex) => {
-                const pieceKey = `${rowIndex}-${columnIndex}`;
-                const isDropping = animatedPieces.includes(pieceKey);
-                const isWinning = winningPieces.includes(pieceKey);
+            {board.map((row, rowIndex) => (
+              <div className="board-row" role="row" key={`board-row-${rowIndex}`}>
+                {row.map((cell, columnIndex) => {
+                  const pieceKey = `${rowIndex}-${columnIndex}`;
+                  const isDropping = animatedPieces.includes(pieceKey);
+                  const isWinning = winningPieces.includes(pieceKey);
 
-                return (
-                  <button
-                    key={pieceKey}
-                    type="button"
-                    className={`cell player-${cell}${isDropping ? " dropping" : ""}${isWinning ? " winning" : ""}`}
-                    style={isDropping ? { "--drop-start": `-${(rowIndex + 1) * 115}%` } : undefined}
-                    onClick={() => playColumn(columnIndex)}
-                    disabled={!canDropPiece}
-                    aria-label={`Row ${rowIndex + 1}, column ${columnIndex + 1}`}
-                  >
-                    <span key={isDropping ? `drop-${animationRun}` : "piece"} />
-                  </button>
-                );
-              }),
-            )}
+                  return (
+                    <div
+                      key={pieceKey}
+                      className={`cell player-${cell}${isDropping ? " dropping" : ""}${isWinning ? " winning" : ""}`}
+                      style={isDropping ? { "--drop-start": `-${(rowIndex + 1) * 115}%` } : undefined}
+                      role="gridcell"
+                      aria-label={`Row ${rowIndex + 1}, column ${columnIndex + 1}: ${getPieceLabel(cell)}${isWinning ? ", winning piece" : ""}`}
+                    >
+                      <span key={isDropping ? `drop-${animationRun}` : "piece"} />
+                    </div>
+                  );
+                })}
+              </div>
+            ))}
           </div>
         </div>
 
-        <aside className="move-column">
-          <span>{opponentMoveLabel}</span>
-          {aiMoves.length === 0 ? (
-            <strong>-</strong>
+        <details className="move-history-panel">
+          <summary>
+            Move history <span>{moveHistory.length}</span>
+          </summary>
+          {moveHistory.length === 0 ? (
+            <p>No moves yet. Choose a column to begin.</p>
           ) : (
-            aiMoves.map((move, index) => <strong key={`ai-${index}`}>{move + 1}</strong>)
+            <ol className="move-history-list">
+              {moveHistory.map((move) => (
+                <li className={`player-${move.piece}`} key={`${move.turn}-${move.column}`}>
+                  <span>Turn {move.turn}</span>
+                  <strong>{move.owner}</strong>
+                  <span>Column {move.column + 1}</span>
+                </li>
+              ))}
+            </ol>
           )}
-        </aside>
+        </details>
       </section>
+
+      {gameOver ? (
+        <section className="game-result-panel" aria-labelledby="game-result-title">
+          <span>Game over</span>
+          <h2 id="game-result-title">{displayMessage}</h2>
+          <p>{status === "draw" ? "A perfectly balanced board." : "Review the match or start another round."}</p>
+          <div>
+            {gameMode === GAME_MODE_MULTIPLAYER ? (
+              <button type="button" onClick={requestPlayAgain} disabled={busy || playAgainRequested}>
+                {playAgainRequested ? `Rematch requested · ${playAgainAccepted}/2` : "Request rematch"}
+              </button>
+            ) : (
+              <button type="button" onClick={requestNewGame} disabled={busy}>
+                Play again
+              </button>
+            )}
+            <button type="button" onClick={() => redirectTo(gameReviewPath(gameId))}>
+              Review match
+            </button>
+            <button type="button" onClick={returnToMainMenu}>
+              Main menu
+            </button>
+          </div>
+        </section>
+      ) : null}
     </>
   );
-  const actionBar = gameStarted && showingGame ? (
-    <section className="game-actionbar" aria-label="Game actions">
-      {gameMode !== GAME_MODE_MULTIPLAYER ? (
-        <button type="button" onClick={requestNewGame} disabled={busy}>
-          Reset
-        </button>
-      ) : null}
-      {canRequestPlayAgain ? (
-        <button type="button" onClick={requestPlayAgain} disabled={busy || playAgainRequested}>
-          Play again {playAgainAccepted}/2
-        </button>
-      ) : null}
-      {canTogglePublicRoom ? (
-        <button
-          className="public-room-toggle"
-          type="button"
-          aria-pressed={isRoomPublic}
-          onClick={togglePublicRoom}
-          disabled={busy || roomVisibilityPending || roomVisibilityCooldown}
-        >
-          <span>Make Room Public</span>
-          <input type="checkbox" checked={isRoomPublic} readOnly tabIndex={-1} aria-hidden="true" />
-        </button>
-      ) : null}
-      {canLeaveGame ? (
-        <button className="leave-game-button" type="button" onClick={leaveGame} disabled={busy}>
-          Leave
-        </button>
-      ) : null}
-    </section>
-  ) : null;
+  const actionBar =
+    gameStarted && showingGame && !gameOver ? (
+      <section className="game-actionbar" aria-label="Game actions">
+        {gameMode !== GAME_MODE_MULTIPLAYER ? (
+          <button type="button" onClick={requestNewGame} disabled={busy}>
+            Reset
+          </button>
+        ) : null}
+        {canRequestPlayAgain ? (
+          <button type="button" onClick={requestPlayAgain} disabled={busy || playAgainRequested}>
+            Play again {playAgainAccepted}/2
+          </button>
+        ) : null}
+        {canTogglePublicRoom ? (
+          <button
+            className="public-room-toggle"
+            type="button"
+            aria-pressed={isRoomPublic}
+            onClick={togglePublicRoom}
+            disabled={busy || roomVisibilityPending || roomVisibilityCooldown}
+          >
+            <span>Make Room Public</span>
+            <input type="checkbox" checked={isRoomPublic} readOnly tabIndex={-1} aria-hidden="true" />
+          </button>
+        ) : null}
+        {canLeaveGame ? (
+          <button className="leave-game-button" type="button" onClick={leaveGame} disabled={busy}>
+            Leave
+          </button>
+        ) : null}
+      </section>
+    ) : null;
   const notFoundView = (
     <section className="blank-page not-found-page" aria-label="Page not found">
       <h1>404</h1>
       <p>Page not found. Returning home in 3 seconds.</p>
     </section>
   );
-  const legalView = <section className="blank-page" aria-label={routePath === TOS_PATH ? "Terms of Service" : "Privacy Policy"} />;
-  let pageView = setupView;
-  if (!authReady && (showingSetup || showingGame || showingGameReview || showingProfile || showingAiWaiting)) {
-    pageView = loadingView;
-  } else if (routePath === LOGIN_PATH || routePath === SIGNUP_PATH) {
-    pageView = authPageView;
-  } else if (showingGame && !isAuthenticated) {
-    pageView = authRequiredView;
-  } else if (showingGame) {
-    pageView = gameStarted ? gameView : loadingView;
-  } else if (showingAiWaiting && !isAuthenticated) {
-    pageView = authRequiredView;
-  } else if (showingAiWaiting) {
-    pageView = aiWaitingView;
-  } else if (showingGameReview && !isAuthenticated) {
-    pageView = authRequiredView;
-  } else if (showingJoin) {
-    pageView = joinGameView;
-  } else if (showingProfile && !isAuthenticated) {
-    pageView = authRequiredView;
-  } else if (showingGameReview) {
-    pageView = profileReviewView;
-  } else if (showingProfile) {
-    pageView = profileView;
-  } else if (showingLegalPage) {
-    pageView = legalView;
-  } else if (routePath === NOT_FOUND_PATH) {
-    pageView = notFoundView;
-  }
+  const informationPages = {
+    [TOS_PATH]: {
+      eyebrow: "Legal",
+      title: "Terms of Service",
+      intro:
+        "These terms explain the basic rules for using Connect 4. By creating an account or playing a match, you agree to use the service responsibly.",
+      sections: [
+        [
+          "Using the service",
+          "Connect 4 is provided for personal entertainment and learning. You are responsible for activity on your account and for keeping your login credentials private.",
+        ],
+        [
+          "Fair play and conduct",
+          "Do not disrupt matches, impersonate other players, abuse public rooms, probe the service for vulnerabilities, or use automation that harms other players or the service.",
+        ],
+        [
+          "Availability and game data",
+          "Matches, ratings, analysis, and saved history may be delayed, interrupted, corrected, or removed when needed to operate and improve the service.",
+        ],
+        [
+          "Accounts",
+          "Accounts may be limited or removed when they are used to harm the service or other players. You may stop using Connect 4 at any time.",
+        ],
+        [
+          "Disclaimer",
+          "Connect 4 is provided as-is without a guarantee that it will always be available or error-free. To the extent allowed by law, the creator is not liable for indirect losses resulting from use of the service.",
+        ],
+        [
+          "Changes",
+          "These terms may be updated as the project evolves. Material changes will be reflected on this page.",
+        ],
+      ],
+    },
+    [PRIVACY_POLICY_PATH]: {
+      eyebrow: "Legal",
+      title: "Privacy Policy",
+      intro:
+        "This policy describes the information Connect 4 uses to provide accounts, multiplayer matches, saved history, and game analysis.",
+      sections: [
+        [
+          "Information collected",
+          "Connect 4 stores account details such as your email and username, gameplay records, room participation, match results, move history, and basic technical information needed to keep the service secure and reliable.",
+        ],
+        [
+          "How information is used",
+          "Information is used to authenticate players, operate live games, save profiles and match history, generate requested analysis, prevent abuse, and diagnose service problems.",
+        ],
+        [
+          "Service providers",
+          "Supabase provides authentication and database services. Hosting and networking providers may process limited technical data while delivering the application.",
+        ],
+        [
+          "Sharing",
+          "Personal information is not sold. Information is shared only with service providers needed to operate Connect 4, when required by law, or when needed to protect users and the service.",
+        ],
+        [
+          "Retention and choices",
+          "Gameplay and account data is kept while it supports the service. You may request access, correction, or deletion through the contact page.",
+        ],
+        [
+          "Children",
+          "Connect 4 is not intended for children under 13, and the service does not knowingly collect their personal information.",
+        ],
+      ],
+    },
+    [ABOUT_PATH]: {
+      eyebrow: "The project",
+      title: "About Connect 4",
+      intro:
+        "Connect 4 is a full-stack take on the classic strategy game, built by Michael D to explore real-time multiplayer, game AI, and useful post-game feedback.",
+      sections: [
+        [
+          "Play your way",
+          "Challenge the minimax-powered AI at four difficulty levels or create a live room for another authenticated player.",
+        ],
+        [
+          "Learn from completed games",
+          "Saved matches can be replayed move by move, and players can request shared move feedback after a game ends.",
+        ],
+        [
+          "Built in public",
+          "The project source, setup documentation, API notes, and development history are available in the public repository.",
+        ],
+      ],
+    },
+    [CONTACT_PATH]: {
+      eyebrow: "Support",
+      title: "Contact",
+      intro:
+        "For bugs, account questions, privacy requests, or feature suggestions, open an issue in the project repository.",
+      sections: [
+        [
+          "Before reporting a bug",
+          "Include what you expected, what happened, the browser or device you used, and steps that reproduce the problem. Do not include passwords, access tokens, or other sensitive information.",
+        ],
+        [
+          "Response expectations",
+          "This is an independently maintained project, so response times may vary. Security and privacy reports receive priority.",
+        ],
+      ],
+    },
+  };
+  const informationPage = informationPages[routePath];
+  const informationView = informationPage ? (
+    <article className="information-page" aria-labelledby="information-page-title">
+      <header>
+        <span>{informationPage.eyebrow}</span>
+        <h1 id="information-page-title">{informationPage.title}</h1>
+        <p>{informationPage.intro}</p>
+        <small>Last updated July 15, 2026</small>
+      </header>
+      <div className="information-sections">
+        {informationPage.sections.map(([title, content]) => (
+          <section key={title}>
+            <h2>{title}</h2>
+            <p>{content}</p>
+          </section>
+        ))}
+      </div>
+      {routePath === ABOUT_PATH || routePath === CONTACT_PATH ? (
+        <a
+          className="repository-button"
+          href="https://github.com/Michaeldo2004/Connect4web"
+          target="_blank"
+          rel="noreferrer"
+        >
+          {routePath === CONTACT_PATH ? "Open the repository" : "View source code"}
+        </a>
+      ) : null}
+    </article>
+  ) : null;
+  const authenticatedGameView = !authReady
+    ? loadingView
+    : !isAuthenticated
+      ? authRequiredView
+      : gameStarted
+        ? gameView
+        : loadingView;
+  const authenticatedWaitingView = !authReady ? loadingView : isAuthenticated ? aiWaitingView : authRequiredView;
+  const authenticatedProfileView = !authReady ? loadingView : isAuthenticated ? profileView : authRequiredView;
+  const authenticatedReviewView = !authReady ? loadingView : isAuthenticated ? profileReviewView : authRequiredView;
+
+  const routedView = (
+    <Suspense fallback={loadingView}>
+      <Routes>
+        <Route path={SETUP_PATH} element={!authReady ? loadingView : setupView} />
+        <Route path={LOGIN_PATH} element={<AuthRoute>{authPageView}</AuthRoute>} />
+        <Route path={SIGNUP_PATH} element={<AuthRoute>{authPageView}</AuthRoute>} />
+        <Route path={JOIN_PATH} element={joinGameView} />
+        <Route path={AI_WAITING_PATH} element={authenticatedWaitingView} />
+        <Route path={GAME_PATH} element={authenticatedGameView} />
+        <Route path={`${GAME_PATH}/:gameId`} element={authenticatedGameView} />
+        <Route path={GAME_REVIEW_PATH} element={<ReviewRoute>{authenticatedReviewView}</ReviewRoute>} />
+        <Route path={`${GAME_PATH}/:gameId/review`} element={<ReviewRoute>{authenticatedReviewView}</ReviewRoute>} />
+        <Route path={PROFILE_PATH} element={<ProfileRoute>{authenticatedProfileView}</ProfileRoute>} />
+        <Route path={TOS_PATH} element={informationView} />
+        <Route path={PRIVACY_POLICY_PATH} element={informationView} />
+        <Route path={ABOUT_PATH} element={informationView} />
+        <Route path={CONTACT_PATH} element={informationView} />
+        <Route path={NOT_FOUND_PATH} element={notFoundView} />
+        <Route path="*" element={notFoundView} />
+      </Routes>
+    </Suspense>
+  );
 
   return (
     <div className={`app-shell theme-${theme}`}>
@@ -2853,13 +3606,22 @@ function App() {
         </a>
         {isAuthenticated ? (
           <div className="account-actions">
-            <a className="auth-route-link" href={PROFILE_PATH} onClick={(event) => {
-              event.preventDefault();
-              redirectTo(PROFILE_PATH);
-            }}>
+            <a
+              className="auth-route-link"
+              href={PROFILE_PATH}
+              onClick={(event) => {
+                event.preventDefault();
+                redirectTo(PROFILE_PATH);
+              }}
+            >
               Profile
             </a>
-            <button className="theme-toggle-button" type="button" onClick={toggleTheme} aria-label={`Switch to ${themeToggleLabel.toLowerCase()} theme`}>
+            <button
+              className="theme-toggle-button"
+              type="button"
+              onClick={toggleTheme}
+              aria-label={`Switch to ${themeToggleLabel.toLowerCase()} theme`}
+            >
               {themeToggleLabel}
             </button>
             <span>{accountName}</span>
@@ -2869,7 +3631,12 @@ function App() {
           </div>
         ) : (
           <div className="account-actions">
-            <button className="theme-toggle-button" type="button" onClick={toggleTheme} aria-label={`Switch to ${themeToggleLabel.toLowerCase()} theme`}>
+            <button
+              className="theme-toggle-button"
+              type="button"
+              onClick={toggleTheme}
+              aria-label={`Switch to ${themeToggleLabel.toLowerCase()} theme`}
+            >
               {themeToggleLabel}
             </button>
             <a className="auth-route-link" href={LOGIN_PATH}>
@@ -2884,15 +3651,15 @@ function App() {
 
       <main className="page-shell">
         {actionBar}
-        <section className="game-area">{pageView}</section>
+        <section className="game-area">{routedView}</section>
       </main>
 
       <footer className="site-footer">
         <nav aria-label="Footer">
           <a href={PRIVACY_POLICY_PATH}>Privacy Policy</a>
           <a href={TOS_PATH}>Terms of Service</a>
-          <span>Contact</span>
-          <span>About</span>
+          <a href={CONTACT_PATH}>Contact</a>
+          <a href={ABOUT_PATH}>About</a>
           <a href="https://github.com/Michaeldo2004/Connect4web" target="_blank" rel="noreferrer">
             Repository
           </a>
@@ -2908,10 +3675,21 @@ function App() {
 
       {authOpen ? (
         <div className="modal-backdrop" role="presentation">
-          <section className="auth-modal" role="dialog" aria-modal="true" aria-labelledby="auth-modal-title">
+          <section
+            ref={authModalRef}
+            className="auth-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="auth-modal-title"
+          >
             <div className="auth-modal-header">
               <h2 id="auth-modal-title">{authMode === "signup" ? "Create account" : "Login"}</h2>
-              <button className="modal-close-button" type="button" onClick={closeAuthModal} aria-label="Close auth popup">
+              <button
+                className="modal-close-button"
+                type="button"
+                onClick={closeAuthModal}
+                aria-label="Close auth popup"
+              >
                 X
               </button>
             </div>

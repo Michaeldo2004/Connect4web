@@ -175,9 +175,10 @@ Create, join, move, reset, leave, and rematch events reject missing or invalid t
 create_game { difficulty, accessToken }
 join_game { gameId, playerId, accessToken }
 create_multiplayer_game { ownerName?, requestId?, accessToken }
+reconcile_multiplayer_creation { requestId, accessToken }
 list_public_games { accessToken }
 set_room_public { gameId, playerId, public, accessToken }
-join_multiplayer_game { gameId, playerId?, publicJoin?, accessToken }
+join_multiplayer_game { gameId, playerId?, requestId?, publicJoin?, accessToken }
 player_move { gameId, playerId, column, accessToken }
 reset_game { gameId, playerId, difficulty?, accessToken }
 play_again { gameId, playerId, accessToken }
@@ -190,21 +191,22 @@ leave_game { gameId, playerId, accessToken }
 game_created { gameId, playerId, playerNumber, aiNumber, board, status, message, difficulty, mode, currentPlayer }
 game_joined { gameId, playerNumber?, aiNumber?, board, status, message, difficulty, mode, currentPlayer }
 multiplayer_game_created { gameId, playerId, playerNumber, playersConnected, board, status, message, mode, requestId?, recovered? }
-multiplayer_game_joined { gameId, playerId, playerNumber, playersConnected, board, status, message, mode }
+multiplayer_game_joined { gameId, playerId, playerNumber, playersConnected, board, status, message, mode, requestId? }
 board_updated { gameId, playerId?, playerNumber?, aiNumber?, board, status, message, aiMove, aiThinking?, difficulty, mode, currentPlayer?, playersConnected?, disconnectDeadline?, playAgainAccepted?, publicRoom? }
 play_again_updated { gameId, board, status, message, difficulty, mode, currentPlayer, playersConnected, playAgainAccepted }
 public_games { games: [{ gameId, ownerName }] }
 player_left { gameId, message }
 game_left { gameId }
 invalid_move { gameId, board, status, message, difficulty, mode }
-join_rejected { gameId, message }
-create_rejected { message, requestId? }
+join_rejected { gameId, message, requestId? }
+create_rejected { message, requestId?, code }
 ```
 
-`create_multiplayer_game` supports a Socket.IO acknowledgement. Clients should
-generate and retain one `requestId` for a room-creation attempt until the server
-acknowledges success or rejection. Retrying that ID as the same authenticated
-profile recovers the same active in-memory room instead of creating a duplicate.
+PvP creation uses an idempotent command followed by authoritative
+reconciliation. The client stores a `requestId` scoped to its authenticated
+profile, sends `create_multiplayer_game`, and retains the ID until a correlated
+`multiplayer_game_joined` event arrives. A create event or acknowledgement only
+causes the client to reconcile; it is not the source of truth for navigation.
 
 Successful acknowledgement:
 
@@ -231,10 +233,39 @@ Rejected acknowledgement:
 }
 ```
 
+After any response loss, timeout, reconnect, or page reload, the client sends:
+
+```json
+{
+  "requestId": "client-generated-uuid",
+  "accessToken": "supabase-access-token"
+}
+```
+
+to `reconcile_multiplayer_creation`. A found response is:
+
+```json
+{
+  "ok": true,
+  "status": "found",
+  "requestId": "client-generated-uuid",
+  "gameId": "generated-game-id",
+  "playerId": "player-one-id"
+}
+```
+
+The client then emits `join_multiplayer_game` with those authoritative IDs and
+the same `requestId`. `status: "not_found"` causes the original create command
+to be retried with the same ID. Terminal states such as `cancelled`, `expired`,
+`completed`, and `invalid` reject the stale command rather than creating a new
+room under the same ID.
+
 The emitted `multiplayer_game_created` and `create_rejected` events remain
-available for compatibility. Request-ID recovery lasts for the lifetime of the
-active in-memory game state; it does not make live matches survive a backend
-restart.
+available for compatibility. With the
+`20260715_multiplayer_room_requests.sql` migration installed, the authenticated
+profile/request-to-room mapping survives backend restarts. Active boards and
+live matches remain in memory; durable hydration is intentionally limited to a
+waiting one-player room with no moves.
 
 ### `create_game`
 
@@ -297,11 +328,14 @@ Request:
 ```json
 {
   "ownerName": "Player",
+  "requestId": "client-generated-uuid",
   "accessToken": "supabase-access-token"
 }
 ```
 
-Response event: `multiplayer_game_created`
+The response event and acknowledgement remain `multiplayer_game_created`, but
+the current client reconciles the request and explicitly joins the returned
+authoritative room before navigating.
 
 ```json
 {

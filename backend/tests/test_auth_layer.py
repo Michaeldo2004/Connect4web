@@ -101,6 +101,23 @@ class AuthLayerTests(unittest.TestCase):
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.get_json()["message"], "Login required")
 
+    def test_profile_games_endpoint_returns_consistent_service_error(self):
+        app.config["AUTH_REQUIRED"] = True
+
+        with patch.object(app_module, "verify_access_token", return_value=({"profile_id": "user-123"}, None)):
+            with patch.object(
+                app_module.supabase_store,
+                "fetch_completed_games",
+                side_effect=RuntimeError("database unavailable"),
+            ):
+                response = app.test_client().get(
+                    "/api/profile/games",
+                    headers={"Authorization": "Bearer token"},
+                )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.get_json()["code"], "profile_games_unavailable")
+
     def test_profile_game_moves_endpoint_returns_authenticated_history(self):
         app.config["AUTH_REQUIRED"] = True
         expected_moves = [{"move_number": 1, "player_number": 1, "column_played": 3}]
@@ -111,7 +128,9 @@ class AuthLayerTests(unittest.TestCase):
         }
 
         with patch.object(app_module, "verify_access_token", return_value=({"profile_id": "user-123"}, None)):
-            with patch.object(app_module.supabase_store, "fetch_game_moves", return_value=expected_review) as fetch_moves:
+            with patch.object(
+                app_module.supabase_store, "fetch_game_moves", return_value=expected_review
+            ) as fetch_moves:
                 response = app.test_client().get(
                     "/api/profile/games/game-1/moves",
                     headers={"Authorization": "Bearer token"},
@@ -140,11 +159,12 @@ class AuthLayerTests(unittest.TestCase):
             "analysis_error": None,
         }
 
-        with patch.object(app_module, "verify_access_token", return_value=({"profile_id": "player-2"}, None)), patch.object(
-            app_module.supabase_store, "fetch_game_moves", return_value=review
-        ), patch.dict(app_module.analysis_jobs_by_game, {"shared-game": {"state": "running"}}, clear=True), patch.object(
-            app_module.supabase_store, "set_game_analysis_status"
-        ) as set_status:
+        with (
+            patch.object(app_module, "verify_access_token", return_value=({"profile_id": "player-2"}, None)),
+            patch.object(app_module.supabase_store, "fetch_game_moves", return_value=review),
+            patch.dict(app_module.analysis_jobs_by_game, {"shared-game": {"state": "running"}}, clear=True),
+            patch.object(app_module.supabase_store, "set_game_analysis_status") as set_status,
+        ):
             response = app.test_client().get(
                 "/api/profile/games/shared-game/moves",
                 headers={"Authorization": "Bearer token"},
@@ -163,9 +183,11 @@ class AuthLayerTests(unittest.TestCase):
             "analysis_error": None,
         }
 
-        with patch.object(app_module, "verify_access_token", return_value=({"profile_id": "player-2"}, None)), patch.object(
-            app_module.supabase_store, "fetch_game_moves", return_value=review
-        ), patch.object(app_module.supabase_store, "set_game_analysis_status", return_value=True) as set_status:
+        with (
+            patch.object(app_module, "verify_access_token", return_value=({"profile_id": "player-2"}, None)),
+            patch.object(app_module.supabase_store, "fetch_game_moves", return_value=review),
+            patch.object(app_module.supabase_store, "set_game_analysis_status", return_value=True) as set_status,
+        ):
             response = app.test_client().get(
                 "/api/profile/games/orphaned-game/moves",
                 headers={"Authorization": "Bearer token"},
@@ -199,8 +221,9 @@ class AuthLayerTests(unittest.TestCase):
     def test_profile_game_moves_endpoint_returns_json_when_store_is_unavailable(self):
         app.config["AUTH_REQUIRED"] = True
 
-        with patch.object(app_module, "verify_access_token", return_value=({"profile_id": "user-123"}, None)), patch.object(
-            app_module.supabase_store, "fetch_game_moves", side_effect=RuntimeError("database offline")
+        with (
+            patch.object(app_module, "verify_access_token", return_value=({"profile_id": "user-123"}, None)),
+            patch.object(app_module.supabase_store, "fetch_game_moves", side_effect=RuntimeError("database offline")),
         ):
             with self.assertLogs(app.logger, level="WARNING") as captured_logs:
                 response = app.test_client().get(
@@ -223,9 +246,11 @@ class AuthLayerTests(unittest.TestCase):
             "moves": [{"id": 10, "player_number": 1, "column_played": 3, "board_before": []}],
         }
 
-        with patch.object(app_module, "verify_access_token", return_value=({"profile_id": "user-123"}, None)), patch.object(
-            app_module.supabase_store, "fetch_game_analysis_source", return_value=source
-        ), patch.object(app_module.supabase_store, "set_game_analysis_status", return_value=True):
+        with (
+            patch.object(app_module, "verify_access_token", return_value=({"profile_id": "user-123"}, None)),
+            patch.object(app_module.supabase_store, "fetch_game_analysis_source", return_value=source),
+            patch.object(app_module.supabase_store, "set_game_analysis_status", return_value=True),
+        ):
             response = app.test_client().post(
                 "/api/profile/games/game-1/analysis",
                 headers={"Authorization": "Bearer token"},
@@ -243,11 +268,12 @@ class AuthLayerTests(unittest.TestCase):
             "moves": [{"id": 10}],
         }
 
-        with patch.object(app_module, "verify_access_token", return_value=({"profile_id": "user-123"}, None)), patch.object(
-            app_module.supabase_store, "fetch_game_analysis_source", return_value=source
-        ), patch.object(app_module, "enqueue_move_analysis") as enqueue_analysis, patch.object(
-            app_module.supabase_store, "set_game_analysis_status"
-        ) as set_status:
+        with (
+            patch.object(app_module, "verify_access_token", return_value=({"profile_id": "user-123"}, None)),
+            patch.object(app_module.supabase_store, "fetch_game_analysis_source", return_value=source),
+            patch.object(app_module, "enqueue_move_analysis") as enqueue_analysis,
+            patch.object(app_module.supabase_store, "set_game_analysis_status") as set_status,
+        ):
             response = app.test_client().post(
                 "/api/profile/games/game-1/analysis",
                 headers={"Authorization": "Bearer token"},
@@ -268,9 +294,11 @@ class AuthLayerTests(unittest.TestCase):
             "moves": [{"id": 10}],
         }
 
-        with patch.object(app_module, "verify_access_token", return_value=({"profile_id": "user-123"}, None)), patch.object(
-            app_module.supabase_store, "fetch_game_analysis_source", return_value=source
-        ), patch.object(app_module, "enqueue_move_analysis") as enqueue_analysis:
+        with (
+            patch.object(app_module, "verify_access_token", return_value=({"profile_id": "user-123"}, None)),
+            patch.object(app_module.supabase_store, "fetch_game_analysis_source", return_value=source),
+            patch.object(app_module, "enqueue_move_analysis") as enqueue_analysis,
+        ):
             response = app.test_client().post(
                 "/api/profile/games/game-1/analysis",
                 headers={"Authorization": "Bearer token"},
@@ -289,9 +317,11 @@ class AuthLayerTests(unittest.TestCase):
             "moves": [{"move_number": 2, "reconstructed": True}],
         }
 
-        with patch.object(app_module, "verify_access_token", return_value=({"profile_id": "user-123"}, None)), patch.object(
-            app_module.supabase_store, "fetch_game_analysis_source", return_value=source
-        ), patch.object(app_module, "enqueue_move_analysis") as enqueue_analysis:
+        with (
+            patch.object(app_module, "verify_access_token", return_value=({"profile_id": "user-123"}, None)),
+            patch.object(app_module.supabase_store, "fetch_game_analysis_source", return_value=source),
+            patch.object(app_module, "enqueue_move_analysis") as enqueue_analysis,
+        ):
             response = app.test_client().post(
                 "/api/profile/games/game-1/analysis",
                 headers={"Authorization": "Bearer token"},
@@ -310,9 +340,11 @@ class AuthLayerTests(unittest.TestCase):
             "moves": [{"id": 10, "player_number": 1, "column_played": 3, "board_before": []}],
         }
 
-        with patch.object(app_module, "verify_access_token", return_value=({"profile_id": "user-123"}, None)), patch.object(
-            app_module.supabase_store, "fetch_game_analysis_source", return_value=source
-        ), patch.object(app_module.supabase_store, "set_game_analysis_status", return_value=True) as set_status:
+        with (
+            patch.object(app_module, "verify_access_token", return_value=({"profile_id": "user-123"}, None)),
+            patch.object(app_module.supabase_store, "fetch_game_analysis_source", return_value=source),
+            patch.object(app_module.supabase_store, "set_game_analysis_status", return_value=True) as set_status,
+        ):
             response = app.test_client().post(
                 "/api/profile/games/game-1/analysis",
                 headers={"Authorization": "Bearer token"},

@@ -106,6 +106,15 @@ be evaluated again with truthful worst-move data and the current rating rules.
 Apply it before exposing move evaluation: it also removes the legacy direct
 read policy on `move_analysis`, keeping rating data server-only.
 
+For every existing database, also run
+`docs/migrations/20260715_multiplayer_room_requests.sql`. This migration is
+required for PvP creation recovery across backend restarts. It creates a
+server-only mapping keyed by authenticated profile and idempotency request,
+plus service-role-only transactional functions that create-or-return one room
+and preserve cancelled or expired request tombstones. Until it is installed,
+PvP still uses the in-memory fallback but cannot recover a pending creation
+after a backend restart.
+
 After migration, `GET /api/profile/games/{gameId}/moves` reports
 `analysis_available: true` and `analysis_unavailable_reason: null`. Before the
 migration, the compatibility fallback still returns board history but disables
@@ -127,6 +136,20 @@ select policyname, cmd
 from pg_policies
 where schemaname = 'public'
   and tablename = 'move_analysis';
+
+select table_name
+from information_schema.tables
+where table_schema = 'public'
+  and table_name = 'multiplayer_room_requests';
+
+select routine_name
+from information_schema.routines
+where routine_schema = 'public'
+  and routine_name in (
+    'claim_multiplayer_room_request',
+    'resolve_multiplayer_room_request'
+  )
+order by routine_name;
 ```
 
 When those env vars are set, Flask writes game rows, player rows, move rows, and final status updates to Supabase. If they are blank, the app runs without database persistence.

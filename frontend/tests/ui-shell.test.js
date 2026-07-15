@@ -135,27 +135,57 @@ test("review routes avoid live sockets and API failures are parsed safely", () =
   assert.match(appSource, /result\?\.status === "error"/);
 });
 
-test("multiplayer room creation is correlated, acknowledged, and recoverable", () => {
+test("multiplayer room creation persists a user-scoped command", () => {
   assert.match(appSource, /const MULTIPLAYER_CREATE_TIMEOUT_MS = 10000;/);
+  assert.match(appSource, /const MULTIPLAYER_RECONCILE_TERMINAL_STATUSES = new Set\(\["cancelled", "expired", "completed", "invalid"\]\);/);
   assert.match(appSource, /function createMultiplayerRequestId\(\)/);
   assert.match(appSource, /window\.crypto\?\.randomUUID/);
-  assert.match(appSource, /function savePendingGame\(mode, difficulty, ownerName = "", requestId = ""\)/);
-  assert.match(appSource, /const pendingGame = \{ mode, difficulty, ownerName, requestId \};/);
-  assert.match(appSource, /function loadPendingGame\(\)/);
+  assert.match(appSource, /function savePendingGame\(mode, difficulty, ownerName = "", requestId = "", profileId = ""\)/);
+  assert.match(appSource, /const pendingGame = \{ mode, difficulty, ownerName, requestId, profileId \};/);
+  assert.match(appSource, /function loadPendingGame\(expectedProfileId = ""\)/);
+  assert.match(appSource, /pendingGame\.mode === GAME_MODE_MULTIPLAYER[\s\S]*expectedProfileId[\s\S]*pendingGame\.profileId !== expectedProfileId[\s\S]*window\.sessionStorage\.removeItem\(PENDING_GAME_KEY\);[\s\S]*return null;/);
   assert.doesNotMatch(appSource, /function takePendingGame\(\)/);
   assert.match(appSource, /existingPendingGame\?\.mode === GAME_MODE_MULTIPLAYER && existingPendingGame\.requestId/);
-  assert.match(appSource, /savePendingGame\(GAME_MODE_MULTIPLAYER, null, accountName, requestId\)/);
-  assert.match(appSource, /function emitPendingMultiplayerCreate\(pendingGame = loadPendingGame\(\)\)/);
+  assert.match(appSource, /savePendingGame\(GAME_MODE_MULTIPLAYER, null, accountName, requestId, profileId\)/);
+  assert.match(appSource, /loadPendingGame\(authSession\?\.user\?\.id \|\| ""\)/);
+});
+
+test("multiplayer creation reconciles authoritatively before joining", () => {
+  assert.match(appSource, /function reconcilePendingMultiplayerCreate\(pendingGame = loadCurrentPendingGame\(\)\)/);
+  assert.match(appSource, /"reconcile_multiplayer_creation",\s*authPayload\(\{ requestId \}\)/);
+  assert.match(appSource, /reconciliationStatus === "found"[\s\S]*joinReconciledMultiplayerGame\(persistedGame, response\)/);
+  assert.match(appSource, /reconciliationStatus === "not_found"[\s\S]*emitPendingMultiplayerCreate\(persistedGame\)/);
+  assert.match(appSource, /function joinReconciledMultiplayerGame\(pendingGame, reconciliation\)/);
+  assert.match(appSource, /nextSocket\.emit\("join_multiplayer_game", authPayload\(\{\s*gameId: reconciliation\.gameId,\s*playerId: reconciliation\.playerId,\s*requestId,/);
+
+  const createdHandler = appSource.slice(
+    appSource.indexOf("function handleMultiplayerGameCreated"),
+    appSource.indexOf("function handleMultiplayerGameJoined"),
+  );
+  assert.match(createdHandler, /reconcilePendingMultiplayerCreate\(pendingGame\)/);
+  assert.doesNotMatch(createdHandler, /clearPendingGame|applyMultiplayerGameStarted/);
+
+  const joinedHandler = appSource.slice(
+    appSource.indexOf("function handleMultiplayerGameJoined"),
+    appSource.indexOf("function handleJoinRejected"),
+  );
+  assert.match(joinedHandler, /correlatedRequestId !== pendingGame\.requestId/);
+  assert.match(joinedHandler, /clearPendingGame\(correlatedRequestId\)/);
+  assert.match(joinedHandler, /applyMultiplayerGameStarted\(data\)/);
+});
+
+test("multiplayer reconciliation retains retryable work and clears terminal work", () => {
+  assert.match(appSource, /function emitPendingMultiplayerCreate\(pendingGame = loadCurrentPendingGame\(\)\)/);
   assert.match(appSource, /const persistedGame = savePendingGame\([\s\S]*requestId,[\s\S]*\);\s*multiplayerCreateInFlightRequestRef\.current = requestId;/);
   assert.match(appSource, /nextSocket\.timeout\(MULTIPLAYER_CREATE_TIMEOUT_MS\)\.emit\(\s*"create_multiplayer_game"/);
   assert.match(appSource, /authPayload\(\{ ownerName: persistedGame\.ownerName, requestId \}\)/);
-  assert.match(appSource, /if \(!response \|\| response\.ok === false\)/);
-  assert.match(appSource, /handleMultiplayerGameCreated\(response, requestId\)/);
+  assert.match(appSource, /reconcilePendingMultiplayerCreate\(currentPendingGame\)/);
   assert.match(appSource, /nextSocket\.on\("multiplayer_game_created", handleMultiplayerGameCreated\)/);
-  assert.match(appSource, /completedMultiplayerCreateRequestRef\.current === responseRequestId/);
-  assert.match(appSource, /completedMultiplayerCreateGameRef\.current === data\.gameId/);
-  assert.match(appSource, /const timeoutMessage = "Room creation timed out\. Try Create game again\.";[\s\S]*setBusy\(false\);/);
+  assert.match(appSource, /data\?\.code === "persistence_unavailable"[\s\S]*releasePendingMultiplayerCreation\(rejectionMessage\)/);
+  assert.match(appSource, /MULTIPLAYER_RECONCILE_TERMINAL_STATUSES\.has\(reconciliationStatus\)[\s\S]*handleCreateRejected/);
+  assert.match(appSource, /releasePendingMultiplayerCreation\("Room creation timed out\. Try Create game again\."\)/);
   assert.match(appSource, /function handleDisconnect\(\)[\s\S]*Room creation will retry after reconnecting\.[\s\S]*setBusy\(false\);/);
+  assert.match(appSource, /function handleConnect\(\)[\s\S]*reconcilePendingMultiplayerCreate\(pendingGame\)/);
   assert.doesNotMatch(appSource, /nextSocket\.on\("connect_error", \(\) => \{\s*clearPendingGame\(\);/);
 });
 
@@ -165,7 +195,12 @@ test("multiplayer setup clears stale state and reports explicit rejection", () =
   const setupIntentIndex = appSource.indexOf("if (routePath === SETUP_PATH && selectedSetupMode === GAME_MODE_MULTIPLAYER)");
   const staleModeIndex = appSource.indexOf("if (gameMode === GAME_MODE_MULTIPLAYER)", setupIntentIndex);
   assert.ok(setupIntentIndex >= 0 && staleModeIndex > setupIntentIndex);
-  assert.match(appSource, /const rejectionMessage = data\?\.message \|\| "Could not create game";\s*setMessage\(rejectionMessage\);\s*showToast\(rejectionMessage, "error"\);/);
+  const createRejectionHandler = appSource.slice(
+    appSource.indexOf("function handleCreateRejected"),
+    appSource.indexOf("function emitPendingMultiplayerCreate"),
+  );
+  assert.match(createRejectionHandler, /const rejectionMessage = data\?\.message \|\| "Could not create game";/);
+  assert.match(createRejectionHandler, /setMessage\(rejectionMessage\);\s*showToast\(rejectionMessage, "error"\);/);
   assert.match(appSource, /function chooseDifficulty\(difficulty\) \{[\s\S]*clearPendingGame\(\);/);
   assert.match(appSource, /async function logout\(\) \{[\s\S]*clearPendingGame\(\);/);
 });
@@ -300,6 +335,10 @@ test("auth modal supports login, signup, and close states", () => {
   assert.match(appSource, /name="email"/);
   assert.match(appSource, /name="password"/);
   assert.match(appSource, /submitAuthForm/);
+  assert.match(appSource, /resetPasswordForEmail/);
+  assert.match(appSource, /className="password-visibility-button"/);
+  assert.match(appSource, /event\.key === "Escape"/);
+  assert.match(appSource, /authTriggerRef\.current\?\.focus/);
 });
 
 test("input sanitizers preserve valid username numbers and strip unsafe characters", () => {
@@ -316,12 +355,17 @@ test("input sanitizers preserve valid username numbers and strip unsafe characte
   assert.match(appSource, /onChange=\{\(event\) => updateAuthField\("username", event\.target\.value\)\}/);
 });
 
-test("footer links point to placeholder legal routes", () => {
+test("footer links point to complete information pages", () => {
   assert.match(appSource, /className="site-footer"/);
   assert.match(appSource, /href=\{PRIVACY_POLICY_PATH\}/);
   assert.match(appSource, /href=\{TOS_PATH\}/);
   assert.match(appSource, /Privacy Policy/);
   assert.match(appSource, /Terms of Service/);
+  assert.match(appSource, /href=\{CONTACT_PATH\}/);
+  assert.match(appSource, /href=\{ABOUT_PATH\}/);
+  assert.match(appSource, /const informationPages =/);
+  assert.match(appSource, /Information collected/);
+  assert.match(appSource, /Fair play and conduct/);
   assert.match(appSource, /https:\/\/github\.com\/Michaeldo2004\/Connect4web/);
   assert.match(appSource, /target="_blank"/);
   assert.match(appSource, /rel="noreferrer"/);
@@ -343,6 +387,20 @@ test("connect 4 theme and mobile layout rules exist", () => {
   assert.match(cssSource, /\.review-move-button\.current\s*\{/);
   assert.match(cssSource, /color: var\(--brand-yellow\);/);
   assert.match(cssSource, /@media \(max-width: 760px\)/);
-  assert.match(cssSource, /\.play-layout\s*\{\s*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/);
+  assert.match(cssSource, /\.play-layout\s*\{\s*grid-template-columns: minmax\(0, 1fr\);/);
+  assert.match(cssSource, /\.match-header\s*\{/);
+  assert.match(cssSource, /\.move-history-panel\s*\{/);
   assert.match(cssSource, /width: min\(100%, calc\(100vw - 28px\)\);/);
+});
+
+test("game UI uses player chips, shareable room details, and semantic board cells", () => {
+  assert.match(appSource, /className="match-header"/);
+  assert.match(appSource, /className="match-details"/);
+  assert.match(appSource, /function formatRoomCode\(roomId\)/);
+  assert.match(appSource, /function copyRoomInvite\(\)/);
+  assert.match(appSource, /className="move-history-panel"/);
+  assert.match(appSource, /className="game-result-panel"/);
+  assert.match(appSource, /role="gridcell"/);
+  assert.match(appSource, /getPieceLabel\(cell\)/);
+  assert.doesNotMatch(appSource, /onClick=\{\(\) => playColumn\(columnIndex\)\}/);
 });

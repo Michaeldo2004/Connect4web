@@ -2,13 +2,12 @@ import re
 import unittest
 from pathlib import Path
 
-
 SCHEMA_PATH = Path(__file__).resolve().parents[2] / "docs" / "supabase_schema.sql"
 MIGRATION_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "docs"
-    / "migrations"
-    / "20260714_move_analysis_worst_move_and_ratings.sql"
+    Path(__file__).resolve().parents[2] / "docs" / "migrations" / "20260714_move_analysis_worst_move_and_ratings.sql"
+)
+MULTIPLAYER_RECOVERY_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[2] / "docs" / "migrations" / "20260715_multiplayer_room_requests.sql"
 )
 
 
@@ -17,6 +16,7 @@ class SupabaseSchemaTests(unittest.TestCase):
     def setUpClass(cls):
         cls.schema = SCHEMA_PATH.read_text(encoding="utf-8")
         cls.migration = MIGRATION_PATH.read_text(encoding="utf-8")
+        cls.multiplayer_recovery_migration = MULTIPLAYER_RECOVERY_MIGRATION_PATH.read_text(encoding="utf-8")
 
     def test_schema_file_exists(self):
         self.assertTrue(SCHEMA_PATH.exists())
@@ -25,12 +25,55 @@ class SupabaseSchemaTests(unittest.TestCase):
         for table_name in [
             "profiles",
             "games",
+            "multiplayer_room_requests",
             "game_players",
             "game_moves",
             "move_analysis",
             "player_stats",
         ]:
             self.assertIn(f"create table public.{table_name}", self.schema)
+
+    def test_multiplayer_room_requests_are_private_lifecycle_tombstones(self):
+        for field in [
+            "profile_id uuid not null",
+            "request_id text not null",
+            "game_id uuid not null",
+            "player_id uuid not null",
+            "state text not null default 'active'",
+            "expires_at timestamptz not null",
+            "resolved_at timestamptz",
+            "primary key (profile_id, request_id)",
+        ]:
+            self.assertIn(field, self.schema)
+        self.assertRegex(
+            self.schema,
+            r"state in \('active', 'completed', 'cancelled', 'expired', 'invalid'\)",
+        )
+        self.assertIn("create unique index multiplayer_room_requests_game_id_unique", self.schema)
+        self.assertIn(
+            "alter table public.multiplayer_room_requests enable row level security;",
+            self.schema,
+        )
+        self.assertNotRegex(
+            self.schema,
+            r'create policy "[^"]+"\s+on public\.multiplayer_room_requests',
+        )
+
+    def test_multiplayer_recovery_migration_defines_atomic_service_only_rpcs(self):
+        self.assertTrue(MULTIPLAYER_RECOVERY_MIGRATION_PATH.exists())
+        migration = self.multiplayer_recovery_migration
+        self.assertIn("begin;", migration)
+        self.assertIn("commit;", migration)
+        self.assertIn("create table if not exists public.multiplayer_room_requests", migration)
+        self.assertIn("create or replace function public.claim_multiplayer_room_request", migration)
+        self.assertIn("pg_advisory_xact_lock", migration)
+        self.assertIn("insert into public.games", migration)
+        self.assertIn("insert into public.game_players", migration)
+        self.assertIn("insert into public.multiplayer_room_requests", migration)
+        self.assertIn("create or replace function public.resolve_multiplayer_room_request", migration)
+        self.assertIn("set status = 'abandoned'", migration)
+        self.assertIn("from public, anon, authenticated", migration)
+        self.assertIn("to service_role", migration)
 
     def test_games_tracks_lazy_analysis_status(self):
         self.assertIn("analysis_status text not null default 'not_requested'", self.schema)
@@ -149,6 +192,7 @@ class SupabaseSchemaTests(unittest.TestCase):
         for table_name in [
             "profiles",
             "games",
+            "multiplayer_room_requests",
             "game_players",
             "game_moves",
             "move_analysis",

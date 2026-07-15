@@ -1,14 +1,15 @@
+import logging
 import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
+
 
 COMPLETED_STATUSES = {"human_win", "ai_win", "player1_win", "player2_win", "draw"}
 GAME_OVER_STATUSES = COMPLETED_STATUSES | {"abandoned"}
-MOVE_ANALYSIS_SCHEMA_UPDATE_MESSAGE = (
-    "Move evaluation is temporarily unavailable while the review database is updated."
-)
+MOVE_ANALYSIS_SCHEMA_UPDATE_MESSAGE = "Move evaluation is temporarily unavailable while the review database is updated."
 WINNER_BY_STATUS = {
     "human_win": 1,
     "ai_win": 2,
@@ -70,7 +71,7 @@ def get_client():
 
         _client = create_client(url, secret_key)
     except Exception as error:
-        print(f"Supabase sync disabled: {error.__class__.__name__}")
+        logger.warning("Supabase sync disabled error=%s", error.__class__.__name__)
         _client = None
 
     _client_checked = True
@@ -90,8 +91,22 @@ def execute_safely(action):
         action(client)
         return True
     except Exception as error:
-        print(f"Supabase sync failed: {error.__class__.__name__}")
+        logger.warning("Supabase sync failed error=%s", error.__class__.__name__)
         return False
+
+
+def fetch_profile_display_name(profile_id):
+    """Return the authoritative public name for an authenticated profile."""
+    client = get_client()
+    if client is None or not profile_id:
+        return None
+
+    response = client.table("profiles").select("username,display_name").eq("id", profile_id).limit(1).execute()
+    rows = response.data or []
+    if not rows:
+        return None
+    profile = rows[0]
+    return profile.get("display_name") or profile.get("username")
 
 
 def db_game_id(game_id):
@@ -104,25 +119,19 @@ def db_game_id(game_id):
 def is_missing_move_analysis_columns(error):
     """Recognize the PostgREST error raised by the pre-worst-move schema."""
     code = str(getattr(error, "code", "") or "")
-    message = " ".join((
-        str(getattr(error, "message", "") or ""),
-        str(error),
-    )).lower()
-    return (
-        (code == "42703" or "42703" in message)
-        and ("worst_column" in message or "worst_score" in message)
-    )
+    message = " ".join(
+        (
+            str(getattr(error, "message", "") or ""),
+            str(error),
+        )
+    ).lower()
+    return (code == "42703" or "42703" in message) and ("worst_column" in message or "worst_score" in message)
 
 
 def move_analysis_schema_ready(client, game_id):
     """Check required derived-data columns without reading the server-only rating."""
     try:
-        (
-            client.table("move_analysis")
-            .select("worst_column,worst_score")
-            .eq("game_id", game_id)
-            .execute()
-        )
+        (client.table("move_analysis").select("worst_column,worst_score").eq("game_id", game_id).execute())
         return True
     except Exception as error:
         if is_missing_move_analysis_columns(error):
@@ -237,6 +246,181 @@ def create_game_record(game_id, game):
     return execute_safely(action)
 
 
+def is_configured():
+    load_local_env()
+    return bool(os.environ.get("SUPABASE_URL") and os.environ.get("SUPABASE_SECRET_KEY"))
+
+
+def is_missing_multiplayer_recovery_schema(error):
+    code = str(getattr(error, "code", "") or "")
+    message = " ".join(
+        (
+            str(getattr(error, "message", "") or ""),
+            str(error),
+        )
+    ).lower()
+    return code in {"42P01", "42883", "PGRST202", "PGRST205"} or any(
+        fragment in message
+        for fragment in (
+            "multiplayer_room_requests does not exist",
+            "could not find the function",
+            "could not find the table",
+            "undefined table",
+            "undefined function",
+        )
+    )
+
+
+def multiplayer_recovery_client():
+    client = get_client()
+    if client is not None:
+        return client, None
+    if is_configured():
+        return None, {"result": "error", "code": "persistence_unavailable"}
+    return None, {"result": "disabled"}
+
+
+def normalize_multiplayer_room_request(row):
+    if not isinstance(row, dict):
+        return None
+
+    profile_id = db_game_id(row.get("profile_id"))
+    game_id = db_game_id(row.get("game_id"))
+    player_id = db_game_id(row.get("player_id"))
+    request_id = row.get("request_id")
+    if profile_id is None or game_id is None or player_id is None or not isinstance(request_id, str):
+        return None
+
+    game_data = row.get("games") or {}
+    if isinstance(game_data, list):
+        game_data = game_data[0] if game_data else {}
+    game_mode = row.get("game_mode") or game_data.get("mode")
+    game_status = row.get("game_status") or game_data.get("status")
+
+    game_players = game_data.get("game_players") or []
+    player_count = row.get("player_count")
+    owner_profile_id = row.get("owner_profile_id")
+    if player_count is None:
+        player_count = len(game_players)
+    if owner_profile_id is None and len(game_players) == 1:
+        owner_profile_id = game_players[0].get("profile_id")
+    owner_profile_id = db_game_id(owner_profile_id)
+
+    return {
+        "profile_id": profile_id,
+        "request_id": request_id,
+        "game_id": game_id,
+        "player_id": player_id,
+        "owner_name": row.get("owner_name") or "Player",
+        "state": row.get("state"),
+        "expires_at": row.get("expires_at"),
+        "resolved_at": row.get("resolved_at"),
+        "game_mode": game_mode,
+        "game_status": game_status,
+        "player_count": int(player_count or 0),
+        "owner_profile_id": owner_profile_id,
+        "created": bool(row.get("created")),
+    }
+
+
+def claim_multiplayer_room_request(profile_id, request_id, game_id, player_id, owner_name):
+    profile_id = db_game_id(profile_id)
+    game_id = db_game_id(game_id)
+    player_id = db_game_id(player_id)
+    if profile_id is None or game_id is None or player_id is None or not request_id:
+        return {"result": "error", "code": "invalid_room_request"}
+
+    client, unavailable = multiplayer_recovery_client()
+    if unavailable:
+        return unavailable
+
+    try:
+        response = client.rpc(
+            "claim_multiplayer_room_request",
+            {
+                "p_profile_id": profile_id,
+                "p_request_id": request_id,
+                "p_game_id": game_id,
+                "p_player_id": player_id,
+                "p_owner_name": owner_name or "Player",
+            },
+        ).execute()
+    except Exception as error:
+        if is_missing_multiplayer_recovery_schema(error):
+            return {"result": "schema_missing"}
+        logger.warning("Supabase multiplayer claim failed error=%s", error.__class__.__name__)
+        return {"result": "error", "code": "persistence_unavailable"}
+
+    rows = response.data or []
+    if isinstance(rows, dict):
+        rows = [rows]
+    room = normalize_multiplayer_room_request(rows[0] if rows else None)
+    if room is None:
+        # The transaction may have committed even when the response was lost or
+        # malformed. Force a retry with the same idempotency key.
+        return {"result": "error", "code": "persistence_unavailable"}
+    return {"result": "ok", "room": room}
+
+
+def fetch_multiplayer_room_request(profile_id, request_id):
+    profile_id = db_game_id(profile_id)
+    if profile_id is None or not request_id:
+        return {"result": "error", "code": "invalid_room_request"}
+
+    client, unavailable = multiplayer_recovery_client()
+    if unavailable:
+        return unavailable
+
+    try:
+        response = (
+            client.table("multiplayer_room_requests")
+            .select(
+                "profile_id,request_id,game_id,player_id,owner_name,state,expires_at,resolved_at,"
+                "games!inner(mode,status,game_players(player_number,profile_id,is_ai))"
+            )
+            .eq("profile_id", profile_id)
+            .eq("request_id", request_id)
+            .execute()
+        )
+    except Exception as error:
+        if is_missing_multiplayer_recovery_schema(error):
+            return {"result": "schema_missing"}
+        logger.warning("Supabase multiplayer recovery failed error=%s", error.__class__.__name__)
+        return {"result": "error", "code": "persistence_unavailable"}
+
+    for row in response.data or []:
+        room = normalize_multiplayer_room_request(row)
+        if room and room["profile_id"] == profile_id and room["request_id"] == request_id:
+            return {"result": "ok", "room": room}
+    if response.data:
+        return {"result": "error", "code": "persistence_unavailable"}
+    return {"result": "not_found"}
+
+
+def resolve_multiplayer_room_request(game_id, state):
+    game_id = db_game_id(game_id)
+    if game_id is None or state not in {"completed", "cancelled", "expired", "invalid"}:
+        return {"result": "error", "code": "invalid_room_resolution"}
+
+    client, unavailable = multiplayer_recovery_client()
+    if unavailable:
+        return unavailable
+    try:
+        response = client.rpc(
+            "resolve_multiplayer_room_request",
+            {
+                "p_game_id": game_id,
+                "p_state": state,
+            },
+        ).execute()
+    except Exception as error:
+        if is_missing_multiplayer_recovery_schema(error):
+            return {"result": "schema_missing"}
+        logger.warning("Supabase multiplayer resolution failed error=%s", error.__class__.__name__)
+        return {"result": "error", "code": "persistence_unavailable"}
+    return {"result": "ok", "resolved": bool(response.data)}
+
+
 def add_game_player_records(game_id, game):
     player_payloads = game_player_payloads(game_id, game)
     if not player_payloads:
@@ -273,10 +457,12 @@ def set_game_analysis_status(game_id, status, error=None):
 
     payload = {"analysis_status": status, "analysis_error": error}
     if status == "processing":
-        payload.update({
-            "analysis_requested_at": now_iso(),
-            "analysis_completed_at": None,
-        })
+        payload.update(
+            {
+                "analysis_requested_at": now_iso(),
+                "analysis_completed_at": None,
+            }
+        )
     elif status in {"complete", "failed"}:
         payload["analysis_completed_at"] = now_iso()
 
@@ -419,11 +605,7 @@ def repair_move_history(moves, final_board=None):
 
 def public_review_move(move, include_analysis=True):
     """Return a review move without exposing evaluator inputs or raw ratings."""
-    public_move = {
-        field: move[field]
-        for field in PUBLIC_REVIEW_MOVE_FIELDS
-        if field in move
-    }
+    public_move = {field: move[field] for field in PUBLIC_REVIEW_MOVE_FIELDS if field in move}
     if not include_analysis:
         return public_move
 
@@ -472,22 +654,26 @@ def fetch_completed_games(profile_id):
             profile = game_player.get("profiles") or {}
             if isinstance(profile, list):
                 profile = profile[0] if profile else {}
-            display_name = profile.get("display_name") or profile.get("username") or game_player.get("display_name_snapshot")
+            display_name = (
+                profile.get("display_name") or profile.get("username") or game_player.get("display_name_snapshot")
+            )
             if game_player.get("player_number") and display_name:
                 player_names[str(game_player["player_number"])] = display_name
-        completed_games.append({
-            "id": game_data.get("id"),
-            "mode": game_data.get("mode"),
-            "difficulty": game_data.get("difficulty"),
-            "status": game_data.get("status"),
-            "winnerPlayerNumber": game_data.get("winner_player_number"),
-            "startedAt": game_data.get("started_at"),
-            "endedAt": game_data.get("ended_at"),
-            "playerNumber": player_number,
-            "playerNames": player_names,
-            "winnerName": player_names.get(str(game_data.get("winner_player_number"))),
-            "result": completed_game_result(game_data, player_number),
-        })
+        completed_games.append(
+            {
+                "id": game_data.get("id"),
+                "mode": game_data.get("mode"),
+                "difficulty": game_data.get("difficulty"),
+                "status": game_data.get("status"),
+                "winnerPlayerNumber": game_data.get("winner_player_number"),
+                "startedAt": game_data.get("started_at"),
+                "endedAt": game_data.get("ended_at"),
+                "playerNumber": player_number,
+                "playerNames": player_names,
+                "winnerName": player_names.get(str(game_data.get("winner_player_number"))),
+                "result": completed_game_result(game_data, player_number),
+            }
+        )
 
     return sorted(completed_games, key=lambda game: game.get("endedAt") or game.get("startedAt") or "", reverse=True)
 
@@ -500,10 +686,7 @@ def fetch_game_moves(profile_id, game_id):
 
     membership = (
         client.table("game_players")
-        .select(
-            "game_id,games!inner("
-            "status,final_board,winner_player_number,analysis_status,analysis_error)"
-        )
+        .select("game_id,games!inner(status,final_board,winner_player_number,analysis_status,analysis_error)")
         .eq("profile_id", profile_id)
         .eq("game_id", db_id)
         .execute()
@@ -522,10 +705,7 @@ def fetch_game_moves(profile_id, game_id):
     try:
         response = (
             client.table("game_moves")
-            .select(
-                f"{move_fields},"
-                "move_analysis(rating,worst_column,worst_score)"
-            )
+            .select(f"{move_fields},move_analysis(rating,worst_column,worst_score)")
             .eq("game_id", db_id)
             .order("move_number")
             .execute()
@@ -537,19 +717,10 @@ def fetch_game_moves(profile_id, game_id):
         # migration is pending. Do not return legacy analysis because its rating
         # and worst-move semantics are not equivalent to the current evaluator.
         analysis_available = False
-        response = (
-            client.table("game_moves")
-            .select(move_fields)
-            .eq("game_id", db_id)
-            .order("move_number")
-            .execute()
-        )
+        response = client.table("game_moves").select(move_fields).eq("game_id", db_id).order("move_number").execute()
     repaired_moves = repair_move_history(response.data or [], game_data.get("final_board"))
     return {
-        "moves": [
-            public_review_move(move, include_analysis=analysis_available)
-            for move in repaired_moves
-        ],
+        "moves": [public_review_move(move, include_analysis=analysis_available) for move in repaired_moves],
         "analysis_status": game_data.get("analysis_status") or "not_requested",
         "analysis_error": game_data.get("analysis_error"),
         "analysis_available": analysis_available,

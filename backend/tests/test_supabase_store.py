@@ -49,12 +49,14 @@ class RecordingQuery:
         return self
 
     def upsert(self, payload, **kwargs):
-        self.client.operations.append({
-            "table": self.table_name,
-            "action": "upsert",
-            "payload": payload,
-            "kwargs": kwargs,
-        })
+        self.client.operations.append(
+            {
+                "table": self.table_name,
+                "action": "upsert",
+                "payload": payload,
+                "kwargs": kwargs,
+            }
+        )
         return self
 
     def update(self, payload):
@@ -79,6 +81,37 @@ class RecordingClient:
 
     def table(self, table_name):
         return RecordingQuery(self, table_name)
+
+
+class RpcClient:
+    def __init__(self, data=None, error=None):
+        self.data = data
+        self.error = error
+        self.calls = []
+
+    def rpc(self, function_name, payload):
+        self.calls.append((function_name, payload))
+        return self
+
+    def execute(self):
+        if self.error is not None:
+            raise self.error
+        return SimpleNamespace(data=self.data)
+
+
+class MissingRecoveryRpcError(Exception):
+    code = "PGRST202"
+    message = "Could not find the function public.claim_multiplayer_room_request"
+
+
+class MissingRecoveryTableError(Exception):
+    code = "PGRST205"
+    message = "Could not find the table public.multiplayer_room_requests in the schema cache"
+
+
+class TransientRecoveryRpcError(Exception):
+    code = "503"
+    message = "Database connection timed out while executing request"
 
 
 class MoveHistoryClient:
@@ -192,10 +225,13 @@ class SupabaseStoreTests(unittest.TestCase):
             saved = supabase_store.create_game_record(game_id, game)
 
         self.assertTrue(saved)
-        self.assertEqual([(op["table"], op["action"]) for op in client.operations], [
-            ("games", "insert"),
-            ("game_players", "insert"),
-        ])
+        self.assertEqual(
+            [(op["table"], op["action"]) for op in client.operations],
+            [
+                ("games", "insert"),
+                ("game_players", "insert"),
+            ],
+        )
         player_rows = client.operations[1]["payload"]
         self.assertEqual(len(player_rows), 2)
         self.assertEqual({row["player_number"] for row in player_rows}, {1, 2})
@@ -204,6 +240,152 @@ class SupabaseStoreTests(unittest.TestCase):
         self.assertTrue(all(row["game_id"] == str(uuid.UUID(game_id)) for row in player_rows))
         self.assertEqual(client.operations[0]["payload"]["analysis_status"], "not_requested")
         self.assertIsNone(client.operations[0]["payload"]["analysis_error"])
+
+    def test_atomic_multiplayer_room_claim_uses_canonical_uuid_payload(self):
+        profile_id = str(uuid.uuid4())
+        game_id = uuid.uuid4().hex
+        player_id = uuid.uuid4().hex
+        row = {
+            "profile_id": profile_id,
+            "request_id": "request-1",
+            "game_id": str(uuid.UUID(game_id)),
+            "player_id": str(uuid.UUID(player_id)),
+            "owner_name": "Player One",
+            "state": "active",
+            "expires_at": "2099-01-01T00:00:00+00:00",
+            "resolved_at": None,
+            "game_mode": "multiplayer",
+            "game_status": "waiting",
+            "player_count": 1,
+            "owner_profile_id": profile_id,
+            "created": True,
+        }
+        client = RpcClient([row])
+
+        with patch.object(supabase_store, "get_client", return_value=client):
+            result = supabase_store.claim_multiplayer_room_request(
+                profile_id,
+                "request-1",
+                game_id,
+                player_id,
+                "Player One",
+            )
+
+        self.assertEqual(result, {"result": "ok", "room": row})
+        self.assertEqual(
+            client.calls,
+            [
+                (
+                    "claim_multiplayer_room_request",
+                    {
+                        "p_profile_id": profile_id,
+                        "p_request_id": "request-1",
+                        "p_game_id": str(uuid.UUID(game_id)),
+                        "p_player_id": str(uuid.UUID(player_id)),
+                        "p_owner_name": "Player One",
+                    },
+                )
+            ],
+        )
+
+    def test_multiplayer_claim_falls_back_only_for_missing_rpc(self):
+        profile_id = str(uuid.uuid4())
+        game_id = str(uuid.uuid4())
+        player_id = str(uuid.uuid4())
+
+        with patch.object(supabase_store, "get_client", return_value=RpcClient(error=MissingRecoveryRpcError())):
+            missing = supabase_store.claim_multiplayer_room_request(
+                profile_id, "request-1", game_id, player_id, "Player"
+            )
+        with patch.object(supabase_store, "get_client", return_value=RpcClient(error=TransientRecoveryRpcError())):
+            transient = supabase_store.claim_multiplayer_room_request(
+                profile_id, "request-1", game_id, player_id, "Player"
+            )
+
+        self.assertEqual(missing, {"result": "schema_missing"})
+        self.assertEqual(transient, {"result": "error", "code": "persistence_unavailable"})
+
+    def test_missing_recovery_table_is_a_schema_fallback(self):
+        self.assertTrue(supabase_store.is_missing_multiplayer_recovery_schema(MissingRecoveryTableError()))
+
+    def test_empty_atomic_claim_response_keeps_request_retryable(self):
+        profile_id = str(uuid.uuid4())
+        with patch.object(supabase_store, "get_client", return_value=RpcClient([])):
+            result = supabase_store.claim_multiplayer_room_request(
+                profile_id,
+                "request-1",
+                str(uuid.uuid4()),
+                str(uuid.uuid4()),
+                "Player",
+            )
+
+        self.assertEqual(result, {"result": "error", "code": "persistence_unavailable"})
+
+    def test_configured_but_unavailable_client_is_retryable_persistence_error(self):
+        with (
+            patch.object(supabase_store, "get_client", return_value=None),
+            patch.object(
+                supabase_store,
+                "is_configured",
+                return_value=True,
+            ),
+        ):
+            client, unavailable = supabase_store.multiplayer_recovery_client()
+
+        self.assertIsNone(client)
+        self.assertEqual(unavailable, {"result": "error", "code": "persistence_unavailable"})
+
+    def test_fetch_multiplayer_room_request_returns_lifecycle_and_owner_shape(self):
+        profile_id = str(uuid.uuid4())
+        game_id = str(uuid.uuid4())
+        player_id = str(uuid.uuid4())
+        rows = [
+            {
+                "profile_id": profile_id,
+                "request_id": "request-1",
+                "game_id": game_id,
+                "player_id": player_id,
+                "owner_name": "Player One",
+                "state": "active",
+                "expires_at": "2099-01-01T00:00:00+00:00",
+                "resolved_at": None,
+                "games": {
+                    "mode": "multiplayer",
+                    "status": "waiting",
+                    "game_players": [{"player_number": 1, "profile_id": profile_id, "is_ai": False}],
+                },
+            }
+        ]
+
+        with patch.object(supabase_store, "get_client", return_value=FakeClient(rows)):
+            result = supabase_store.fetch_multiplayer_room_request(profile_id, "request-1")
+
+        self.assertEqual(result["result"], "ok")
+        self.assertEqual(result["room"]["game_id"], game_id)
+        self.assertEqual(result["room"]["player_id"], player_id)
+        self.assertEqual(result["room"]["state"], "active")
+        self.assertEqual(result["room"]["player_count"], 1)
+        self.assertEqual(result["room"]["owner_profile_id"], profile_id)
+
+    def test_resolve_multiplayer_room_request_calls_server_only_rpc(self):
+        game_id = str(uuid.uuid4())
+        client = RpcClient(True)
+        with patch.object(supabase_store, "get_client", return_value=client):
+            result = supabase_store.resolve_multiplayer_room_request(game_id, "cancelled")
+
+        self.assertEqual(result, {"result": "ok", "resolved": True})
+        self.assertEqual(
+            client.calls,
+            [
+                (
+                    "resolve_multiplayer_room_request",
+                    {
+                        "p_game_id": game_id,
+                        "p_state": "cancelled",
+                    },
+                )
+            ],
+        )
 
     def test_add_game_player_records_upserts_multiplayer_players(self):
         game_id = uuid.uuid4().hex
@@ -222,11 +404,14 @@ class SupabaseStoreTests(unittest.TestCase):
             saved = supabase_store.add_game_player_records(game_id, game)
 
         self.assertTrue(saved)
-        self.assertEqual([(op["table"], op["action"]) for op in client.operations], [
-            ("game_players", "upsert"),
-            ("game_players", "upsert"),
-            ("games", "update"),
-        ])
+        self.assertEqual(
+            [(op["table"], op["action"]) for op in client.operations],
+            [
+                ("game_players", "upsert"),
+                ("game_players", "upsert"),
+                ("games", "update"),
+            ],
+        )
         player_rows = [client.operations[0]["payload"], client.operations[1]["payload"]]
         self.assertEqual(client.operations[0]["kwargs"], {"on_conflict": "game_id,player_number"})
         self.assertEqual({row["player_number"] for row in player_rows}, {1, 2})
@@ -311,15 +496,17 @@ class SupabaseStoreTests(unittest.TestCase):
             },
             {
                 "player_number": 2,
-                "games": [{
-                    "id": draw_id,
-                    "mode": "multiplayer",
-                    "difficulty": "multiplayer",
-                    "status": "draw",
-                    "winner_player_number": None,
-                    "started_at": "2026-01-02T00:00:00+00:00",
-                    "ended_at": "2026-01-02T00:10:00+00:00",
-                }],
+                "games": [
+                    {
+                        "id": draw_id,
+                        "mode": "multiplayer",
+                        "difficulty": "multiplayer",
+                        "status": "draw",
+                        "winner_player_number": None,
+                        "started_at": "2026-01-02T00:00:00+00:00",
+                        "ended_at": "2026-01-02T00:10:00+00:00",
+                    }
+                ],
             },
         ]
 
@@ -339,14 +526,16 @@ class SupabaseStoreTests(unittest.TestCase):
                 "column_played": 3,
                 "board_before": [],
                 "board_after": [],
-                "move_analysis": [{
-                    "rating": "great",
-                    "played_score": 80,
-                    "best_score": 80,
-                    "worst_score": -800,
-                    "best_column": 3,
-                    "worst_column": 0,
-                }],
+                "move_analysis": [
+                    {
+                        "rating": "great",
+                        "played_score": 80,
+                        "best_score": 80,
+                        "worst_score": -800,
+                        "best_column": 3,
+                        "worst_column": 0,
+                    }
+                ],
             },
             {
                 "move_number": 2,
@@ -357,38 +546,46 @@ class SupabaseStoreTests(unittest.TestCase):
                 "move_analysis": {"rating": "mistake", "played_score": -20},
             },
         ]
-        membership = [{"game_id": game_id, "games": {
-            "status": "draw",
-            "analysis_status": "complete",
-            "analysis_error": None,
-        }}]
+        membership = [
+            {
+                "game_id": game_id,
+                "games": {
+                    "status": "draw",
+                    "analysis_status": "complete",
+                    "analysis_error": None,
+                },
+            }
+        ]
         client = MoveHistoryClient(membership, moves)
 
         with patch.object(supabase_store, "get_client", return_value=client):
-            self.assertEqual(supabase_store.fetch_game_moves("profile-1", game_id), {
-                "moves": [
-                    {
-                        "move_number": 1,
-                        "player_number": 1,
-                        "column_played": 3,
-                        "board_before": [],
-                        "board_after": [],
-                        "move_analysis": [{"feedback": "Great Move"}],
-                    },
-                    {
-                        "move_number": 2,
-                        "player_number": 2,
-                        "column_played": 2,
-                        "board_before": [],
-                        "board_after": [],
-                        "move_analysis": [{"feedback": "Mistake"}],
-                    },
-                ],
-                "analysis_status": "complete",
-                "analysis_error": None,
-                "analysis_available": True,
-                "analysis_unavailable_reason": None,
-            })
+            self.assertEqual(
+                supabase_store.fetch_game_moves("profile-1", game_id),
+                {
+                    "moves": [
+                        {
+                            "move_number": 1,
+                            "player_number": 1,
+                            "column_played": 3,
+                            "board_before": [],
+                            "board_after": [],
+                            "move_analysis": [{"feedback": "Great Move"}],
+                        },
+                        {
+                            "move_number": 2,
+                            "player_number": 2,
+                            "column_played": 2,
+                            "board_before": [],
+                            "board_after": [],
+                            "move_analysis": [{"feedback": "Mistake"}],
+                        },
+                    ],
+                    "analysis_status": "complete",
+                    "analysis_error": None,
+                    "analysis_available": True,
+                    "analysis_unavailable_reason": None,
+                },
+            )
         analysis_selection = client.selections["game_moves"]
         self.assertIn("worst_column", analysis_selection)
         self.assertIn("worst_score", analysis_selection)
@@ -414,22 +611,26 @@ class SupabaseStoreTests(unittest.TestCase):
 
         for rating, feedback in expected_feedback.items():
             with self.subTest(rating=rating):
-                public_move = supabase_store.public_review_move({
-                    "id": 10,
-                    "move_number": 1,
-                    "player_number": 1,
-                    "column_played": 3,
-                    "move_analysis": [{
-                        "rating": rating,
-                        "played_score": -100,
-                        "best_score": 500,
-                        "worst_score": -100,
-                        "played_column": 3,
-                        "best_column": 4,
-                        "worst_column": 0,
-                        "minimax_depth": 4,
-                    }],
-                })
+                public_move = supabase_store.public_review_move(
+                    {
+                        "id": 10,
+                        "move_number": 1,
+                        "player_number": 1,
+                        "column_played": 3,
+                        "move_analysis": [
+                            {
+                                "rating": rating,
+                                "played_score": -100,
+                                "best_score": 500,
+                                "worst_score": -100,
+                                "played_column": 3,
+                                "best_column": 4,
+                                "worst_column": 0,
+                                "minimax_depth": 4,
+                            }
+                        ],
+                    }
+                )
 
                 self.assertEqual(public_move["move_analysis"], [{"feedback": feedback}])
                 serialized = repr(public_move)
@@ -445,19 +646,26 @@ class SupabaseStoreTests(unittest.TestCase):
 
     def test_fetch_game_moves_falls_back_to_history_when_analysis_schema_is_old(self):
         game_id = str(uuid.uuid4())
-        moves = [{
-            "id": 10,
-            "move_number": 1,
-            "player_number": 1,
-            "column_played": 3,
-            "board_before": [],
-            "board_after": [],
-        }]
-        membership = [{"game_id": game_id, "games": {
-            "status": "draw",
-            "analysis_status": "complete",
-            "analysis_error": None,
-        }}]
+        moves = [
+            {
+                "id": 10,
+                "move_number": 1,
+                "player_number": 1,
+                "column_played": 3,
+                "board_before": [],
+                "board_after": [],
+            }
+        ]
+        membership = [
+            {
+                "game_id": game_id,
+                "games": {
+                    "status": "draw",
+                    "analysis_status": "complete",
+                    "analysis_error": None,
+                },
+            }
+        ]
         client = MoveHistoryClient(membership, moves, missing_analysis_columns=True)
 
         with patch.object(supabase_store, "get_client", return_value=client):
@@ -470,16 +678,23 @@ class SupabaseStoreTests(unittest.TestCase):
             supabase_store.MOVE_ANALYSIS_SCHEMA_UPDATE_MESSAGE,
         )
         self.assertTrue(any("worst_column" in selection for _, selection in client.selection_history))
-        self.assertEqual(client.selections["game_moves"], "id,move_number,player_number,column_played,board_before,board_after")
+        self.assertEqual(
+            client.selections["game_moves"], "id,move_number,player_number,column_played,board_before,board_after"
+        )
 
     def test_fetch_game_analysis_source_reports_old_analysis_schema(self):
         game_id = str(uuid.uuid4())
         moves = [{"id": 10, "move_number": 1, "player_number": 1, "column_played": 3}]
-        membership = [{"game_id": game_id, "games": {
-            "status": "draw",
-            "analysis_status": "not_requested",
-            "analysis_error": None,
-        }}]
+        membership = [
+            {
+                "game_id": game_id,
+                "games": {
+                    "status": "draw",
+                    "analysis_status": "not_requested",
+                    "analysis_error": None,
+                },
+            }
+        ]
         client = MoveHistoryClient(membership, moves, missing_analysis_columns=True)
 
         with patch.object(supabase_store, "get_client", return_value=client):
@@ -494,29 +709,34 @@ class SupabaseStoreTests(unittest.TestCase):
     def test_move_analysis_status_and_rows_are_persisted(self):
         game_id = str(uuid.uuid4())
         client = RecordingClient()
-        rows = [{
-            "move_id": 10,
-            "minimax_depth": 4,
-            "played_column": 2,
-            "best_column": 3,
-            "worst_column": 0,
-            "played_score": 10,
-            "best_score": 200,
-            "worst_score": -800,
-            "rating": "blunder",
-        }]
+        rows = [
+            {
+                "move_id": 10,
+                "minimax_depth": 4,
+                "played_column": 2,
+                "best_column": 3,
+                "worst_column": 0,
+                "played_score": 10,
+                "best_score": 200,
+                "worst_score": -800,
+                "rating": "blunder",
+            }
+        ]
 
         with patch.object(supabase_store, "get_client", return_value=client):
             self.assertTrue(supabase_store.set_game_analysis_status(game_id, "processing"))
             self.assertTrue(supabase_store.replace_move_analysis(game_id, rows))
             self.assertTrue(supabase_store.set_game_analysis_status(game_id, "complete"))
 
-        self.assertEqual([(op["table"], op["action"]) for op in client.operations], [
-            ("games", "update"),
-            ("move_analysis", "delete"),
-            ("move_analysis", "insert"),
-            ("games", "update"),
-        ])
+        self.assertEqual(
+            [(op["table"], op["action"]) for op in client.operations],
+            [
+                ("games", "update"),
+                ("move_analysis", "delete"),
+                ("move_analysis", "insert"),
+                ("games", "update"),
+            ],
+        )
         inserted = client.operations[2]["payload"][0]
         self.assertEqual(inserted["game_id"], game_id)
         self.assertEqual(inserted["worst_column"], 0)
@@ -533,7 +753,13 @@ class SupabaseStoreTests(unittest.TestCase):
         after_three[4][3] = 1
         stored_moves = [
             {"move_number": 1, "player_number": 1, "column_played": 3, "board_before": empty, "board_after": after_one},
-            {"move_number": 3, "player_number": 1, "column_played": 3, "board_before": after_two, "board_after": after_three},
+            {
+                "move_number": 3,
+                "player_number": 1,
+                "column_played": 3,
+                "board_before": after_two,
+                "board_after": after_three,
+            },
         ]
 
         repaired = supabase_store.repair_move_history(stored_moves)

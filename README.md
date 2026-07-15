@@ -104,8 +104,11 @@ frontend/.env: VITE_BACKEND_URL, VITE_SOCKET_TRANSPORTS, VITE_SETUP_PATH, VITE_G
 Gameplay socket events require a Supabase access token when `AUTH_REQUIRED=true`.
 
 PvP room creation uses a client-generated request ID plus a Socket.IO
-acknowledgement. If the success event is lost during a reconnect, retrying the
-same request recovers the existing active room instead of creating a duplicate.
+reconciliation query. The backend derives ownership from the verified user,
+and the client explicitly joins the authoritative room returned for that
+user/request pair. Apply
+`docs/migrations/20260715_multiplayer_room_requests.sql` to make this recovery
+survive backend restarts; without it, the same flow falls back to memory.
 
 When configured, the backend writes game rows, player rows, valid moves, final game status, and requested move analysis to Supabase. The profile page reads completed game history through the backend; completed means a win or draw was recorded. Live Socket.IO game state still runs in memory.
 
@@ -120,6 +123,7 @@ POST /api/profile/games/{gameId}/analysis
 Socket.IO create_game
 Socket.IO join_game
 Socket.IO create_multiplayer_game
+Socket.IO reconcile_multiplayer_creation
 Socket.IO join_multiplayer_game
 Socket.IO player_move
 Socket.IO reset_game
@@ -151,7 +155,9 @@ Every new AI game randomizes the starting side. Multiplayer rooms randomize the 
 
 - Database persistence is backend-only and optional. If Supabase env vars are missing, gameplay still works without saving.
 - Auth requires Supabase env vars on the frontend. The backend verifies tokens with `SUPABASE_JWT_SECRET` when set, or through the configured Supabase client.
-- Rejoin only works while the backend process stays alive.
+- Waiting-room creation can be recovered after a backend restart when the PvP
+  request migration is installed. Active matches still require the original
+  backend process.
 - Free backend hosting limited CPU resources to work with.
 - In-memory Socket.IO rooms are not safe for horizontal scaling without a message queue or shared store.
 - Move-analysis jobs are coordinated in memory and currently assume one backend process.

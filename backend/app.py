@@ -5,7 +5,9 @@ import threading
 import time
 import uuid
 from collections import deque
-from concurrent.futures import ProcessPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
+from datetime import datetime, timezone
 
 import jwt
 import numpy as np
@@ -56,7 +58,9 @@ def get_env_bool(name, default):
 
 
 def get_cors_origins():
-    configured_origins = get_env_value("CORS_ALLOWED_ORIGINS", get_env_value("FRONTEND_ORIGIN", "http://localhost:5173"))
+    configured_origins = get_env_value(
+        "CORS_ALLOWED_ORIGINS", get_env_value("FRONTEND_ORIGIN", "http://localhost:5173")
+    )
     return [origin.strip() for origin in configured_origins.split(",") if origin.strip()]
 
 
@@ -72,6 +76,7 @@ games = {}
 games_lock = threading.Lock()
 multiplayer_create_lock = threading.Lock()
 create_attempts = {}
+create_attempts_lock = threading.Lock()
 ai_executor = None
 ai_executor_lock = threading.Lock()
 AI_WORKER_COUNT = max(1, get_env_int("AI_WORKER_COUNT", 1))
@@ -262,7 +267,7 @@ def get_ai_piece(game):
     return game.get("ai_piece", AI)
 
 
-def create_multiplayer_game_state(player_id=None, profile_id=None):
+def create_multiplayer_game_state(player_id=None, profile_id=None, bind_socket=True):
     player_id = player_id or uuid.uuid4().hex
     now = time.time()
     return {
@@ -274,8 +279,8 @@ def create_multiplayer_game_state(player_id=None, profile_id=None):
                 "piece": HUMAN,
                 "profile_id": profile_id,
                 "display_name": "Player 1",
-                "socket_id": request.sid if request else None,
-                "connected": True,
+                "socket_id": request.sid if bind_socket and request else None,
+                "connected": bool(bind_socket),
                 "disconnect_token": None,
             },
         },
@@ -320,23 +325,38 @@ def cleanup_stale_games():
     with games_lock:
         for game_id, game in games.items():
             ttl = MULTIPLAYER_GAME_TTL_SECONDS if game.get("mode") == "multiplayer" else AI_GAME_TTL_SECONDS
-            if now - game.get("updated_at", game.get("created_at", now)) > ttl:
+            durable_expires_at = game.get("durable_expires_at")
+            if (durable_expires_at is not None and durable_expires_at <= now) or now - game.get(
+                "updated_at", game.get("created_at", now)
+            ) > ttl:
                 stale_game_ids.append(game_id)
 
     for game_id in stale_game_ids:
         removed = False
+        removed_game = None
         with get_game_lock(game_id):
             game = get_stored_game(game_id)
             if game is None:
                 removed = True
             else:
                 ttl = MULTIPLAYER_GAME_TTL_SECONDS if game.get("mode") == "multiplayer" else AI_GAME_TTL_SECONDS
-                if now - game.get("updated_at", game.get("created_at", now)) > ttl:
+                durable_expires_at = game.get("durable_expires_at")
+                if (durable_expires_at is not None and durable_expires_at <= now) or now - game.get(
+                    "updated_at", game.get("created_at", now)
+                ) > ttl:
                     with games_lock:
                         if games.get(game_id) is game:
                             games.pop(game_id, None)
                             removed = True
+                            removed_game = game
         if removed:
+            if (
+                removed_game is not None
+                and removed_game.get("mode") == "multiplayer"
+                and removed_game.get("status") == "waiting"
+                and removed_game.get("creation_request_id")
+            ):
+                supabase_store.resolve_multiplayer_room_request(game_id, "expired")
             delete_game_lock(game_id)
 
 
@@ -344,18 +364,37 @@ def check_create_allowed():
     cleanup_stale_games()
     now = time.time()
     key = request_key()
-    attempts = [stamp for stamp in create_attempts.get(key, []) if now - stamp < CREATE_RATE_LIMIT_SECONDS]
-    create_attempts[key] = attempts
+    # This deployment is intentionally single-process. Protect the in-memory
+    # rate limiter from concurrent Socket.IO threads without adding Redis.
+    with create_attempts_lock:
+        attempts = [stamp for stamp in create_attempts.get(key, []) if now - stamp < CREATE_RATE_LIMIT_SECONDS]
+        if len(attempts) >= CREATE_RATE_LIMIT_COUNT:
+            create_attempts[key] = attempts
+            return "Too many games created. Try again later."
 
-    if len(attempts) >= CREATE_RATE_LIMIT_COUNT:
-        return "Too many games created. Try again later."
+        with games_lock:
+            if len(games) >= MAX_ACTIVE_GAMES:
+                return "Server has too many active games. Try again later."
 
-    with games_lock:
-        if len(games) >= MAX_ACTIVE_GAMES:
-            return "Server has too many active games. Try again later."
-
-    attempts.append(now)
+        attempts.append(now)
+        create_attempts[key] = attempts
     return None
+
+
+def authenticated_display_name(auth_context):
+    """Resolve room names from trusted profile data, never client payloads."""
+    profile_id = auth_context.get("profile_id")
+    try:
+        profile_name = supabase_store.fetch_profile_display_name(profile_id)
+    except Exception as error:
+        app.logger.warning(
+            "Could not load multiplayer display name profile_id=%s error=%s",
+            profile_id,
+            error.__class__.__name__,
+        )
+        profile_name = None
+    email_name = (auth_context.get("email") or "").partition("@")[0]
+    return sanitize_public_owner_name(profile_name, email_name or "Player")
 
 
 def remove_ai_games_for_sid(socket_id):
@@ -463,17 +502,19 @@ def run_move_analysis(moves, minimax_depth, time_limit):
         played_score = scores[played_column]
         best_score = scores[best_column]
         worst_score = scores[worst_column]
-        results.append({
-            "move_id": move_id,
-            "minimax_depth": minimax_depth,
-            "played_column": played_column,
-            "best_column": best_column,
-            "worst_column": worst_column,
-            "played_score": played_score,
-            "best_score": best_score,
-            "worst_score": worst_score,
-            "rating": analysis_rating(played_score, best_score, worst_score),
-        })
+        results.append(
+            {
+                "move_id": move_id,
+                "minimax_depth": minimax_depth,
+                "played_column": played_column,
+                "best_column": best_column,
+                "worst_column": worst_column,
+                "played_score": played_score,
+                "best_score": best_score,
+                "worst_score": worst_score,
+                "rating": analysis_rating(played_score, best_score, worst_score),
+            }
+        )
     return results
 
 
@@ -584,12 +625,16 @@ def complete_move_analysis(job):
             rows = run_move_analysis(job["moves"], job["minimax_depth"], job["time_limit"])
         else:
             # Intentionally no Future timeout/cancellation: analysis is non-preemptive.
-            rows = get_ai_executor().submit(
-                run_move_analysis,
-                job["moves"],
-                job["minimax_depth"],
-                job["time_limit"],
-            ).result()
+            rows = (
+                get_ai_executor()
+                .submit(
+                    run_move_analysis,
+                    job["moves"],
+                    job["minimax_depth"],
+                    job["time_limit"],
+                )
+                .result()
+            )
         if not supabase_store.replace_move_analysis(job["game_id"], rows):
             raise RuntimeError("Could not persist move analysis")
         if not supabase_store.set_game_analysis_status(job["game_id"], "complete"):
@@ -630,9 +675,7 @@ def dispatch_ai_scheduler(release_running=False):
             ai_running_job_type = next_job_type
             if next_job_type == "move_analysis":
                 next_job["state"] = "running"
-        blocked_by_admissions = bool(
-            not ai_active_jobs and move_analysis_job_queue and ai_admission_queue
-        )
+        blocked_by_admissions = bool(not ai_active_jobs and move_analysis_job_queue and ai_admission_queue)
 
     if blocked_by_admissions:
         schedule_analysis_admission_wakeup()
@@ -675,8 +718,7 @@ def wake_analysis_after_stale_admissions():
                 return
             now = time.time()
             next_expiry = min(
-                entry.get("last_checked_at", now) + AI_ADMISSION_STALE_SECONDS
-                for entry in ai_admission_queue
+                entry.get("last_checked_at", now) + AI_ADMISSION_STALE_SECONDS for entry in ai_admission_queue
             )
         socketio.sleep(max(0.05, next_expiry - time.time() + 0.01))
         with ai_queue_lock:
@@ -699,18 +741,14 @@ def reset_ai_job_queue():
 def active_ai_game_count():
     with games_lock:
         return sum(
-            1
-            for game in games.values()
-            if game.get("mode") == "ai" and game.get("status") not in FINISHED_STATUSES
+            1 for game in games.values() if game.get("mode") == "ai" and game.get("status") not in FINISHED_STATUSES
         )
 
 
 def prune_ai_admission_queue(now=None):
     now = now or time.time()
     active_entries = [
-        entry
-        for entry in ai_admission_queue
-        if now - entry.get("last_checked_at", now) <= AI_ADMISSION_STALE_SECONDS
+        entry for entry in ai_admission_queue if now - entry.get("last_checked_at", now) <= AI_ADMISSION_STALE_SECONDS
     ]
     ai_admission_queue.clear()
     ai_admission_queue.extend(active_entries)
@@ -725,9 +763,7 @@ def request_ai_admission(profile_id, difficulty, queue_id=None):
             (
                 queued_entry
                 for queued_entry in ai_admission_queue
-                if queue_id
-                and queued_entry["queue_id"] == queue_id
-                and queued_entry.get("profile_id") == profile_id
+                if queue_id and queued_entry["queue_id"] == queue_id and queued_entry.get("profile_id") == profile_id
             ),
             None,
         )
@@ -864,7 +900,11 @@ def prepare_ai_turn(game_id, game, expected_game=None, slot_reserved=False):
         if slot_reserved:
             release_ai_search_slot(slot_reserved)
         return None, None
-    if game.get("status") in FINISHED_STATUSES or game.get("current_player") != get_ai_piece(game) or game.get("ai_thinking"):
+    if (
+        game.get("status") in FINISHED_STATUSES
+        or game.get("current_player") != get_ai_piece(game)
+        or game.get("ai_thinking")
+    ):
         if slot_reserved:
             release_ai_search_slot(slot_reserved)
         return None, None
@@ -875,11 +915,7 @@ def prepare_ai_turn(game_id, game, expected_game=None, slot_reserved=False):
     game["ai_thinking"] = True
     game["ai_queued"] = reservation.get("state") == "queued"
     game["ai_queue_position"] = reservation.get("position", 0)
-    game["message"] = (
-        f"AI queued - position {game['ai_queue_position']}"
-        if game["ai_queued"]
-        else "AI is thinking"
-    )
+    game["message"] = f"AI queued - position {game['ai_queue_position']}" if game["ai_queued"] else "AI is thinking"
     mark_game_updated(game)
     supabase_store.update_game_record(game_id, game)
     return {
@@ -914,7 +950,9 @@ def apply_ai_result(game, game_id, ai_move, transposition_table):
     board_before = board_to_list(board)
     drop_piece(board, ai_move, ai_piece)
     if game_id:
-        supabase_store.record_move(game_id, game, ai_piece, ai_move, board_before, board_to_list(board), is_ai_move=True)
+        supabase_store.record_move(
+            game_id, game, ai_piece, ai_move, board_before, board_to_list(board), is_ai_move=True
+        )
     game["transposition_table"] = transposition_table
 
     if check_win(board, ai_piece):
@@ -1095,7 +1133,7 @@ def find_multiplayer_creation(profile_id, request_id):
 
 
 def multiplayer_create_rejection(message, request_id=None, code="create_rejected"):
-    event_payload = {"message": message}
+    event_payload = {"message": message, "code": code}
     if request_id is not None:
         event_payload["requestId"] = request_id
     emit("create_rejected", event_payload)
@@ -1118,6 +1156,148 @@ def multiplayer_create_success(game_payload, request_id=None, recovered=False):
         "recovered": recovered,
         **game_payload,
     }
+
+
+def parse_timestamp(value):
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def durable_multiplayer_room_error(room, profile_id, request_id):
+    expected_profile_id = supabase_store.db_game_id(profile_id)
+    if (
+        not isinstance(room, dict)
+        or expected_profile_id is None
+        or room.get("profile_id") != expected_profile_id
+        or room.get("request_id") != request_id
+    ):
+        return "creation_request_invalid", "Stored multiplayer room request is invalid"
+
+    state = room.get("state")
+    if state == "expired":
+        return "creation_request_expired", "This multiplayer room request has expired"
+    if state == "invalid":
+        return "creation_request_invalid", "Stored multiplayer room request is invalid"
+    if state != "active":
+        return "creation_request_terminal", "This multiplayer room request is no longer active"
+
+    expires_at = parse_timestamp(room.get("expires_at"))
+    if expires_at is None:
+        return "creation_request_invalid", "Stored multiplayer room request is invalid"
+    if expires_at <= time.time():
+        return "creation_request_expired", "This multiplayer room request has expired"
+
+    if (
+        room.get("game_mode") != "multiplayer"
+        or room.get("game_status") != "waiting"
+        or room.get("player_count") != 1
+        or room.get("owner_profile_id") != expected_profile_id
+        or supabase_store.db_game_id(room.get("game_id")) is None
+        or supabase_store.db_game_id(room.get("player_id")) is None
+    ):
+        return "creation_request_invalid", "Stored multiplayer room request is invalid"
+    return None, None
+
+
+def rebuild_durable_multiplayer_room(room, bind_socket):
+    game_id = supabase_store.db_game_id(room.get("game_id"))
+    player_id = supabase_store.db_game_id(room.get("player_id"))
+    profile_id = supabase_store.db_game_id(room.get("profile_id"))
+    if game_id is None or player_id is None or profile_id is None:
+        return None, None, None
+
+    with get_game_lock(game_id):
+        game = get_stored_game(game_id)
+        if game is None:
+            game = create_multiplayer_game_state(player_id, profile_id=profile_id, bind_socket=bind_socket)
+            game["owner_name"] = sanitize_public_owner_name(room.get("owner_name"))
+            game["players"][player_id]["display_name"] = game["owner_name"]
+            game["creation_request_id"] = room["request_id"]
+            game["creator_profile_id"] = profile_id
+            game["creator_player_id"] = player_id
+            game["durable_expires_at"] = parse_timestamp(room.get("expires_at"))
+            store_game(game_id, game)
+        else:
+            player = game.get("players", {}).get(player_id)
+            if (
+                game.get("mode") != "multiplayer"
+                or game.get("creation_request_id") != room.get("request_id")
+                or game.get("creator_profile_id") != profile_id
+                or player is None
+                or player.get("profile_id") != profile_id
+            ):
+                return None, None, None
+            if bind_socket:
+                mark_multiplayer_player_connected(game_id, game, player_id)
+    return game_id, player_id, game
+
+
+def recover_in_memory_multiplayer_room(profile_id, request_id, bind_socket):
+    game_id, player_id = find_multiplayer_creation(profile_id, request_id)
+    if not game_id or not player_id:
+        return None, None, None
+
+    with get_game_lock(game_id):
+        game = get_stored_game(game_id)
+        player = (game or {}).get("players", {}).get(player_id)
+        if (
+            game is None
+            or game.get("mode") != "multiplayer"
+            or game.get("status") != "waiting"
+            or len(game.get("players", {})) != 1
+            or (game.get("durable_expires_at") is not None and game.get("durable_expires_at") <= time.time())
+            or game.get("creation_request_id") != request_id
+            or game.get("creator_profile_id") != profile_id
+            or player is None
+            or player.get("profile_id") != profile_id
+        ):
+            return None, None, None
+        if bind_socket:
+            mark_multiplayer_player_connected(game_id, game, player_id)
+    return game_id, player_id, game
+
+
+def prepare_durable_multiplayer_room(room, profile_id, request_id, bind_socket):
+    error_code, error_message = durable_multiplayer_room_error(room, profile_id, request_id)
+    if error_code:
+        if error_code == "creation_request_expired":
+            supabase_store.resolve_multiplayer_room_request(room.get("game_id"), "expired")
+        elif error_code == "creation_request_invalid":
+            supabase_store.resolve_multiplayer_room_request(room.get("game_id"), "invalid")
+        return None, None, None, error_code, error_message
+
+    game_id, player_id, game = rebuild_durable_multiplayer_room(room, bind_socket)
+    if game is None:
+        supabase_store.resolve_multiplayer_room_request(room.get("game_id"), "invalid")
+        return (
+            None,
+            None,
+            None,
+            "creation_request_invalid",
+            "Stored multiplayer room request is invalid",
+        )
+    return game_id, player_id, game, None, None
+
+
+def reconcile_multiplayer_rejection(request_id, code, message):
+    return {
+        "ok": False,
+        "status": "rejected",
+        "requestId": request_id,
+        "code": code,
+        "message": message,
+    }
+
+
+def multiplayer_join_rejection(game_id, message, request_id=None):
+    payload = {"gameId": game_id, "message": message}
+    if request_id is not None:
+        payload["requestId"] = request_id
+    emit("join_rejected", payload)
 
 
 def public_game_payload(game_id, game):
@@ -1155,7 +1335,12 @@ def apply_human_and_ai_move(game, column, game_id=None):
     if column < 0 or column >= COLS:
         return None, "Column out of range"
 
-    if game["status"] in FINISHED_STATUSES or check_win(board, human_piece) or check_win(board, ai_piece) or is_draw(board):
+    if (
+        game["status"] in FINISHED_STATUSES
+        or check_win(board, human_piece)
+        or check_win(board, ai_piece)
+        or is_draw(board)
+    ):
         return None, "Game is already over"
 
     if game.get("current_player") != human_piece:
@@ -1296,7 +1481,7 @@ def mark_multiplayer_player_connected(game_id, game, player_id):
         if game["status"] == "playing":
             game["message"] = f"Player {game['current_player']} turn"
     mark_game_updated(game)
-    print(f"Player {player['piece']} connected to game {game_id}")
+    app.logger.info("Player reconnected game_id=%s player_number=%s", game_id, player["piece"])
 
 
 def start_multiplayer_disconnect_timer(game_id, player_id, disconnect_token):
@@ -1404,20 +1589,33 @@ def profile_games():
     if not profile_id:
         return jsonify({"message": "Login required"}), 401
 
-    # Repair a participant row if its join-time database write failed. Games
-    # remain in server memory after completion, so both players can recover
-    # their profile history without replaying the match.
-    with games_lock:
-        profile_games_to_repair = [
-            (game_id, game)
-            for game_id, game in games.items()
-            if game.get("mode") == "multiplayer"
-            and any(player.get("profile_id") == profile_id for player in game.get("players", {}).values())
-        ]
-    for game_id, game in profile_games_to_repair:
-        supabase_store.add_game_player_records(game_id, game)
+    try:
+        # Repair a participant row if its join-time database write failed.
+        with games_lock:
+            profile_games_to_repair = [
+                (game_id, game)
+                for game_id, game in games.items()
+                if game.get("mode") == "multiplayer"
+                and any(player.get("profile_id") == profile_id for player in game.get("players", {}).values())
+            ]
+        for game_id, game in profile_games_to_repair:
+            supabase_store.add_game_player_records(game_id, game)
 
-    return jsonify({"games": supabase_store.fetch_completed_games(profile_id)})
+        completed_games = supabase_store.fetch_completed_games(profile_id)
+    except Exception as error:
+        app.logger.warning(
+            "Could not load profile games profile_id=%s error=%s",
+            profile_id,
+            error.__class__.__name__,
+        )
+        return jsonify(
+            {
+                "message": GAME_REVIEW_UNAVAILABLE_MESSAGE,
+                "code": "profile_games_unavailable",
+            }
+        ), 503
+
+    return jsonify({"games": completed_games})
 
 
 @app.get("/api/profile/games/<game_id>/moves")
@@ -1434,10 +1632,12 @@ def profile_game_moves(game_id):
         review = supabase_store.fetch_game_moves(profile_id, game_id)
     except Exception as error:
         app.logger.warning("Could not load game review (%s)", error.__class__.__name__)
-        return jsonify({
-            "message": GAME_REVIEW_UNAVAILABLE_MESSAGE,
-            "code": "game_review_unavailable",
-        }), 503
+        return jsonify(
+            {
+                "message": GAME_REVIEW_UNAVAILABLE_MESSAGE,
+                "code": "game_review_unavailable",
+            }
+        ), 503
     if review is None or not review["moves"]:
         return jsonify({"message": "Game history not found"}), 404
 
@@ -1471,27 +1671,33 @@ def request_profile_game_analysis(game_id):
         source = supabase_store.fetch_game_analysis_source(profile_id, game_id)
     except Exception as error:
         app.logger.warning("Could not load move-analysis source (%s)", error.__class__.__name__)
-        return jsonify({
-            "message": GAME_REVIEW_UNAVAILABLE_MESSAGE,
-            "code": "game_review_unavailable",
-        }), 503
+        return jsonify(
+            {
+                "message": GAME_REVIEW_UNAVAILABLE_MESSAGE,
+                "code": "game_review_unavailable",
+            }
+        ), 503
     if source is None:
         return jsonify({"message": "Completed game history not found"}), 404
     if not source.get("analysis_available", True):
-        return jsonify({
-            "message": source.get("analysis_unavailable_reason")
-            or supabase_store.MOVE_ANALYSIS_SCHEMA_UPDATE_MESSAGE,
-            "code": "move_analysis_schema_update_required",
-        }), 503
+        return jsonify(
+            {
+                "message": source.get("analysis_unavailable_reason")
+                or supabase_store.MOVE_ANALYSIS_SCHEMA_UPDATE_MESSAGE,
+                "code": "move_analysis_schema_update_required",
+            }
+        ), 503
     if source["analysis_status"] == "complete":
         return jsonify({"gameId": game_id, "status": "complete"})
     if not source["moves"]:
         return jsonify({"message": "No recorded moves to analyze"}), 422
     if any(move.get("id") is None for move in source["moves"]):
-        return jsonify({
-            "message": "Move evaluation is unavailable because this game has incomplete move history.",
-            "code": "incomplete_move_history",
-        }), 422
+        return jsonify(
+            {
+                "message": "Move evaluation is unavailable because this game has incomplete move history.",
+                "code": "incomplete_move_history",
+            }
+        ), 422
 
     with ai_queue_lock:
         existing = analysis_jobs_by_game.get(game_id)
@@ -1509,12 +1715,14 @@ def request_profile_game_analysis(game_id):
         if job.get("state") == "queued" and job in move_analysis_job_queue:
             position = list(move_analysis_job_queue).index(job) + 1
         status = job.get("state", "queued")
-    return jsonify({
-        "gameId": game_id,
-        "status": status,
-        "queuePosition": position,
-        "priority": "move_analysis",
-    }), 202
+    return jsonify(
+        {
+            "gameId": game_id,
+            "status": status,
+            "queuePosition": position,
+            "priority": "move_analysis",
+        }
+    ), 202
 
 
 def create_admitted_ai_game(auth_context, difficulty):
@@ -1536,13 +1744,16 @@ def create_admitted_ai_game(auth_context, difficulty):
 def emit_ai_admission_result(auth_context, difficulty, queue_id=None):
     admitted, entry, position = request_ai_admission(auth_context["profile_id"], difficulty, queue_id)
     if not admitted:
-        emit("ai_waiting", {
-            "queueId": entry["queue_id"],
-            "position": position,
-            "difficulty": entry["difficulty"],
-            "checkIntervalSeconds": 20,
-            "message": "AI player is currently busy right now.",
-        })
+        emit(
+            "ai_waiting",
+            {
+                "queueId": entry["queue_id"],
+                "position": position,
+                "difficulty": entry["difficulty"],
+                "checkIntervalSeconds": 20,
+                "message": "AI player is currently busy right now.",
+            },
+        )
         return
 
     try:
@@ -1658,56 +1869,171 @@ def socket_create_multiplayer_game(data=None):
     game_payload = None
     recovered = False
     created = False
+    fallback_persistence = False
 
     # Serialize the request-id lookup and insertion so two simultaneous retries
     # cannot create separate rooms. Per-game state is still mutated under that
     # game's lock, and games_lock is never held while acquiring a game lock.
     with multiplayer_create_lock:
         cleanup_stale_games()
-        recovered_game_id, recovered_player_id = find_multiplayer_creation(profile_id, request_id)
-        if recovered_game_id and recovered_player_id:
-            with get_game_lock(recovered_game_id):
-                recovered_game = get_stored_game(recovered_game_id)
-                recovered_player = (recovered_game or {}).get("players", {}).get(recovered_player_id)
-                if (
-                    recovered_game is not None
-                    and recovered_game.get("mode") == "multiplayer"
-                    and recovered_game.get("creation_request_id") == request_id
-                    and recovered_game.get("creator_profile_id") == profile_id
-                    and recovered_player is not None
-                    and recovered_player.get("profile_id") == profile_id
-                ):
-                    mark_multiplayer_player_connected(recovered_game_id, recovered_game, recovered_player_id)
-                    game = recovered_game
-                    game_id = recovered_game_id
-                    player_id = recovered_player_id
-                    game_payload = serialize_game(game_id, game, player_id=player_id)
-                    recovered = True
+        in_memory_creation_id, _ = find_multiplayer_creation(profile_id, request_id)
+        game_id, player_id, game = recover_in_memory_multiplayer_room(profile_id, request_id, True)
+        if game is not None:
+            game_payload = serialize_game(game_id, game, player_id=player_id)
+            recovered = True
+        elif in_memory_creation_id is not None:
+            return multiplayer_create_rejection(
+                "This multiplayer room request is no longer active",
+                request_id,
+                "creation_request_terminal",
+            )
 
         if game is None:
-            error = check_create_allowed()
-            if error:
-                return multiplayer_create_rejection(error, request_id)
-
-            game_id = uuid.uuid4().hex
-            player_id = uuid.uuid4().hex
-            game = create_multiplayer_game_state(player_id, profile_id=profile_id)
-            game["owner_name"] = sanitize_public_owner_name(data.get("ownerName"), auth_context.get("email") or "Player")
-            game["players"][player_id]["display_name"] = game["owner_name"]
+            owner_name = authenticated_display_name(auth_context)
+            persistence_result = {"result": "disabled"}
             if request_id is not None and profile_id is not None:
-                game["creation_request_id"] = request_id
-                game["creator_profile_id"] = profile_id
-                game["creator_player_id"] = player_id
-            game_payload = serialize_game(game_id, game, player_id=player_id)
-            store_game(game_id, game)
-            created = True
+                persistence_result = supabase_store.fetch_multiplayer_room_request(profile_id, request_id)
+                if persistence_result.get("result") == "ok":
+                    room = persistence_result["room"]
+                    game_id, player_id, game, error_code, error_message = prepare_durable_multiplayer_room(
+                        room,
+                        profile_id,
+                        request_id,
+                        True,
+                    )
+                    if error_code:
+                        return multiplayer_create_rejection(error_message, request_id, error_code)
+                    game_payload = serialize_game(game_id, game, player_id=player_id)
+                    recovered = True
+                elif persistence_result.get("result") == "error":
+                    return multiplayer_create_rejection(
+                        "Multiplayer room persistence is temporarily unavailable. Try again.",
+                        request_id,
+                        persistence_result.get("code") or "persistence_unavailable",
+                    )
 
-    if created:
+            if game is None:
+                error = check_create_allowed()
+                if error:
+                    return multiplayer_create_rejection(error, request_id)
+
+                proposed_game_id = str(uuid.uuid4())
+                proposed_player_id = str(uuid.uuid4())
+                if (
+                    request_id is not None
+                    and profile_id is not None
+                    and persistence_result.get("result") == "not_found"
+                ):
+                    claim_result = supabase_store.claim_multiplayer_room_request(
+                        profile_id,
+                        request_id,
+                        proposed_game_id,
+                        proposed_player_id,
+                        owner_name,
+                    )
+                    if claim_result.get("result") == "ok":
+                        room = claim_result["room"]
+                        game_id, player_id, game, error_code, error_message = prepare_durable_multiplayer_room(
+                            room,
+                            profile_id,
+                            request_id,
+                            True,
+                        )
+                        if error_code:
+                            return multiplayer_create_rejection(error_message, request_id, error_code)
+                        game_payload = serialize_game(game_id, game, player_id=player_id)
+                        created = bool(room.get("created"))
+                        recovered = not created
+                    elif claim_result.get("result") == "error":
+                        return multiplayer_create_rejection(
+                            "Multiplayer room persistence is temporarily unavailable. Try again.",
+                            request_id,
+                            claim_result.get("code") or "persistence_unavailable",
+                        )
+                    else:
+                        persistence_result = claim_result
+
+                if game is None:
+                    # Supabase is disabled or the optional recovery migration is
+                    # not installed. Preserve the original in-memory behavior.
+                    game_id = proposed_game_id
+                    player_id = proposed_player_id
+                    game = create_multiplayer_game_state(player_id, profile_id=profile_id)
+                    game["owner_name"] = owner_name
+                    game["players"][player_id]["display_name"] = owner_name
+                    if request_id is not None and profile_id is not None:
+                        game["creation_request_id"] = request_id
+                        game["creator_profile_id"] = profile_id
+                        game["creator_player_id"] = player_id
+                    game_payload = serialize_game(game_id, game, player_id=player_id)
+                    store_game(game_id, game)
+                    created = True
+                    fallback_persistence = True
+
+    if fallback_persistence:
         supabase_store.create_game_record(game_id, game)
     join_room(game_id)
     if created:
-        print(f"Player 1 connected to game {game_id}")
+        app.logger.info("Multiplayer player connected game_id=%s player_number=1", game_id)
     return multiplayer_create_success(game_payload, request_id, recovered)
+
+
+@socketio.on("reconcile_multiplayer_creation")
+def socket_reconcile_multiplayer_creation(data=None):
+    data = data or {}
+    request_id, request_id_error = parse_multiplayer_create_request_id(data)
+    auth_context, auth_error = authenticate_payload(data)
+    if auth_error:
+        return reconcile_multiplayer_rejection(request_id, "authentication_failed", auth_error)
+    if request_id_error or request_id is None:
+        return reconcile_multiplayer_rejection(None, "invalid_request", request_id_error or "Invalid request ID")
+
+    profile_id = auth_context["profile_id"]
+    with multiplayer_create_lock:
+        cleanup_stale_games()
+        in_memory_creation_id, _ = find_multiplayer_creation(profile_id, request_id)
+        game_id, player_id, game = recover_in_memory_multiplayer_room(profile_id, request_id, False)
+        if game is not None:
+            return {
+                "ok": True,
+                "status": "found",
+                "requestId": request_id,
+                "gameId": game_id,
+                "playerId": player_id,
+            }
+        if in_memory_creation_id is not None:
+            return reconcile_multiplayer_rejection(
+                request_id,
+                "creation_request_terminal",
+                "This multiplayer room request is no longer active",
+            )
+
+        persistence_result = supabase_store.fetch_multiplayer_room_request(profile_id, request_id)
+        if persistence_result.get("result") in {"disabled", "schema_missing", "not_found"}:
+            return {"ok": True, "status": "not_found", "requestId": request_id}
+        if persistence_result.get("result") == "error":
+            return reconcile_multiplayer_rejection(
+                request_id,
+                persistence_result.get("code") or "persistence_unavailable",
+                "Multiplayer room persistence is temporarily unavailable. Try again.",
+            )
+
+        room = persistence_result["room"]
+        game_id, player_id, game, error_code, error_message = prepare_durable_multiplayer_room(
+            room,
+            profile_id,
+            request_id,
+            False,
+        )
+        if error_code:
+            return reconcile_multiplayer_rejection(request_id, error_code, error_message)
+        return {
+            "ok": True,
+            "status": "found",
+            "requestId": request_id,
+            "gameId": game_id,
+            "playerId": player_id,
+        }
 
 
 @socketio.on("list_public_games")
@@ -1766,53 +2092,66 @@ def socket_set_room_public(data):
                     error = None
 
     if error:
-        emit("room_public_update_failed", {
-            "gameId": game_id,
-            "publicRoom": bool((get_stored_game(game_id) or {}).get("public")),
-            "message": invalid_payload["message"],
-            "retryAfterMs": invalid_payload.get("retryAfterMs", 0),
-        })
+        emit(
+            "room_public_update_failed",
+            {
+                "gameId": game_id,
+                "publicRoom": bool((get_stored_game(game_id) or {}).get("public")),
+                "message": invalid_payload["message"],
+                "retryAfterMs": invalid_payload.get("retryAfterMs", 0),
+            },
+        )
         return
 
     confirmed_public = bool(game.get("public"))
     if confirmed_public != requested_public:
-        emit("room_public_update_failed", {
-            "gameId": game_id,
-            "publicRoom": confirmed_public,
-            "message": "Room visibility could not be confirmed",
-        })
+        emit(
+            "room_public_update_failed",
+            {
+                "gameId": game_id,
+                "publicRoom": confirmed_public,
+                "message": "Room visibility could not be confirmed",
+            },
+        )
         return
 
-    emit("room_public_updated", {
-        "gameId": game_id,
-        "publicRoom": confirmed_public,
-        "message": "Room is now public" if confirmed_public else "Room is now private",
-    })
+    emit(
+        "room_public_updated",
+        {
+            "gameId": game_id,
+            "publicRoom": confirmed_public,
+            "message": "Room is now public" if confirmed_public else "Room is now private",
+        },
+    )
 
 
 @socketio.on("join_multiplayer_game")
 def socket_join_multiplayer_game(data):
     data = data or {}
+    request_id, request_id_error = parse_multiplayer_create_request_id(data)
+    game_id = data.get("gameId") if isinstance(data, dict) else None
     auth_context, auth_error = authenticate_payload(data or {})
     if auth_error:
-        emit("join_rejected", {"gameId": None, "message": auth_error})
+        multiplayer_join_rejection(game_id, auth_error, request_id)
+        return
+    if request_id_error:
+        multiplayer_join_rejection(game_id, request_id_error, None)
         return
 
-    game_id = data.get("gameId") if isinstance(data, dict) else None
     player_id = data.get("playerId") if isinstance(data, dict) else None
     if not game_id:
-        emit("join_rejected", {"gameId": game_id, "message": "Multiplayer game not found"})
+        multiplayer_join_rejection(game_id, "Multiplayer game not found", request_id)
         return
 
     with get_game_lock(game_id):
         game = get_stored_game(game_id)
         if game is None or game.get("mode") != "multiplayer":
-            emit("join_rejected", {"gameId": game_id, "message": "Multiplayer game not found"})
+            multiplayer_join_rejection(game_id, "Multiplayer game not found", request_id)
             return
 
         if player_id in game["players"]:
             if is_auth_required() and game["players"][player_id].get("profile_id") != auth_context["profile_id"]:
-                emit("join_rejected", {"gameId": game_id, "message": "Multiplayer game not found"})
+                multiplayer_join_rejection(game_id, "Multiplayer game not found", request_id)
                 return
             mark_multiplayer_player_connected(game_id, game, player_id)
             joined_payload = serialize_game(game_id, game, player_id=player_id)
@@ -1820,19 +2159,19 @@ def socket_join_multiplayer_game(data):
             is_rejoin = True
 
         elif len(game["players"]) >= 2:
-            emit("join_rejected", {"gameId": game_id, "message": "Multiplayer game is full"})
+            multiplayer_join_rejection(game_id, "Multiplayer game is full", request_id)
             return
 
         elif data.get("publicJoin") and not game.get("public"):
-            emit("join_rejected", {"gameId": game_id, "message": "Room is no longer public"})
+            multiplayer_join_rejection(game_id, "Room is no longer public", request_id)
             return
 
         else:
-            player_id = uuid.uuid4().hex
+            player_id = str(uuid.uuid4())
             game["players"][player_id] = {
                 "piece": AI,
                 "profile_id": auth_context["profile_id"],
-                "display_name": sanitize_public_owner_name(data.get("playerName"), auth_context.get("email") or "Player"),
+                "display_name": authenticated_display_name(auth_context),
                 "socket_id": request.sid,
                 "connected": True,
                 "disconnect_token": None,
@@ -1843,16 +2182,21 @@ def socket_join_multiplayer_game(data):
             game["message"] = f"Player {game['current_player']} turn"
             mark_game_updated(game)
             supabase_store.add_game_player_records(game_id, game)
+            if game.get("creation_request_id"):
+                supabase_store.resolve_multiplayer_room_request(game_id, "completed")
             joined_payload = serialize_game(game_id, game, player_id=player_id)
             updated_payload = None
             is_rejoin = False
+
+        if request_id is not None:
+            joined_payload["requestId"] = request_id
 
     join_room(game_id)
     emit("multiplayer_game_joined", joined_payload)
     if is_rejoin:
         emit("board_updated", updated_payload, to=game_id)
     else:
-        print(f"Player 2 connected to game {game_id}")
+        app.logger.info("Multiplayer player connected game_id=%s player_number=2", game_id)
         emit_multiplayer_board_update(game_id, game)
 
 
@@ -1888,7 +2232,7 @@ def socket_disconnect():
         player["connected"] = False
         player["socket_id"] = None
         player["disconnect_token"] = uuid.uuid4().hex
-        print(f"Player {player['piece']} disconnected from game {game_id}")
+        app.logger.info("Player disconnected game_id=%s player_number=%s", game_id, player["piece"])
 
         if len(game["players"]) < 2 or game["status"] in FINISHED_STATUSES:
             game["public"] = False
@@ -1935,9 +2279,22 @@ def socket_leave_game(data):
         if not leave_allowed and game is not None and game.get("mode") == "multiplayer" and error is None:
             player = game["players"].get(player_id)
             if game["status"] == "waiting" and len(game["players"]) == 1:
-                supabase_store.delete_game_record(game_id)
-                pop_game(game_id)
-                leave_allowed = True
+                resolution = supabase_store.resolve_multiplayer_room_request(game_id, "cancelled")
+                if resolution.get("result") == "error":
+                    invalid_payload = make_socket_error(
+                        game_id,
+                        game,
+                        "Could not cancel room right now. Try again.",
+                    )
+                else:
+                    game["status"] = "abandoned"
+                    game["message"] = "Room cancelled"
+                    game["public"] = False
+                    mark_game_updated(game)
+                    if resolution.get("result") in {"disabled", "schema_missing"}:
+                        supabase_store.update_game_record(game_id, game)
+                    pop_game(game_id)
+                    leave_allowed = True
             elif is_multiplayer_finished(game):
                 player_left_payload = {"gameId": game_id, "message": f"Player {player['piece']} left the room"}
                 finalize_or_delete_previous_game(game_id, game)
@@ -1988,7 +2345,9 @@ def socket_play_again(data):
             game["rematch_requests"].add(player_id)
             mark_game_updated(game)
 
-            if len(game["rematch_requests"]) == 2 and all(player.get("connected") for player in game["players"].values()):
+            if len(game["rematch_requests"]) == 2 and all(
+                player.get("connected") for player in game["players"].values()
+            ):
                 finalize_or_delete_previous_game(game_id, game)
                 reset_multiplayer_game(game)
                 new_game_id = replace_game_id(game_id, game)

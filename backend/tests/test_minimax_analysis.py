@@ -34,15 +34,18 @@ class MinimaxAnalysisTests(unittest.TestCase):
         board = np.zeros((6, 7), dtype=int)
         static_scores_in_center_order = [30, 20, 40, 10, 50, 0, 60]
 
-        with patch.object(
-            minimax_module,
-            "minimax",
-            side_effect=[111, minimax_module.SearchTimeout()],
-        ) as deep_search, patch.object(
-            minimax_module,
-            "evaluate_board",
-            side_effect=static_scores_in_center_order,
-        ) as static_search:
+        with (
+            patch.object(
+                minimax_module,
+                "minimax",
+                side_effect=[111, minimax_module.SearchTimeout()],
+            ) as deep_search,
+            patch.object(
+                minimax_module,
+                "evaluate_board",
+                side_effect=static_scores_in_center_order,
+            ) as static_search,
+        ):
             best_column, worst_column, scores = minimax_module.get_move_scores(board, 1)
 
         self.assertEqual(deep_search.call_count, 2)

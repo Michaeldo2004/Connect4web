@@ -1,5 +1,6 @@
 import threading
 import unittest
+import uuid
 from unittest.mock import call, patch
 
 import app as app_module
@@ -32,6 +33,24 @@ class SocketGameTests(unittest.TestCase):
         app_module.create_attempts.clear()
         self.supabase_execute_patch = patch.object(app_module.supabase_store, "execute_safely", return_value=False)
         self.supabase_execute_patch.start()
+        self.room_claim_patch = patch.object(
+            app_module.supabase_store,
+            "claim_multiplayer_room_request",
+            return_value={"result": "disabled"},
+        )
+        self.room_fetch_patch = patch.object(
+            app_module.supabase_store,
+            "fetch_multiplayer_room_request",
+            return_value={"result": "disabled"},
+        )
+        self.room_resolve_patch = patch.object(
+            app_module.supabase_store,
+            "resolve_multiplayer_room_request",
+            return_value={"result": "disabled"},
+        )
+        self.room_claim_mock = self.room_claim_patch.start()
+        self.room_fetch_mock = self.room_fetch_patch.start()
+        self.room_resolve_mock = self.room_resolve_patch.start()
         self.client = socketio.test_client(app)
 
     def tearDown(self):
@@ -45,6 +64,9 @@ class SocketGameTests(unittest.TestCase):
         app.config["AI_SEARCH_INLINE"] = False
         app.config.pop("AUTH_REQUIRED", None)
         app_module.DISCONNECT_GRACE_SECONDS = 15
+        self.room_resolve_patch.stop()
+        self.room_fetch_patch.stop()
+        self.room_claim_patch.stop()
         self.supabase_execute_patch.stop()
 
     def create_game(self, difficulty="very_easy"):
@@ -53,14 +75,34 @@ class SocketGameTests(unittest.TestCase):
         self.assertIsNotNone(payload)
         return payload
 
+    def durable_room_record(self, profile_id, request_id, state="active", game_status="waiting", created=False):
+        return {
+            "profile_id": profile_id,
+            "request_id": request_id,
+            "game_id": str(uuid.uuid4()),
+            "player_id": str(uuid.uuid4()),
+            "owner_name": "Durable Player",
+            "state": state,
+            "expires_at": "2099-01-01T00:00:00+00:00",
+            "resolved_at": None,
+            "game_mode": "multiplayer",
+            "game_status": game_status,
+            "player_count": 1,
+            "owner_profile_id": profile_id,
+            "created": created,
+        }
+
     def test_socket_connects(self):
         self.assertTrue(self.client.is_connected())
 
     def test_api_move_endpoint_is_removed(self):
-        response = app.test_client().post("/api/move", json={
-            "board": [[0, 0, 0, 0, 0, 0, 0] for _ in range(6)],
-            "column": 3,
-        })
+        response = app.test_client().post(
+            "/api/move",
+            json={
+                "board": [[0, 0, 0, 0, 0, 0, 0] for _ in range(6)],
+                "column": 3,
+            },
+        )
         self.assertEqual(response.status_code, 404)
 
     def test_create_game_returns_game_and_player_ids(self):
@@ -119,22 +161,28 @@ class SocketGameTests(unittest.TestCase):
             else:
                 self.assertEqual(len(updates), 1)
                 self.assertEqual(updates[0]["currentPlayer"], 2)
-                self.assertEqual(updates[0]["aiMove"], next(
-                    column_index
-                    for row in updates[0]["board"]
-                    for column_index, cell in enumerate(row)
-                    if cell == 1
-                ))
+                self.assertEqual(
+                    updates[0]["aiMove"],
+                    next(
+                        column_index
+                        for row in updates[0]["board"]
+                        for column_index, cell in enumerate(row)
+                        if cell == 1
+                    ),
+                )
 
     def test_ai_move_rejected_when_not_human_turn(self):
         created = self.create_game()
         game = games[created["gameId"]]
         game["current_player"] = game["ai_piece"]
-        self.client.emit("player_move", {
-            "gameId": created["gameId"],
-            "playerId": created["playerId"],
-            "column": 3,
-        })
+        self.client.emit(
+            "player_move",
+            {
+                "gameId": created["gameId"],
+                "playerId": created["playerId"],
+                "column": 3,
+            },
+        )
         invalid = find_event(self.client, "invalid_move")
         self.assertIsNotNone(invalid)
         self.assertEqual(invalid["message"], "Not your turn")
@@ -145,11 +193,14 @@ class SocketGameTests(unittest.TestCase):
         game = games[created["gameId"]]
 
         with patch.object(app_module, "reserve_ai_search_slot", return_value=False):
-            self.client.emit("player_move", {
-                "gameId": created["gameId"],
-                "playerId": created["playerId"],
-                "column": 3,
-            })
+            self.client.emit(
+                "player_move",
+                {
+                    "gameId": created["gameId"],
+                    "playerId": created["playerId"],
+                    "column": 3,
+                },
+            )
 
         invalid = find_event(self.client, "invalid_move")
         self.assertIsNotNone(invalid)
@@ -172,9 +223,11 @@ class SocketGameTests(unittest.TestCase):
                 {"game_id": f"queued-{index}", "reservation": reservation}
                 for index, reservation in enumerate(queued_reservations, start=1)
             ]
-            with patch.object(app_module, "queued_game_payload", return_value={}), patch.object(
-                app_module.socketio, "emit"
-            ), patch.object(app_module, "start_reserved_ai_job") as start_job:
+            with (
+                patch.object(app_module, "queued_game_payload", return_value={}),
+                patch.object(app_module.socketio, "emit"),
+                patch.object(app_module, "start_reserved_ai_job") as start_job,
+            ):
                 for job in jobs:
                     app_module.launch_ai_turn(job)
                 app_module.finish_ai_job()
@@ -186,9 +239,11 @@ class SocketGameTests(unittest.TestCase):
         active = app_module.reserve_ai_search_slot()
         self.assertEqual(active["state"], "active")
 
-        with patch.object(app_module, "start_move_analysis_job") as start_analysis, patch.object(
-            app_module, "start_reserved_ai_job"
-        ) as start_live, patch.object(app_module, "queued_game_payload", return_value={}):
+        with (
+            patch.object(app_module, "start_move_analysis_job") as start_analysis,
+            patch.object(app_module, "start_reserved_ai_job") as start_live,
+            patch.object(app_module, "queued_game_payload", return_value={}),
+        ):
             analysis = app_module.enqueue_move_analysis("analysis-1", [])
             live_reservation = app_module.reserve_ai_search_slot()
             live_job = {"game_id": "live-1", "reservation": live_reservation}
@@ -202,9 +257,11 @@ class SocketGameTests(unittest.TestCase):
             start_analysis.assert_called_once_with(analysis)
 
     def test_running_move_analysis_is_non_preemptive(self):
-        with patch.object(app_module, "start_move_analysis_job") as start_analysis, patch.object(
-            app_module, "start_reserved_ai_job"
-        ) as start_live, patch.object(app_module, "queued_game_payload", return_value={}):
+        with (
+            patch.object(app_module, "start_move_analysis_job") as start_analysis,
+            patch.object(app_module, "start_reserved_ai_job") as start_live,
+            patch.object(app_module, "queued_game_payload", return_value={}),
+        ):
             analysis = app_module.enqueue_move_analysis("analysis-1", [])
             start_analysis.assert_called_once_with(analysis)
             self.assertEqual(app_module.ai_running_job_type, "move_analysis")
@@ -219,9 +276,7 @@ class SocketGameTests(unittest.TestCase):
             start_live.assert_called_once_with(live_job)
 
     def test_move_analysis_remains_exclusive_when_more_workers_are_configured(self):
-        with patch.object(app_module, "AI_WORKER_COUNT", 2), patch.object(
-            app_module, "start_move_analysis_job"
-        ):
+        with patch.object(app_module, "AI_WORKER_COUNT", 2), patch.object(app_module, "start_move_analysis_job"):
             app_module.enqueue_move_analysis("analysis-1", [])
             reservation = app_module.reserve_ai_search_slot()
 
@@ -251,26 +306,33 @@ class SocketGameTests(unittest.TestCase):
             start_analysis.assert_called_once_with(analysis)
 
     def test_move_analysis_builds_scores_and_ratings(self):
-        moves = [{
-            "id": 10,
-            "player_number": 1,
-            "column_played": 2,
-            "board_before": [[0 for _ in range(7)] for _ in range(6)],
-        }]
+        moves = [
+            {
+                "id": 10,
+                "player_number": 1,
+                "column_played": 2,
+                "board_before": [[0 for _ in range(7)] for _ in range(6)],
+            }
+        ]
         with patch.object(app_module, "get_move_scores", return_value=(3, 0, {0: -50, 2: 10, 3: 200})):
             rows = app_module.run_move_analysis(moves, 4, 30)
 
-        self.assertEqual(rows, [{
-            "move_id": 10,
-            "minimax_depth": 4,
-            "played_column": 2,
-            "best_column": 3,
-            "worst_column": 0,
-            "played_score": 10,
-            "best_score": 200,
-            "worst_score": -50,
-            "rating": "ok",
-        }])
+        self.assertEqual(
+            rows,
+            [
+                {
+                    "move_id": 10,
+                    "minimax_depth": 4,
+                    "played_column": 2,
+                    "best_column": 3,
+                    "worst_column": 0,
+                    "played_score": 10,
+                    "best_score": 200,
+                    "worst_score": -50,
+                    "rating": "ok",
+                }
+            ],
+        )
 
     def test_move_analysis_rating_rules_use_best_then_worst_precedence(self):
         self.assertEqual(app_module.analysis_rating(50, 50, -100), "great")
@@ -303,21 +365,29 @@ class SocketGameTests(unittest.TestCase):
         }
         app_module.analysis_jobs_by_game[job["game_id"]] = job
 
-        with patch.object(app_module, "run_move_analysis", return_value=[{"move_id": 10}]), patch.object(
-            app_module.supabase_store,
-            "replace_move_analysis",
-            return_value=True,
-        ), patch.object(
-            app_module.supabase_store,
-            "set_game_analysis_status",
-            side_effect=[False, True],
-        ) as set_status, patch.object(app_module, "finish_ai_job"):
+        with (
+            patch.object(app_module, "run_move_analysis", return_value=[{"move_id": 10}]),
+            patch.object(
+                app_module.supabase_store,
+                "replace_move_analysis",
+                return_value=True,
+            ),
+            patch.object(
+                app_module.supabase_store,
+                "set_game_analysis_status",
+                side_effect=[False, True],
+            ) as set_status,
+            patch.object(app_module, "finish_ai_job"),
+        ):
             app_module.complete_move_analysis(job)
 
-        self.assertEqual(set_status.call_args_list, [
-            call("analysis-1", "complete"),
-            call("analysis-1", "failed", "Could not complete move analysis"),
-        ])
+        self.assertEqual(
+            set_status.call_args_list,
+            [
+                call("analysis-1", "complete"),
+                call("analysis-1", "failed", "Could not complete move analysis"),
+            ],
+        )
         self.assertNotIn("analysis-1", app_module.analysis_jobs_by_game)
 
     def test_ai_admission_waiting_room_promotes_front_player(self):
@@ -331,10 +401,13 @@ class SocketGameTests(unittest.TestCase):
         self.assertNotIn("gameId", waiting)
 
         with patch.object(app_module, "AI_ADMISSION_CAPACITY", 1), patch("app.random.choice", return_value=1):
-            self.client.emit("check_ai_waiting", {
-                "queueId": waiting["queueId"],
-                "difficulty": "medium",
-            })
+            self.client.emit(
+                "check_ai_waiting",
+                {
+                    "queueId": waiting["queueId"],
+                    "difficulty": "medium",
+                },
+            )
             created = find_event(self.client, "game_created")
 
         self.assertIsNotNone(created)
@@ -343,10 +416,7 @@ class SocketGameTests(unittest.TestCase):
 
     def test_ai_admission_queue_is_unbounded_and_reports_positions(self):
         with patch.object(app_module, "AI_ADMISSION_CAPACITY", 0):
-            positions = [
-                app_module.request_ai_admission(f"profile-{index}", "easy")[2]
-                for index in range(1, 11)
-            ]
+            positions = [app_module.request_ai_admission(f"profile-{index}", "easy")[2] for index in range(1, 11)]
         self.assertEqual(positions, list(range(1, 11)))
 
     def test_stale_ai_result_is_discarded_after_game_version_changes(self):
@@ -404,11 +474,14 @@ class SocketGameTests(unittest.TestCase):
         current_game_id = created["gameId"]
         current_player_id = created["playerId"]
         for _ in range(8):
-            self.client.emit("reset_game", {
-                "gameId": current_game_id,
-                "playerId": current_player_id,
-                "difficulty": "very_easy",
-            })
+            self.client.emit(
+                "reset_game",
+                {
+                    "gameId": current_game_id,
+                    "playerId": current_player_id,
+                    "difficulty": "very_easy",
+                },
+            )
             updates = find_events(self.client, "board_updated")
             reset = updates[0]
             self.assertNotEqual(reset["gameId"], current_game_id)
@@ -434,10 +507,13 @@ class SocketGameTests(unittest.TestCase):
         created = self.create_game()
         second_client = socketio.test_client(app)
         try:
-            second_client.emit("join_game", {
-                "gameId": created["gameId"],
-                "playerId": created["playerId"],
-            })
+            second_client.emit(
+                "join_game",
+                {
+                    "gameId": created["gameId"],
+                    "playerId": created["playerId"],
+                },
+            )
             joined = find_event(second_client, "game_joined")
             self.assertIsNotNone(joined)
             self.assertEqual(joined["gameId"], created["gameId"])
@@ -447,10 +523,13 @@ class SocketGameTests(unittest.TestCase):
 
     def test_join_game_with_wrong_player_id_rejected(self):
         created = self.create_game()
-        self.client.emit("join_game", {
-            "gameId": created["gameId"],
-            "playerId": "wrong-player",
-        })
+        self.client.emit(
+            "join_game",
+            {
+                "gameId": created["gameId"],
+                "playerId": "wrong-player",
+            },
+        )
         rejected = find_event(self.client, "join_rejected")
         self.assertIsNotNone(rejected)
         self.assertEqual(rejected["gameId"], created["gameId"])
@@ -458,11 +537,14 @@ class SocketGameTests(unittest.TestCase):
     def test_player_move_updates_board(self):
         created = self.create_game()
         games[created["gameId"]]["current_player"] = games[created["gameId"]]["human_piece"]
-        self.client.emit("player_move", {
-            "gameId": created["gameId"],
-            "playerId": created["playerId"],
-            "column": 3,
-        })
+        self.client.emit(
+            "player_move",
+            {
+                "gameId": created["gameId"],
+                "playerId": created["playerId"],
+                "column": 3,
+            },
+        )
         updated = find_event(self.client, "board_updated")
         self.assertIsNotNone(updated)
         self.assertEqual(updated["status"], "playing")
@@ -470,11 +552,14 @@ class SocketGameTests(unittest.TestCase):
 
     def test_invalid_move_rejected(self):
         created = self.create_game()
-        self.client.emit("player_move", {
-            "gameId": created["gameId"],
-            "playerId": created["playerId"],
-            "column": 8,
-        })
+        self.client.emit(
+            "player_move",
+            {
+                "gameId": created["gameId"],
+                "playerId": created["playerId"],
+                "column": 8,
+            },
+        )
         invalid = find_event(self.client, "invalid_move")
         self.assertIsNotNone(invalid)
         self.assertEqual(invalid["status"], "invalid_move")
@@ -482,10 +567,13 @@ class SocketGameTests(unittest.TestCase):
 
     def test_ai_leave_removes_game(self):
         created = self.create_game()
-        self.client.emit("leave_game", {
-            "gameId": created["gameId"],
-            "playerId": created["playerId"],
-        })
+        self.client.emit(
+            "leave_game",
+            {
+                "gameId": created["gameId"],
+                "playerId": created["playerId"],
+            },
+        )
         left = find_event(self.client, "game_left")
         self.assertIsNotNone(left)
         self.assertNotIn(created["gameId"], games)
@@ -499,10 +587,13 @@ class SocketGameTests(unittest.TestCase):
 
         reconnecting_client = socketio.test_client(app)
         try:
-            reconnecting_client.emit("join_game", {
-                "gameId": created["gameId"],
-                "playerId": created["playerId"],
-            })
+            reconnecting_client.emit(
+                "join_game",
+                {
+                    "gameId": created["gameId"],
+                    "playerId": created["playerId"],
+                },
+            )
             joined = find_event(reconnecting_client, "game_joined")
             self.assertIsNotNone(joined)
             self.assertEqual(joined["gameId"], created["gameId"])
@@ -529,18 +620,24 @@ class SocketGameTests(unittest.TestCase):
 
     def test_reset_game_clears_board(self):
         created = self.create_game()
-        self.client.emit("player_move", {
-            "gameId": created["gameId"],
-            "playerId": created["playerId"],
-            "column": 3,
-        })
+        self.client.emit(
+            "player_move",
+            {
+                "gameId": created["gameId"],
+                "playerId": created["playerId"],
+                "column": 3,
+            },
+        )
         find_event(self.client, "board_updated")
 
-        self.client.emit("reset_game", {
-            "gameId": created["gameId"],
-            "playerId": created["playerId"],
-            "difficulty": "hard",
-        })
+        self.client.emit(
+            "reset_game",
+            {
+                "gameId": created["gameId"],
+                "playerId": created["playerId"],
+                "difficulty": "hard",
+            },
+        )
         reset = find_event(self.client, "board_updated")
         self.assertIsNotNone(reset)
         self.assertNotEqual(reset["gameId"], created["gameId"])
@@ -579,6 +676,278 @@ class SocketGameTests(unittest.TestCase):
         self.assertEqual(ack["status"], "waiting")
         self.assertEqual(ack["mode"], "multiplayer")
 
+    def test_multiplayer_create_uses_atomic_durable_claim(self):
+        profile_id = str(uuid.uuid4())
+        room = self.durable_room_record(profile_id, "durable-create", created=True)
+        app.config["AUTH_REQUIRED"] = True
+
+        with (
+            patch.object(
+                app_module,
+                "authenticate_payload",
+                return_value=({"profile_id": profile_id, "email": "durable@example.com"}, None),
+            ),
+            patch.object(
+                app_module.supabase_store,
+                "fetch_multiplayer_room_request",
+                return_value={"result": "not_found"},
+            ),
+            patch.object(
+                app_module.supabase_store,
+                "claim_multiplayer_room_request",
+                return_value={"result": "ok", "room": room},
+            ) as claim,
+            patch.object(app_module.supabase_store, "create_game_record") as legacy_create,
+        ):
+            ack = self.client.emit(
+                "create_multiplayer_game",
+                {"requestId": room["request_id"], "accessToken": "token", "ownerName": room["owner_name"]},
+                callback=True,
+            )
+
+        self.assertTrue(ack["ok"])
+        self.assertFalse(ack["recovered"])
+        self.assertEqual(ack["gameId"], room["game_id"])
+        self.assertEqual(ack["playerId"], room["player_id"])
+        self.assertEqual(len(games), 1)
+        claim.assert_called_once()
+        legacy_create.assert_not_called()
+
+    def test_multiplayer_create_rejects_transient_durable_store_failure(self):
+        profile_id = str(uuid.uuid4())
+        app.config["AUTH_REQUIRED"] = True
+        with (
+            patch.object(
+                app_module,
+                "authenticate_payload",
+                return_value=({"profile_id": profile_id, "email": None}, None),
+            ),
+            patch.object(
+                app_module.supabase_store,
+                "fetch_multiplayer_room_request",
+                return_value={"result": "error", "code": "persistence_unavailable"},
+            ),
+            patch.object(app_module.supabase_store, "claim_multiplayer_room_request") as claim,
+        ):
+            ack = self.client.emit(
+                "create_multiplayer_game",
+                {"requestId": "transient-failure", "accessToken": "token"},
+                callback=True,
+            )
+
+        self.assertFalse(ack["ok"])
+        self.assertEqual(ack["code"], "persistence_unavailable")
+        event = find_event(self.client, "create_rejected")
+        self.assertEqual(event["code"], "persistence_unavailable")
+        self.assertEqual(event["requestId"], "transient-failure")
+        self.assertEqual(games, {})
+        claim.assert_not_called()
+
+    def test_multiplayer_create_does_not_reuse_terminal_claim_result(self):
+        profile_id = str(uuid.uuid4())
+        room = self.durable_room_record(profile_id, "terminal-race", state="completed")
+        app.config["AUTH_REQUIRED"] = True
+        with (
+            patch.object(
+                app_module,
+                "authenticate_payload",
+                return_value=({"profile_id": profile_id, "email": None}, None),
+            ),
+            patch.object(
+                app_module.supabase_store,
+                "fetch_multiplayer_room_request",
+                return_value={"result": "not_found"},
+            ),
+            patch.object(
+                app_module.supabase_store,
+                "claim_multiplayer_room_request",
+                return_value={"result": "ok", "room": room},
+            ),
+            patch.object(app_module.supabase_store, "create_game_record") as legacy_create,
+        ):
+            ack = self.client.emit(
+                "create_multiplayer_game",
+                {"requestId": room["request_id"], "accessToken": "token"},
+                callback=True,
+            )
+
+        self.assertFalse(ack["ok"])
+        self.assertEqual(ack["code"], "creation_request_terminal")
+        self.assertEqual(games, {})
+        legacy_create.assert_not_called()
+
+    def test_multiplayer_create_falls_back_when_recovery_schema_is_missing(self):
+        profile_id = str(uuid.uuid4())
+        app.config["AUTH_REQUIRED"] = True
+        with (
+            patch.object(
+                app_module,
+                "authenticate_payload",
+                return_value=({"profile_id": profile_id, "email": None}, None),
+            ),
+            patch.object(
+                app_module.supabase_store,
+                "fetch_multiplayer_room_request",
+                return_value={"result": "schema_missing"},
+            ),
+            patch.object(app_module.supabase_store, "create_game_record", return_value=True) as legacy_create,
+        ):
+            ack = self.client.emit(
+                "create_multiplayer_game",
+                {"requestId": "missing-schema", "accessToken": "token"},
+                callback=True,
+            )
+
+        self.assertTrue(ack["ok"])
+        self.assertEqual(len(games), 1)
+        legacy_create.assert_called_once()
+
+    def test_reconcile_restores_durable_waiting_room_then_join_binds_socket(self):
+        profile_id = str(uuid.uuid4())
+        room = self.durable_room_record(profile_id, "restart-recovery")
+        app.config["AUTH_REQUIRED"] = True
+
+        def authenticate(_data):
+            return {"profile_id": profile_id, "email": "durable@example.com"}, None
+
+        with (
+            patch.object(app_module, "authenticate_payload", side_effect=authenticate),
+            patch.object(
+                app_module.supabase_store,
+                "fetch_multiplayer_room_request",
+                return_value={"result": "ok", "room": room},
+            ),
+        ):
+            ack = self.client.emit(
+                "reconcile_multiplayer_creation",
+                {"requestId": room["request_id"], "accessToken": "token"},
+                callback=True,
+            )
+            restored_player = games[room["game_id"]]["players"][room["player_id"]]
+            self.assertFalse(restored_player["connected"])
+            self.assertIsNone(restored_player["socket_id"])
+
+            self.client.emit(
+                "join_multiplayer_game",
+                {
+                    "gameId": room["game_id"],
+                    "playerId": room["player_id"],
+                    "requestId": room["request_id"],
+                    "accessToken": "token",
+                },
+            )
+            joined = find_event(self.client, "multiplayer_game_joined")
+
+        self.assertEqual(
+            ack,
+            {
+                "ok": True,
+                "status": "found",
+                "requestId": room["request_id"],
+                "gameId": room["game_id"],
+                "playerId": room["player_id"],
+            },
+        )
+        self.assertEqual(joined["requestId"], room["request_id"])
+        self.assertTrue(restored_player["connected"])
+        self.assertIsNotNone(restored_player["socket_id"])
+
+    def test_reconcile_rejects_terminal_request_without_reusing_id(self):
+        profile_id = str(uuid.uuid4())
+        room = self.durable_room_record(profile_id, "cancelled-request", state="cancelled")
+        app.config["AUTH_REQUIRED"] = True
+        with (
+            patch.object(
+                app_module,
+                "authenticate_payload",
+                return_value=({"profile_id": profile_id, "email": None}, None),
+            ),
+            patch.object(
+                app_module.supabase_store,
+                "fetch_multiplayer_room_request",
+                return_value={"result": "ok", "room": room},
+            ),
+        ):
+            ack = self.client.emit(
+                "reconcile_multiplayer_creation",
+                {"requestId": room["request_id"], "accessToken": "token"},
+                callback=True,
+            )
+
+        self.assertFalse(ack["ok"])
+        self.assertEqual(ack["status"], "rejected")
+        self.assertEqual(ack["code"], "creation_request_terminal")
+        self.assertEqual(games, {})
+
+    def test_reconcile_does_not_recover_in_memory_room_after_it_started(self):
+        profile_id = str(uuid.uuid4())
+        request_id = "already-started"
+        player_id = str(uuid.uuid4())
+        game_id = str(uuid.uuid4())
+        game = app_module.create_multiplayer_game_state(player_id, profile_id=profile_id, bind_socket=False)
+        game.update(
+            {
+                "status": "playing",
+                "creation_request_id": request_id,
+                "creator_profile_id": profile_id,
+                "creator_player_id": player_id,
+            }
+        )
+        games[game_id] = game
+        app.config["AUTH_REQUIRED"] = True
+
+        with (
+            patch.object(
+                app_module,
+                "authenticate_payload",
+                return_value=({"profile_id": profile_id, "email": None}, None),
+            ),
+            patch.object(app_module.supabase_store, "fetch_multiplayer_room_request") as fetch,
+        ):
+            ack = self.client.emit(
+                "reconcile_multiplayer_creation",
+                {"requestId": request_id, "accessToken": "token"},
+                callback=True,
+            )
+
+        self.assertFalse(ack["ok"])
+        self.assertEqual(ack["code"], "creation_request_terminal")
+        fetch.assert_not_called()
+        self.assertFalse(game["players"][player_id]["connected"])
+
+    def test_reconcile_marks_expired_active_request_terminal(self):
+        profile_id = str(uuid.uuid4())
+        room = self.durable_room_record(profile_id, "expired-request")
+        room["expires_at"] = "2000-01-01T00:00:00+00:00"
+        app.config["AUTH_REQUIRED"] = True
+        with (
+            patch.object(
+                app_module,
+                "authenticate_payload",
+                return_value=({"profile_id": profile_id, "email": None}, None),
+            ),
+            patch.object(
+                app_module.supabase_store,
+                "fetch_multiplayer_room_request",
+                return_value={"result": "ok", "room": room},
+            ),
+            patch.object(
+                app_module.supabase_store,
+                "resolve_multiplayer_room_request",
+                return_value={"result": "ok", "resolved": True},
+            ) as resolve,
+        ):
+            ack = self.client.emit(
+                "reconcile_multiplayer_creation",
+                {"requestId": room["request_id"], "accessToken": "token"},
+                callback=True,
+            )
+
+        self.assertFalse(ack["ok"])
+        self.assertEqual(ack["code"], "creation_request_expired")
+        resolve.assert_called_once_with(room["game_id"], "expired")
+        self.assertEqual(games, {})
+
     def test_multiplayer_create_retry_rebinds_authenticated_creator(self):
         request_payload = {
             "requestId": "lost-create-response",
@@ -591,8 +960,10 @@ class SocketGameTests(unittest.TestCase):
 
         app.config["AUTH_REQUIRED"] = True
         retry_client = None
-        with patch.object(app_module, "authenticate_payload", side_effect=authenticate), \
-                patch.object(app_module.supabase_store, "create_game_record", return_value=False) as create_record:
+        with (
+            patch.object(app_module, "authenticate_payload", side_effect=authenticate),
+            patch.object(app_module.supabase_store, "create_game_record", return_value=False) as create_record,
+        ):
             # Simulate a response that the creator never receives. The original
             # socket disconnects before consuming the emitted success event.
             self.client.emit("create_multiplayer_game", request_payload)
@@ -670,16 +1041,23 @@ class SocketGameTests(unittest.TestCase):
             )
         event = find_event(self.client, "create_rejected")
 
-        self.assertEqual(ack, {
-            "ok": False,
-            "requestId": "rejected-request",
-            "code": "authentication_failed",
-            "message": "Invalid session",
-        })
-        self.assertEqual(event, {
-            "message": "Invalid session",
-            "requestId": "rejected-request",
-        })
+        self.assertEqual(
+            ack,
+            {
+                "ok": False,
+                "requestId": "rejected-request",
+                "code": "authentication_failed",
+                "message": "Invalid session",
+            },
+        )
+        self.assertEqual(
+            event,
+            {
+                "message": "Invalid session",
+                "requestId": "rejected-request",
+                "code": "authentication_failed",
+            },
+        )
         self.assertEqual(games, {})
 
     def test_multiplayer_create_without_request_id_preserves_legacy_behavior(self):
@@ -716,11 +1094,14 @@ class SocketGameTests(unittest.TestCase):
     def test_public_multiplayer_room_can_be_listed_and_joined_once(self):
         self.client.emit("create_multiplayer_game")
         created = find_event(self.client, "multiplayer_game_created")
-        self.client.emit("set_room_public", {
-            "gameId": created["gameId"],
-            "playerId": created["playerId"],
-            "public": True,
-        })
+        self.client.emit(
+            "set_room_public",
+            {
+                "gameId": created["gameId"],
+                "playerId": created["playerId"],
+                "public": True,
+            },
+        )
         public_update = find_event(self.client, "room_public_updated")
         self.assertTrue(public_update["publicRoom"])
 
@@ -731,18 +1112,24 @@ class SocketGameTests(unittest.TestCase):
             public_games = find_event(second_client, "public_games")
             self.assertEqual(public_games["games"][0]["gameId"], created["gameId"])
 
-            second_client.emit("join_multiplayer_game", {
-                "gameId": created["gameId"],
-                "publicJoin": True,
-            })
+            second_client.emit(
+                "join_multiplayer_game",
+                {
+                    "gameId": created["gameId"],
+                    "publicJoin": True,
+                },
+            )
             joined = find_event(second_client, "multiplayer_game_joined")
             self.assertIsNotNone(joined)
             self.assertFalse(games[created["gameId"]]["public"])
 
-            third_client.emit("join_multiplayer_game", {
-                "gameId": created["gameId"],
-                "publicJoin": True,
-            })
+            third_client.emit(
+                "join_multiplayer_game",
+                {
+                    "gameId": created["gameId"],
+                    "publicJoin": True,
+                },
+            )
             rejected = find_event(third_client, "join_rejected")
             self.assertIsNotNone(rejected)
             self.assertEqual(rejected["message"], "Multiplayer game is full")
@@ -772,10 +1159,13 @@ class SocketGameTests(unittest.TestCase):
         created = find_event(self.client, "multiplayer_game_created")
         second_client = socketio.test_client(app)
         try:
-            second_client.emit("join_multiplayer_game", {
-                "gameId": created["gameId"],
-                "publicJoin": True,
-            })
+            second_client.emit(
+                "join_multiplayer_game",
+                {
+                    "gameId": created["gameId"],
+                    "publicJoin": True,
+                },
+            )
             rejected = find_event(second_client, "join_rejected")
             self.assertIsNotNone(rejected)
             self.assertEqual(rejected["message"], "Room is no longer public")
@@ -834,11 +1224,14 @@ class SocketGameTests(unittest.TestCase):
             self.client.get_received()
             second_client.get_received()
 
-            self.client.emit("player_move", {
-                "gameId": created["gameId"],
-                "playerId": created["playerId"],
-                "column": 3,
-            })
+            self.client.emit(
+                "player_move",
+                {
+                    "gameId": created["gameId"],
+                    "playerId": created["playerId"],
+                    "column": 3,
+                },
+            )
             first_update = find_event(self.client, "board_updated")
             second_update = find_event(second_client, "board_updated")
             self.assertIsNotNone(first_update)
@@ -847,11 +1240,14 @@ class SocketGameTests(unittest.TestCase):
             self.assertEqual(first_update["currentPlayer"], 2)
             self.assertEqual(sum(cell != 0 for row in first_update["board"] for cell in row), 1)
 
-            second_client.emit("player_move", {
-                "gameId": joined["gameId"],
-                "playerId": joined["playerId"],
-                "column": 4,
-            })
+            second_client.emit(
+                "player_move",
+                {
+                    "gameId": joined["gameId"],
+                    "playerId": joined["playerId"],
+                    "column": 4,
+                },
+            )
             second_move = find_event(self.client, "board_updated")
             self.assertIsNotNone(second_move)
             self.assertEqual(second_move["currentPlayer"], 1)
@@ -868,11 +1264,14 @@ class SocketGameTests(unittest.TestCase):
                 second_client.emit("join_multiplayer_game", {"gameId": created["gameId"]})
             joined = find_event(second_client, "multiplayer_game_joined")
             games[created["gameId"]]["current_player"] = 1
-            second_client.emit("player_move", {
-                "gameId": joined["gameId"],
-                "playerId": joined["playerId"],
-                "column": 3,
-            })
+            second_client.emit(
+                "player_move",
+                {
+                    "gameId": joined["gameId"],
+                    "playerId": joined["playerId"],
+                    "column": 3,
+                },
+            )
             invalid = find_event(second_client, "invalid_move")
             self.assertIsNotNone(invalid)
             self.assertEqual(invalid["message"], "Not your turn")
@@ -925,10 +1324,13 @@ class SocketGameTests(unittest.TestCase):
         second_client.disconnect()
         reconnecting_client = socketio.test_client(app)
         try:
-            reconnecting_client.emit("join_multiplayer_game", {
-                "gameId": joined["gameId"],
-                "playerId": joined["playerId"],
-            })
+            reconnecting_client.emit(
+                "join_multiplayer_game",
+                {
+                    "gameId": joined["gameId"],
+                    "playerId": joined["playerId"],
+                },
+            )
             rejoined = find_event(reconnecting_client, "multiplayer_game_joined")
             self.assertIsNotNone(rejoined)
             self.assertEqual(rejoined["playerNumber"], 2)
@@ -953,10 +1355,13 @@ class SocketGameTests(unittest.TestCase):
             second_client.disconnect()
             reconnecting_client = socketio.test_client(app)
             try:
-                reconnecting_client.emit("join_multiplayer_game", {
-                    "gameId": joined["gameId"],
-                    "playerId": joined["playerId"],
-                })
+                reconnecting_client.emit(
+                    "join_multiplayer_game",
+                    {
+                        "gameId": joined["gameId"],
+                        "playerId": joined["playerId"],
+                    },
+                )
                 rejoined = find_event(reconnecting_client, "multiplayer_game_joined")
                 self.assertEqual(rejoined["playerNumber"], 2)
                 self.assertEqual(rejoined["currentPlayer"], 1)
@@ -975,10 +1380,13 @@ class SocketGameTests(unittest.TestCase):
             joined = find_event(second_client, "multiplayer_game_joined")
             self.client.get_received()
 
-            self.client.emit("reset_game", {
-                "gameId": created["gameId"],
-                "playerId": created["playerId"],
-            })
+            self.client.emit(
+                "reset_game",
+                {
+                    "gameId": created["gameId"],
+                    "playerId": created["playerId"],
+                },
+            )
 
             invalid = find_event(self.client, "invalid_move")
             self.assertIsNotNone(invalid)
@@ -1003,18 +1411,24 @@ class SocketGameTests(unittest.TestCase):
             self.client.get_received()
             second_client.get_received()
 
-            self.client.emit("play_again", {
-                "gameId": created["gameId"],
-                "playerId": created["playerId"],
-            })
+            self.client.emit(
+                "play_again",
+                {
+                    "gameId": created["gameId"],
+                    "playerId": created["playerId"],
+                },
+            )
             vote_update = find_event(second_client, "play_again_updated")
             self.assertIsNotNone(vote_update)
             self.assertEqual(vote_update["playAgainAccepted"], 1)
 
-            second_client.emit("play_again", {
-                "gameId": joined["gameId"],
-                "playerId": joined["playerId"],
-            })
+            second_client.emit(
+                "play_again",
+                {
+                    "gameId": joined["gameId"],
+                    "playerId": joined["playerId"],
+                },
+            )
             reset = find_event(self.client, "board_updated")
             self.assertIsNotNone(reset)
             self.assertNotEqual(reset["gameId"], created["gameId"])
@@ -1044,16 +1458,22 @@ class SocketGameTests(unittest.TestCase):
                 first_client.get_received()
                 second_client.get_received()
 
-                first_client.emit("play_again", {
-                    "gameId": created["gameId"],
-                    "playerId": created["playerId"],
-                })
+                first_client.emit(
+                    "play_again",
+                    {
+                        "gameId": created["gameId"],
+                        "playerId": created["playerId"],
+                    },
+                )
                 find_event(first_client, "play_again_updated")
                 with patch("app.random.choice", side_effect=lambda player_ids: player_ids[starter_index]):
-                    second_client.emit("play_again", {
-                        "gameId": joined["gameId"],
-                        "playerId": joined["playerId"],
-                    })
+                    second_client.emit(
+                        "play_again",
+                        {
+                            "gameId": joined["gameId"],
+                            "playerId": joined["playerId"],
+                        },
+                    )
                 reset = find_event(first_client, "board_updated")
                 reset_second = find_event(second_client, "board_updated")
                 self.assertNotEqual(reset["gameId"], created["gameId"])
@@ -1072,13 +1492,22 @@ class SocketGameTests(unittest.TestCase):
     def test_multiplayer_waiting_player_can_leave_room(self):
         self.client.emit("create_multiplayer_game")
         created = find_event(self.client, "multiplayer_game_created")
-        self.client.emit("leave_game", {
-            "gameId": created["gameId"],
-            "playerId": created["playerId"],
-        })
+        with patch.object(
+            app_module.supabase_store,
+            "resolve_multiplayer_room_request",
+            return_value={"result": "ok", "resolved": True},
+        ) as resolve:
+            self.client.emit(
+                "leave_game",
+                {
+                    "gameId": created["gameId"],
+                    "playerId": created["playerId"],
+                },
+            )
         left = find_event(self.client, "game_left")
         self.assertIsNotNone(left)
         self.assertNotIn(created["gameId"], games)
+        resolve.assert_called_once_with(created["gameId"], "cancelled")
 
     def test_multiplayer_finished_leave_notifies_other_player(self):
         self.client.emit("create_multiplayer_game")
@@ -1093,10 +1522,13 @@ class SocketGameTests(unittest.TestCase):
             self.client.get_received()
             second_client.get_received()
 
-            second_client.emit("leave_game", {
-                "gameId": joined["gameId"],
-                "playerId": joined["playerId"],
-            })
+            second_client.emit(
+                "leave_game",
+                {
+                    "gameId": joined["gameId"],
+                    "playerId": joined["playerId"],
+                },
+            )
             left = find_event(second_client, "game_left")
             other_left = find_event(self.client, "player_left")
             self.assertIsNotNone(left)
