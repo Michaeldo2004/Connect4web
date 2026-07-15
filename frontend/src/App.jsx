@@ -618,7 +618,7 @@ function getCurrentPath(pathname) {
   return APP_PATHS.has(pathname) ? pathname : NOT_FOUND_PATH;
 }
 
-function App() {
+function App({ authClient = supabaseClient }) {
   const location = useLocation();
   const navigate = useNavigate();
   const routePath = useMemo(() => getCurrentPath(location.pathname), [location.pathname]);
@@ -687,7 +687,7 @@ function App() {
   const [reviewAnalysisAvailable, setReviewAnalysisAvailable] = useState(true);
   const [reviewAnalysisUnavailableReason, setReviewAnalysisUnavailableReason] = useState("");
   const [reviewAnalysisRequestPending, setReviewAnalysisRequestPending] = useState(false);
-  const [authReady, setAuthReady] = useState(!supabaseClient);
+  const [authReady, setAuthReady] = useState(!authClient);
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState("");
   const [authNotice, setAuthNotice] = useState("");
@@ -832,13 +832,13 @@ function App() {
   }, [aiNumber]);
 
   useEffect(() => {
-    if (!supabaseClient) {
+    if (!authClient) {
       setAuthReady(true);
       return undefined;
     }
 
     let mounted = true;
-    supabaseClient.auth.getSession().then(({ data }) => {
+    authClient.auth.getSession().then(({ data }) => {
       if (!mounted) {
         return;
       }
@@ -846,7 +846,7 @@ function App() {
       setAuthReady(true);
     });
 
-    const { data: listener } = supabaseClient.auth.onAuthStateChange((_event, session) => {
+    const { data: listener } = authClient.auth.onAuthStateChange((_event, session) => {
       setAuthSession(session || null);
       setAuthReady(true);
     });
@@ -855,7 +855,7 @@ function App() {
       mounted = false;
       listener.subscription.unsubscribe();
     };
-  }, []);
+  }, [authClient]);
 
   useEffect(() => {
     if (!authReady || !authSession?.user?.id) {
@@ -1047,25 +1047,28 @@ function App() {
     [authSession],
   );
 
-  const loadUserProfile = useCallback(async (session) => {
-    if (!supabaseClient || !session?.user?.id) {
-      setUserProfile(null);
-      return;
-    }
+  const loadUserProfile = useCallback(
+    async (session) => {
+      if (!authClient || !session?.user?.id) {
+        setUserProfile(null);
+        return;
+      }
 
-    const { data, error } = await supabaseClient
-      .from("profiles")
-      .select("username,display_name")
-      .eq("id", session.user.id)
-      .maybeSingle();
+      const { data, error } = await authClient
+        .from("profiles")
+        .select("username,display_name")
+        .eq("id", session.user.id)
+        .maybeSingle();
 
-    if (error) {
-      setUserProfile(null);
-      return;
-    }
+      if (error) {
+        setUserProfile(null);
+        return;
+      }
 
-    setUserProfile(data || null);
-  }, []);
+      setUserProfile(data || null);
+    },
+    [authClient],
+  );
 
   const loadProfileGames = useCallback(
     async ({ signal } = {}) => {
@@ -2430,7 +2433,7 @@ function App() {
     setAuthError("");
     setAuthNotice("");
 
-    if (!supabaseClient) {
+    if (!authClient) {
       setAuthError("Supabase auth is not configured");
       return;
     }
@@ -2460,7 +2463,7 @@ function App() {
           return;
         }
 
-        const { data, error } = await supabaseClient.auth.signUp({
+        const { data, error } = await authClient.auth.signUp({
           email,
           password,
           options: {
@@ -2473,7 +2476,7 @@ function App() {
         }
 
         if (data.session && data.user) {
-          await supabaseClient.from("profiles").upsert({
+          await authClient.from("profiles").upsert({
             id: data.user.id,
             username,
             display_name: username,
@@ -2491,7 +2494,7 @@ function App() {
         return;
       }
 
-      const { data, error } = await supabaseClient.auth.signInWithPassword({ email, password });
+      const { data, error } = await authClient.auth.signInWithPassword({ email, password });
       if (error) {
         setAuthError(error.message);
         return;
@@ -2512,7 +2515,7 @@ function App() {
   async function requestPasswordReset() {
     setAuthError("");
     setAuthNotice("");
-    if (!supabaseClient) {
+    if (!authClient) {
       setAuthError("Supabase auth is not configured");
       return;
     }
@@ -2525,7 +2528,7 @@ function App() {
 
     setAuthBusy(true);
     try {
-      const { error } = await supabaseClient.auth.resetPasswordForEmail(email, {
+      const { error } = await authClient.auth.resetPasswordForEmail(email, {
         redirectTo: `${window.location.origin}${LOGIN_PATH}`,
       });
       if (error) {
@@ -2544,8 +2547,8 @@ function App() {
     if (socketClient?.connected && aiWaitingQueueId) {
       socketClient.emit("cancel_ai_waiting", authPayload({ queueId: aiWaitingQueueId }));
     }
-    if (supabaseClient) {
-      await supabaseClient.auth.signOut();
+    if (authClient) {
+      await authClient.auth.signOut();
     }
     clearSession();
     clearMultiplayerSession();

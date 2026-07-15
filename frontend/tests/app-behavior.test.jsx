@@ -64,10 +64,30 @@ vi.mock("@supabase/supabase-js", () => ({
 
 import App from "../src/App.jsx";
 
+function createTestAuthClient() {
+  return {
+    from: vi.fn(() => {
+      const query = {
+        select: vi.fn(() => query),
+        eq: vi.fn(() => query),
+        single: vi.fn(async () => ({ data: { username: "PlayerOne", display_name: "Player One" }, error: null })),
+        maybeSingle: vi.fn(async () => ({ data: { username: "PlayerOne", display_name: "Player One" }, error: null })),
+        upsert: vi.fn(async () => ({ error: null })),
+      };
+      return query;
+    }),
+    auth: {
+      getSession: vi.fn(async () => ({ data: { session } })),
+      onAuthStateChange: vi.fn(() => ({ data: { subscription: { unsubscribe: vi.fn() } } })),
+      signOut: vi.fn(async () => ({})),
+    },
+  };
+}
+
 function renderApp(path = "/") {
   return render(
     <MemoryRouter initialEntries={[path]}>
-      <App />
+      <App authClient={createTestAuthClient()} />
     </MemoryRouter>,
   );
 }
