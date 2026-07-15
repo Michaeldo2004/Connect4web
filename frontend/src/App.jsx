@@ -508,10 +508,6 @@ function loadPendingGame(expectedProfileId = "") {
   return null;
 }
 
-function savePendingMultiplayerJoin(gameId) {
-  window.sessionStorage.setItem(PENDING_MULTIPLAYER_JOIN_KEY, JSON.stringify({ gameId }));
-}
-
 function takePendingMultiplayerJoin() {
   try {
     const pendingJoin = JSON.parse(window.sessionStorage.getItem(PENDING_MULTIPLAYER_JOIN_KEY));
@@ -3223,8 +3219,9 @@ function App() {
           <strong>{profileStats.winRate}</strong>
         </div>
       </section>
-      {profileError ? <strong className="profile-error">{profileError}</strong> : null}
-      {profileLoading ? (
+      {profileError ? (
+        <strong className="profile-error">{profileError}</strong>
+      ) : profileLoading ? (
         <ProfileLoadingSkeleton />
       ) : profileGames.length === 0 ? (
         <section className="profile-empty">
