@@ -281,6 +281,7 @@ def create_multiplayer_game_state(player_id=None, profile_id=None, bind_socket=T
                 "display_name": "Player 1",
                 "socket_id": request.sid if bind_socket and request else None,
                 "connected": bool(bind_socket),
+                "ready": False,
                 "disconnect_token": None,
             },
         },
@@ -877,7 +878,9 @@ def serialize_game(game_id, game, ai_move=None, include_player_id=False, player_
 
     if game.get("mode") == "multiplayer":
         payload["currentPlayer"] = game["current_player"]
-        payload["playersConnected"] = sum(1 for player in game["players"].values() if player.get("connected"))
+        payload["playersConnected"] = sum(
+            1 for player in game["players"].values() if player.get("connected") and player.get("ready")
+        )
         payload["disconnectDeadline"] = game.get("disconnect_deadline")
         payload["playAgainAccepted"] = len(game.get("rematch_requests", set()))
         payload["publicRoom"] = bool(game.get("public"))
@@ -1396,6 +1399,9 @@ def apply_multiplayer_move(game, player_id, column, game_id=None):
     if len(game["players"]) < 2:
         return "Waiting for Player 2"
 
+    if game["status"] != "playing":
+        return "Waiting for both players to enter the game"
+
     if not isinstance(column, int):
         return "Invalid column"
 
@@ -1475,6 +1481,7 @@ def mark_multiplayer_player_connected(game_id, game, player_id):
     player = game["players"][player_id]
     player["socket_id"] = request.sid
     player["connected"] = True
+    player["ready"] = False
     player["disconnect_token"] = None
     if all(current_player.get("connected") for current_player in game["players"].values()):
         game["disconnect_deadline"] = None
@@ -2174,12 +2181,13 @@ def socket_join_multiplayer_game(data):
                 "display_name": authenticated_display_name(auth_context),
                 "socket_id": request.sid,
                 "connected": True,
+                "ready": False,
                 "disconnect_token": None,
             }
             assign_multiplayer_pieces(game)
-            game["status"] = "playing"
+            game["status"] = "waiting"
             game["public"] = False
-            game["message"] = f"Player {game['current_player']} turn"
+            game["message"] = "Waiting for both players to enter the game"
             mark_game_updated(game)
             supabase_store.add_game_player_records(game_id, game)
             if game.get("creation_request_id"):
@@ -2198,6 +2206,55 @@ def socket_join_multiplayer_game(data):
     else:
         app.logger.info("Multiplayer player connected game_id=%s player_number=2", game_id)
         emit_multiplayer_board_update(game_id, game)
+
+
+@socketio.on("multiplayer_player_ready")
+def socket_multiplayer_player_ready(data):
+    data = data or {}
+    game_id = data.get("gameId") if isinstance(data, dict) else None
+    player_id = data.get("playerId") if isinstance(data, dict) else None
+    auth_context, auth_error = authenticate_payload(data)
+    if auth_error:
+        emit("invalid_move", make_socket_error(game_id, None, auth_error))
+        return
+
+    with get_game_lock(game_id):
+        game = get_stored_game(game_id)
+        error = validate_game_access(game_id, game, player_id, auth_context)
+        if error:
+            invalid_payload = make_socket_error(game_id, game, error)
+        elif game.get("mode") != "multiplayer":
+            error = "Not a multiplayer game"
+            invalid_payload = make_socket_error(game_id, game, error)
+        else:
+            player = game["players"][player_id]
+            if player.get("socket_id") != request.sid:
+                error = "Player connection changed"
+                invalid_payload = make_socket_error(game_id, game, error)
+            else:
+                error = None
+                player["ready"] = True
+                if (
+                    len(game["players"]) == 2
+                    and all(current.get("connected") and current.get("ready") for current in game["players"].values())
+                    and game["status"] == "waiting"
+                ):
+                    game["status"] = "playing"
+                    game["message"] = f"Player {game['current_player']} turn"
+                    game["disconnect_deadline"] = None
+                    supabase_store.update_game_record(game_id, game)
+                elif game["status"] == "waiting":
+                    game["message"] = (
+                        "Waiting for Player 2"
+                        if len(game["players"]) < 2
+                        else "Waiting for both players to enter the game"
+                    )
+                mark_game_updated(game)
+
+    if error:
+        emit("invalid_move", invalid_payload)
+        return
+    emit_multiplayer_board_update(game_id, game)
 
 
 @socketio.on("disconnect")
@@ -2237,6 +2294,14 @@ def socket_disconnect():
         if len(game["players"]) < 2 or game["status"] in FINISHED_STATUSES:
             game["public"] = False
             mark_game_updated(game)
+            return
+
+        if game["status"] != "playing":
+            player["ready"] = False
+            game["message"] = "Waiting for both players to enter the game"
+            game["disconnect_deadline"] = None
+            mark_game_updated(game)
+            emit_multiplayer_board_update(game_id, game)
             return
 
         game["disconnect_deadline"] = int((time.time() + DISCONNECT_GRACE_SECONDS) * 1000)
@@ -2298,12 +2363,20 @@ def socket_leave_game(data):
             elif is_multiplayer_finished(game):
                 player_left_payload = {"gameId": game_id, "message": f"Player {player['piece']} left the room"}
                 finalize_or_delete_previous_game(game_id, game)
-                pop_game(game_id)
+                player["left"] = True
+                player["connected"] = False
+                player["socket_id"] = None
+                player["disconnect_token"] = None
+                game["public"] = False
+                mark_game_updated(game)
+                if all(current_player.get("left") for current_player in game["players"].values()):
+                    pop_game(game_id)
                 leave_allowed = True
             else:
                 invalid_payload = make_socket_error(game_id, game, "Cannot leave during an active multiplayer game")
 
     if leave_allowed:
+        leave_room(game_id)
         if player_left_payload is not None:
             socketio.emit("player_left", player_left_payload, to=game_id, skip_sid=request.sid)
         emit("game_left", {"gameId": game_id})

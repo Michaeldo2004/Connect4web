@@ -82,6 +82,10 @@ class RecordingClient:
     def table(self, table_name):
         return RecordingQuery(self, table_name)
 
+    def rpc(self, function_name, payload):
+        self.operations.append({"table": function_name, "action": "rpc", "payload": payload})
+        return RecordingQuery(self, function_name)
+
 
 class RpcClient:
     def __init__(self, data=None, error=None):
@@ -407,17 +411,15 @@ class SupabaseStoreTests(unittest.TestCase):
         self.assertEqual(
             [(op["table"], op["action"]) for op in client.operations],
             [
-                ("game_players", "upsert"),
-                ("game_players", "upsert"),
+                ("sync_multiplayer_game_players", "rpc"),
                 ("games", "update"),
             ],
         )
-        player_rows = [client.operations[0]["payload"], client.operations[1]["payload"]]
-        self.assertEqual(client.operations[0]["kwargs"], {"on_conflict": "game_id,player_number"})
+        player_rows = client.operations[0]["payload"]["p_players"]
         self.assertEqual({row["player_number"] for row in player_rows}, {1, 2})
         self.assertEqual({row["profile_id"] for row in player_rows}, {"profile-1", "profile-2"})
         self.assertTrue(all(row["game_id"] == str(uuid.UUID(game_id)) for row in player_rows))
-        game_update = client.operations[2]["payload"]
+        game_update = client.operations[1]["payload"]
         self.assertNotIn("analysis_status", game_update)
         self.assertNotIn("analysis_error", game_update)
 

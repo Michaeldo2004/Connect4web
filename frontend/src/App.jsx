@@ -1398,7 +1398,7 @@ function App({ authClient = supabaseClient }) {
         return;
       }
 
-      const routeGameId = getRouteGameId(location.pathname);
+      const routeGameId = getRouteGameId(window.location.pathname);
       const waitingSession = loadAiWaitingSession();
       if (waitingSession) {
         setAiWaitingQueueId(waitingSession.queueId);
@@ -1586,6 +1586,7 @@ function App({ authClient = supabaseClient }) {
       }
 
       applyMultiplayerGameStarted(data);
+      nextSocket.emit("multiplayer_player_ready", authPayload({ gameId: data.gameId, playerId: data.playerId }));
     }
 
     function handleJoinRejected(data) {
@@ -1901,8 +1902,6 @@ function App({ authClient = supabaseClient }) {
     }
 
     function handlePlayerLeft(data) {
-      clearSession();
-      clearMultiplayerSession();
       setOtherPlayerLeftMessage(data?.message || "The other player left the room");
     }
 
@@ -2015,7 +2014,6 @@ function App({ authClient = supabaseClient }) {
     authPayload,
     authSession,
     clearLocalGame,
-    location.pathname,
     redirectTo,
     resetMultiplayerCreationTracking,
     showToast,
@@ -3333,15 +3331,18 @@ function App({ authClient = supabaseClient }) {
                   const isWinning = winningPieces.includes(pieceKey);
 
                   return (
-                    <div
+                    <button
+                      type="button"
                       key={pieceKey}
                       className={`cell player-${cell}${isDropping ? " dropping" : ""}${isWinning ? " winning" : ""}`}
                       style={isDropping ? { "--drop-start": `-${(rowIndex + 1) * 115}%` } : undefined}
                       role="gridcell"
+                      onClick={() => playColumn(columnIndex)}
+                      disabled={!canDropPiece}
                       aria-label={`Row ${rowIndex + 1}, column ${columnIndex + 1}: ${getPieceLabel(cell)}${isWinning ? ", winning piece" : ""}`}
                     >
                       <span key={isDropping ? `drop-${animationRun}` : "piece"} />
-                    </div>
+                    </button>
                   );
                 })}
               </div>
@@ -3376,7 +3377,11 @@ function App({ authClient = supabaseClient }) {
           <p>{status === "draw" ? "A perfectly balanced board." : "Review the match or start another round."}</p>
           <div>
             {gameMode === GAME_MODE_MULTIPLAYER ? (
-              <button type="button" onClick={requestPlayAgain} disabled={busy || playAgainRequested}>
+              <button
+                type="button"
+                onClick={requestPlayAgain}
+                disabled={busy || playAgainRequested || playersConnected < 2}
+              >
                 {playAgainRequested ? `Rematch requested · ${playAgainAccepted}/2` : "Request rematch"}
               </button>
             ) : (
@@ -3387,7 +3392,7 @@ function App({ authClient = supabaseClient }) {
             <button type="button" onClick={() => redirectTo(gameReviewPath(gameId))}>
               Review match
             </button>
-            <button type="button" onClick={returnToMainMenu}>
+            <button type="button" onClick={gameMode === GAME_MODE_MULTIPLAYER ? leaveGame : returnToMainMenu}>
               Main menu
             </button>
           </div>
@@ -3702,7 +3707,7 @@ function App({ authClient = supabaseClient }) {
           <section className="leave-modal" role="dialog" aria-modal="true" aria-labelledby="leave-modal-title">
             <h2 id="leave-modal-title">Player left</h2>
             <p>{otherPlayerLeftMessage}</p>
-            <button type="button" onClick={returnToMainMenu}>
+            <button type="button" onClick={leaveGame} disabled={busy}>
               Main menu
             </button>
           </section>

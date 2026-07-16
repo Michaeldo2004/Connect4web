@@ -271,6 +271,16 @@ def is_missing_multiplayer_recovery_schema(error):
     )
 
 
+def is_missing_multiplayer_player_sync_schema(error):
+    code = str(getattr(error, "code", "") or "")
+    message = " ".join((str(getattr(error, "message", "") or ""), str(error))).lower()
+    return (
+        code in {"42883", "PGRST202"}
+        or "sync_multiplayer_game_players" in message
+        and ("could not find" in message or "does not exist" in message or "undefined function" in message)
+    )
+
+
 def multiplayer_recovery_client():
     client = get_client()
     if client is not None:
@@ -427,11 +437,30 @@ def add_game_player_records(game_id, game):
         return False
 
     def action(client):
-        # Persist each participant independently. A conflict or malformed row
-        # for one player must not prevent the other participant from being
-        # associated with the completed game.
-        for player_payload in player_payloads:
-            client.table("game_players").upsert(player_payload, on_conflict="game_id,player_number").execute()
+        if game.get("mode") == "multiplayer" and len(player_payloads) == 2:
+            try:
+                client.rpc(
+                    "sync_multiplayer_game_players",
+                    {
+                        "p_game_id": db_game_id(game_id),
+                        "p_players": player_payloads,
+                    },
+                ).execute()
+            except Exception as error:
+                if not is_missing_multiplayer_player_sync_schema(error):
+                    raise
+                # Compatibility path for deployments that have not applied the
+                # atomic sync migration yet. Clearing the old profile links
+                # avoids the unique-profile conflict when starter pieces swap.
+                client.table("game_players").update({"profile_id": None}).eq("game_id", db_game_id(game_id)).execute()
+                for player_payload in player_payloads:
+                    client.table("game_players").upsert(
+                        player_payload,
+                        on_conflict="game_id,player_number",
+                    ).execute()
+        else:
+            for player_payload in player_payloads:
+                client.table("game_players").upsert(player_payload, on_conflict="game_id,player_number").execute()
         client.table("games").update(game_payload(game_id, game)).eq("id", db_game_id(game_id)).execute()
 
     return execute_safely(action)

@@ -845,6 +845,21 @@ a {
   cursor: default;
 }
 
+.board:not(.review-board) .cell:not(:disabled) {
+  cursor: pointer;
+}
+
+.board:not(.review-board) .cell.player-0:not(:disabled):hover span {
+  outline: 3px solid #1e3a8a;
+  outline-offset: -3px;
+}
+
+.board:not(.review-board) .cell:focus-visible {
+  outline: 3px solid var(--brand-yellow);
+  outline-offset: -2px;
+  border-radius: 50%;
+}
+
 .cell span {
   display: block;
   width: 100%;

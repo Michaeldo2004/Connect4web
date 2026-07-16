@@ -145,7 +145,7 @@ describe("application behavior", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
-  test("applies a player move optimistically after a socket-created AI game", async () => {
+  test("drops a piece by clicking a board cell while retaining numbered controls", async () => {
     session = authenticatedSession();
     const user = userEvent.setup();
     renderApp();
@@ -153,7 +153,8 @@ describe("application behavior", () => {
 
     act(() => latestSocket.trigger("game_created", createdGame()));
 
-    await user.click(await screen.findByRole("button", { name: "Drop in column 1" }));
+    expect(await screen.findByRole("button", { name: "Drop in column 1" })).toBeEnabled();
+    await user.click(screen.getByRole("gridcell", { name: "Row 6, column 1: Empty" }));
     expect(screen.getByRole("gridcell", { name: "Row 6, column 1: Yellow piece" })).toBeInTheDocument();
     expect(latestSocket.emitted.some(([event, payload]) => event === "player_move" && payload.column === 0)).toBe(true);
   });
@@ -198,7 +199,7 @@ describe("application behavior", () => {
 
     renderApp("/profiles");
     const stats = await screen.findByRole("region", { name: "Profile statistics" });
-    expect(within(stats).getByText("Total played").nextElementSibling).toHaveTextContent("2");
+    await waitFor(() => expect(within(stats).getByText("Total played").nextElementSibling).toHaveTextContent("2"));
     expect(within(stats).getByText("Wins").nextElementSibling).toHaveTextContent("1");
     expect(within(stats).getByText("Losses").nextElementSibling).toHaveTextContent("1");
     expect(within(stats).getByText("Win rate").nextElementSibling).toHaveTextContent("50%");
@@ -324,8 +325,9 @@ describe("application behavior", () => {
     session = authenticatedSession();
     renderApp();
     await screen.findByRole("button", { name: "Create game" });
+    const joinedSocket = latestSocket;
     act(() =>
-      latestSocket.trigger(
+      joinedSocket.trigger(
         "multiplayer_game_joined",
         createdGame({
           gameId: "old-room",
@@ -335,6 +337,12 @@ describe("application behavior", () => {
         }),
       ),
     );
+    expect(
+      joinedSocket.emitted.some(
+        ([event, payload]) =>
+          event === "multiplayer_player_ready" && payload.gameId === "old-room" && payload.playerId === "player-1",
+      ),
+    ).toBe(true);
     await screen.findByRole("grid", { name: "Connect 4 board" });
     const updatedBoard = emptyBoard();
     updatedBoard[5][3] = 2;
@@ -487,6 +495,67 @@ describe("application behavior", () => {
     expect(await screen.findByRole("heading", { name: "You Won!" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Share result" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Review match" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Request rematch" })).toBeEnabled();
+
+    act(() =>
+      latestSocket.trigger("board_updated", {
+        ...createdGame({
+          mode: "multiplayer",
+          status: "player1_win",
+          message: "Player 1 wins by default",
+          playersConnected: 1,
+          playerNames: { 1: "Alice", 2: "Bob" },
+        }),
+      }),
+    );
+    expect(screen.getByRole("button", { name: "Request rematch" })).toBeDisabled();
+  });
+
+  test("keeps the remaining player's room identity until their completed-game leave is acknowledged", async () => {
+    session = authenticatedSession();
+    const user = userEvent.setup();
+    renderApp();
+    await screen.findByRole("button", { name: "Create game" });
+    act(() =>
+      latestSocket.trigger(
+        "multiplayer_game_joined",
+        createdGame({
+          gameId: "finished-room",
+          playerId: "remaining-player",
+          mode: "multiplayer",
+          playersConnected: 2,
+          playerNames: { 1: "Alice", 2: "Bob" },
+        }),
+      ),
+    );
+    act(() =>
+      latestSocket.trigger("board_updated", {
+        ...createdGame({
+          gameId: "finished-room",
+          playerId: "remaining-player",
+          mode: "multiplayer",
+          status: "player2_win",
+          playersConnected: 2,
+          playerNames: { 1: "Alice", 2: "Bob" },
+        }),
+      }),
+    );
+
+    act(() => latestSocket.trigger("player_left", { gameId: "finished-room", message: "Player 1 left the room" }));
+    expect(JSON.parse(window.sessionStorage.getItem("connect4_multiplayer_session"))).toMatchObject({
+      gameId: "finished-room",
+      playerId: "remaining-player",
+    });
+
+    await user.click(
+      within(screen.getByRole("dialog", { name: "Player left" })).getByRole("button", { name: "Main menu" }),
+    );
+    expect(
+      latestSocket.emitted.some(
+        ([event, payload]) =>
+          event === "leave_game" && payload.gameId === "finished-room" && payload.playerId === "remaining-player",
+      ),
+    ).toBe(true);
   });
 
   test("clears a terminal multiplayer create command and exposes the rejection", async () => {
