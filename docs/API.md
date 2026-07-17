@@ -174,7 +174,7 @@ Create, join, move, reset, leave, and rematch events reject missing or invalid t
 ```text
 create_game { difficulty, accessToken }
 join_game { gameId, playerId, accessToken }
-create_multiplayer_game { ownerName?, requestId?, accessToken }
+create_multiplayer_game { ownerName?, requestId?, difficulty?, accessToken }
 reconcile_multiplayer_creation { requestId, accessToken }
 list_public_games { accessToken }
 set_room_public { gameId, playerId, public, accessToken }
@@ -188,19 +188,29 @@ leave_game { gameId, playerId, accessToken }
 ### Server Events
 
 ```text
-game_created { gameId, playerId, playerNumber, aiNumber, board, status, message, difficulty, mode, currentPlayer }
-game_joined { gameId, playerNumber?, aiNumber?, board, status, message, difficulty, mode, currentPlayer }
-multiplayer_game_created { gameId, playerId, playerNumber, playersConnected, board, status, message, mode, requestId?, recovered? }
-multiplayer_game_joined { gameId, playerId, playerNumber, playersConnected, board, status, message, mode, requestId? }
-board_updated { gameId, playerId?, playerNumber?, aiNumber?, board, status, message, aiMove, aiThinking?, difficulty, mode, currentPlayer?, playersConnected?, disconnectDeadline?, playAgainAccepted?, publicRoom? }
+game_created { gameId, playerId, playerNumber, aiNumber, board, status, message, difficulty, mode, currentPlayer, timeBanksMs, activeTimerPlayer, timerRunning, serverTimeMs, endReason }
+game_joined { gameId, playerNumber?, aiNumber?, board, status, message, difficulty, mode, currentPlayer, timeBanksMs, activeTimerPlayer, timerRunning, serverTimeMs, endReason }
+multiplayer_game_created { gameId, playerId, playerNumber, playersConnected, board, status, message, difficulty, mode, requestId?, recovered?, timeBanksMs, activeTimerPlayer, timerRunning, serverTimeMs, endReason }
+multiplayer_game_joined { gameId, playerId, playerNumber, playersConnected, board, status, message, difficulty, mode, requestId?, timeBanksMs, activeTimerPlayer, timerRunning, serverTimeMs, endReason }
+board_updated { gameId, playerId?, playerNumber?, aiNumber?, board, status, message, aiMove, aiThinking?, difficulty, mode, currentPlayer?, playersConnected?, disconnectDeadline?, playAgainAccepted?, publicRoom?, timeBanksMs, activeTimerPlayer, timerRunning, serverTimeMs, endReason }
 play_again_updated { gameId, board, status, message, difficulty, mode, currentPlayer, playersConnected, playAgainAccepted }
-public_games { games: [{ gameId, ownerName }] }
+public_games { games: [{ gameId, ownerName, difficulty }] }
 player_left { gameId, message }
 game_left { gameId }
-invalid_move { gameId, board, status, message, difficulty, mode }
+invalid_move { gameId, board, status, gameStatus, message, difficulty, mode, timeBanksMs, activeTimerPlayer, timerRunning, serverTimeMs, endReason }
 join_rejected { gameId, message, requestId? }
 create_rejected { message, requestId?, code }
 ```
+
+`timeBanksMs` maps player numbers (`"1"` and/or `"2"`) to the
+server-authoritative remaining milliseconds. `activeTimerPlayer` identifies the
+running bank, while `timerRunning` indicates whether the client should animate
+it. `serverTimeMs` accompanies each snapshot for synchronization, and
+`endReason` is live-only (`connect_four`, `timeout`, `time_tiebreak`,
+`disconnect`, `draw`, or `abandoned`). Timer state is not stored in Supabase.
+PvP `difficulty` is one of `multiplayer` (90 seconds), `fast_connect_60`, or
+`fast_connect_30`. Missing creation difficulty defaults to `multiplayer`;
+unknown values are rejected.
 
 PvP creation uses an idempotent command followed by authoritative
 reconciliation. The client stores a `requestId` scoped to its authenticated
@@ -262,7 +272,8 @@ room under the same ID.
 
 The emitted `multiplayer_game_created` and `create_rejected` events remain
 available for compatibility. With the
-`20260715_multiplayer_room_requests.sql` migration installed, the authenticated
+`20260715_multiplayer_room_requests.sql` and
+`20260716_fast_connect_modes.sql` migrations installed, the authenticated
 profile/request-to-room mapping survives backend restarts. Active boards and
 live matches remain in memory; durable hydration is intentionally limited to a
 waiting one-player room with no moves.
@@ -329,6 +340,7 @@ Request:
 {
   "ownerName": "Player",
   "requestId": "client-generated-uuid",
+  "difficulty": "fast_connect_60",
   "accessToken": "supabase-access-token"
 }
 ```
@@ -354,7 +366,7 @@ authoritative room before navigating.
   "status": "waiting",
   "message": "Waiting for Player 2",
   "aiMove": null,
-  "difficulty": "multiplayer",
+  "difficulty": "fast_connect_60",
   "mode": "multiplayer",
   "currentPlayer": 1,
   "publicRoom": false
@@ -395,7 +407,8 @@ Response event: `public_games`
   "games": [
     {
       "gameId": "generated-game-id",
-      "ownerName": "Player"
+      "ownerName": "Player",
+      "difficulty": "fast_connect_60"
     }
   ]
 }

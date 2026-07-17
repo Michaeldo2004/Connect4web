@@ -22,6 +22,13 @@ from game.board import COLS, ROWS, check_win, create_board, drop_piece, is_valid
 HUMAN = 1
 AI = 2
 DISCONNECT_GRACE_SECONDS = 15
+AI_GAME_TIME_BANK_MS = 90_000
+MULTIPLAYER_TIME_BANKS_MS = {
+    "multiplayer": 90_000,
+    "fast_connect_60": 60_000,
+    "fast_connect_30": 30_000,
+}
+FAST_CONNECT_DIFFICULTIES = {"fast_connect_60", "fast_connect_30"}
 CREATE_RATE_LIMIT_COUNT = 100
 CREATE_RATE_LIMIT_SECONDS = 60
 ROOM_VISIBILITY_RATE_LIMIT_SECONDS = 5
@@ -147,6 +154,19 @@ def parse_difficulty(data):
     return difficulty
 
 
+def parse_multiplayer_difficulty(data):
+    difficulty = data.get("difficulty") if isinstance(data, dict) else None
+    if difficulty in {None, ""}:
+        return "multiplayer", None
+    if difficulty not in MULTIPLAYER_TIME_BANKS_MS:
+        return None, "Unknown multiplayer mode"
+    return difficulty, None
+
+
+def multiplayer_time_bank_ms(difficulty):
+    return MULTIPLAYER_TIME_BANKS_MS.get(difficulty, MULTIPLAYER_TIME_BANKS_MS["multiplayer"])
+
+
 def is_auth_required():
     return app.config.get("AUTH_REQUIRED", AUTH_REQUIRED)
 
@@ -254,6 +274,11 @@ def create_game_state(difficulty, player_id=None, profile_id=None):
         "transposition_table": {},
         "ai_thinking": False,
         "move_number": 0,
+        "time_banks_ms": {human_piece: AI_GAME_TIME_BANK_MS},
+        "timer_active_player": None,
+        "timer_started_at_ms": None,
+        "timer_generation": 0,
+        "end_reason": None,
         "created_at": now,
         "updated_at": now,
     }
@@ -267,9 +292,17 @@ def get_ai_piece(game):
     return game.get("ai_piece", AI)
 
 
-def create_multiplayer_game_state(player_id=None, profile_id=None, bind_socket=True):
+def create_multiplayer_game_state(
+    player_id=None,
+    profile_id=None,
+    bind_socket=True,
+    difficulty="multiplayer",
+):
+    if difficulty not in MULTIPLAYER_TIME_BANKS_MS:
+        raise ValueError("Unknown multiplayer mode")
     player_id = player_id or uuid.uuid4().hex
     now = time.time()
+    time_bank_ms = multiplayer_time_bank_ms(difficulty)
     return {
         "mode": "multiplayer",
         "public": False,
@@ -286,13 +319,18 @@ def create_multiplayer_game_state(player_id=None, profile_id=None, bind_socket=T
             },
         },
         "board": create_board(),
-        "difficulty": "multiplayer",
+        "difficulty": difficulty,
         "status": "waiting",
         "message": "Waiting for Player 2",
         "current_player": HUMAN,
         "disconnect_deadline": None,
         "rematch_requests": set(),
         "move_number": 0,
+        "time_banks_ms": {HUMAN: time_bank_ms, AI: time_bank_ms},
+        "timer_active_player": None,
+        "timer_started_at_ms": None,
+        "timer_generation": 0,
+        "end_reason": None,
         "created_at": now,
         "updated_at": now,
     }
@@ -314,6 +352,165 @@ def assign_multiplayer_pieces(game, starter_player_id=None):
 
 def mark_game_updated(game):
     game["updated_at"] = time.time()
+
+
+def current_time_ms():
+    return time.time() * 1000
+
+
+def timer_banks_snapshot(game, now_ms=None):
+    banks = {
+        int(player_number): max(0, int(remaining_ms))
+        for player_number, remaining_ms in game.get("time_banks_ms", {}).items()
+    }
+    active_player = game.get("timer_active_player")
+    started_at_ms = game.get("timer_started_at_ms")
+    if active_player in banks and started_at_ms is not None and game.get("status") == "playing":
+        elapsed_ms = max(0, (now_ms if now_ms is not None else current_time_ms()) - started_at_ms)
+        banks[active_player] = max(0, int(banks[active_player] - elapsed_ms))
+    return banks
+
+
+def consume_active_timer(game, now_ms=None):
+    active_player = game.get("timer_active_player")
+    started_at_ms = game.get("timer_started_at_ms")
+    banks = game.get("time_banks_ms", {})
+    if active_player not in banks or started_at_ms is None:
+        return active_player, None
+
+    now_ms = now_ms if now_ms is not None else current_time_ms()
+    elapsed_ms = max(0, now_ms - started_at_ms)
+    remaining_ms = max(0.0, banks[active_player] - elapsed_ms)
+    banks[active_player] = remaining_ms
+    game["timer_started_at_ms"] = now_ms
+    return active_player, remaining_ms
+
+
+def cancel_game_timer_task(game):
+    timer_task = game.pop("timer_task", None)
+    if timer_task is not None:
+        timer_task.cancel()
+
+
+def pause_game_timer(game, now_ms=None):
+    cancel_game_timer_task(game)
+    active_player, remaining_ms = consume_active_timer(game, now_ms)
+    game["timer_active_player"] = None
+    game["timer_started_at_ms"] = None
+    game["timer_generation"] = game.get("timer_generation", 0) + 1
+    return active_player, remaining_ms
+
+
+def multiplayer_name_for_piece(game, piece):
+    for player in game.get("players", {}).values():
+        if player.get("piece") == piece:
+            return player.get("display_name") or f"Player {piece}"
+    return f"Player {piece}"
+
+
+def complete_game_on_timeout(game_id, game, timed_out_player):
+    cancel_game_timer_task(game)
+    banks = game.get("time_banks_ms", {})
+    if timed_out_player in banks:
+        banks[timed_out_player] = 0
+    game["timer_active_player"] = None
+    game["timer_started_at_ms"] = None
+    game["timer_generation"] = game.get("timer_generation", 0) + 1
+    game["end_reason"] = "timeout"
+
+    if game.get("mode") == "multiplayer":
+        winning_piece = AI if timed_out_player == HUMAN else HUMAN
+        game["status"] = "player1_win" if winning_piece == HUMAN else "player2_win"
+        game["message"] = f"{multiplayer_name_for_piece(game, winning_piece)} won by timer"
+    else:
+        game["status"] = "ai_win"
+        game["message"] = "AI won by timer"
+
+    mark_game_updated(game)
+    if game_id:
+        supabase_store.update_game_record(game_id, game)
+
+
+def expire_active_timer_if_needed(game_id, game, now_ms=None):
+    active_player, remaining_ms = consume_active_timer(game, now_ms)
+    if active_player is None or remaining_ms is None or remaining_ms > 0:
+        return False
+    complete_game_on_timeout(game_id, game, active_player)
+    return True
+
+
+def schedule_game_timer_task(game_id, game, generation, player_number, delay_ms):
+    if not app.config.get("GAME_CLOCK_TASKS_ENABLED", True):
+        return
+    timer_task = threading.Timer(
+        max(0, delay_ms) / 1000,
+        run_game_timer,
+        args=(game_id, game, generation, player_number, 0),
+    )
+    timer_task.daemon = True
+    game["timer_task"] = timer_task
+    timer_task.start()
+
+
+def run_game_timer(game_id, expected_game, expected_generation, expected_player, delay_ms):
+    if delay_ms > 0:
+        socketio.sleep(delay_ms / 1000)
+    payload = None
+    reschedule_ms = None
+    with get_game_lock(game_id):
+        game = get_stored_game(game_id)
+        if (
+            game is None
+            or game is not expected_game
+            or game.get("status") != "playing"
+            or game.get("timer_generation") != expected_generation
+            or game.get("timer_active_player") != expected_player
+        ):
+            return
+
+        game.pop("timer_task", None)
+        if expire_active_timer_if_needed(game_id, game):
+            payload = serialize_game(game_id, game)
+        else:
+            reschedule_ms = timer_banks_snapshot(game).get(expected_player, 0)
+
+    if payload is not None:
+        socketio.emit("board_updated", payload, to=game_id)
+    elif reschedule_ms is not None:
+        schedule_game_timer_task(
+            game_id,
+            expected_game,
+            expected_generation,
+            expected_player,
+            reschedule_ms,
+        )
+
+
+def start_game_timer(game_id, game, player_number):
+    if game.get("status") != "playing" or player_number not in game.get("time_banks_ms", {}):
+        return
+
+    if game.get("timer_active_player") == player_number and game.get("timer_started_at_ms") is not None:
+        return
+
+    pause_game_timer(game)
+    remaining_ms = game["time_banks_ms"][player_number]
+    if remaining_ms <= 0:
+        complete_game_on_timeout(game_id, game, player_number)
+        return
+
+    game["timer_active_player"] = player_number
+    game["timer_started_at_ms"] = current_time_ms()
+    game["timer_generation"] = game.get("timer_generation", 0) + 1
+    generation = game["timer_generation"]
+    schedule_game_timer_task(game_id, game, generation, player_number, remaining_ms)
+
+
+def finish_game(game, status, message, end_reason):
+    pause_game_timer(game)
+    game["status"] = status
+    game["message"] = message
+    game["end_reason"] = end_reason
 
 
 def request_key():
@@ -348,6 +545,7 @@ def cleanup_stale_games():
                     with games_lock:
                         if games.get(game_id) is game:
                             games.pop(game_id, None)
+                            cancel_game_timer_task(game)
                             removed = True
                             removed_game = game
         if removed:
@@ -413,6 +611,7 @@ def remove_ai_games_for_sid(socket_id):
                 with games_lock:
                     if games.get(game_id) is game:
                         games.pop(game_id, None)
+                        cancel_game_timer_task(game)
                         did_remove = True
         if did_remove:
             delete_game_lock(game_id)
@@ -440,6 +639,8 @@ def replace_game_id(old_game_id, game):
 def pop_game(game_id):
     with games_lock:
         game = games.pop(game_id, None)
+    if game is not None:
+        cancel_game_timer_task(game)
     delete_game_lock(game_id)
     return game
 
@@ -855,6 +1056,9 @@ def get_ai_move(board_data, settings, transposition_table, ai_piece=AI):
 
 
 def serialize_game(game_id, game, ai_move=None, include_player_id=False, player_id=None):
+    server_time_ms = current_time_ms()
+    timer_banks = timer_banks_snapshot(game, server_time_ms)
+    active_timer_player = game.get("timer_active_player")
     payload = {
         "gameId": game_id,
         "board": board_to_list(game["board"]),
@@ -863,6 +1067,15 @@ def serialize_game(game_id, game, ai_move=None, include_player_id=False, player_
         "aiMove": ai_move,
         "difficulty": game["difficulty"],
         "mode": game.get("mode", "ai"),
+        "timeBanksMs": {str(player_number): remaining_ms for player_number, remaining_ms in timer_banks.items()},
+        "activeTimerPlayer": active_timer_player,
+        "timerRunning": bool(
+            game.get("status") == "playing"
+            and active_timer_player in timer_banks
+            and game.get("timer_started_at_ms") is not None
+        ),
+        "serverTimeMs": int(server_time_ms),
+        "endReason": game.get("end_reason"),
     }
 
     if "current_player" in game:
@@ -945,6 +1158,7 @@ def apply_ai_result(game, game_id, ai_move, transposition_table):
         game["transposition_table"] = transposition_table
         game["current_player"] = human_piece
         game["message"] = "AI move failed. Your turn"
+        start_game_timer(game_id, game, human_piece)
         mark_game_updated(game)
         supabase_store.update_game_record(game_id, game)
         return None, "AI returned an invalid move"
@@ -959,15 +1173,14 @@ def apply_ai_result(game, game_id, ai_move, transposition_table):
     game["transposition_table"] = transposition_table
 
     if check_win(board, ai_piece):
-        game["status"] = "ai_win"
-        game["message"] = "AI wins"
+        finish_game(game, "ai_win", "AI wins", "connect_four")
     elif is_draw(board):
-        game["status"] = "draw"
-        game["message"] = "Draw"
+        finish_game(game, "draw", "Draw", "draw")
     else:
         game["status"] = "playing"
         game["current_player"] = human_piece
         game["message"] = "Your turn"
+        start_game_timer(game_id, game, human_piece)
 
     mark_game_updated(game)
     if game_id:
@@ -1014,6 +1227,7 @@ def complete_ai_turn(job):
                 game["ai_queue_position"] = 0
                 game["current_player"] = get_human_piece(game)
                 game["message"] = "AI move failed. Your turn"
+                start_game_timer(job["game_id"], game, game["current_player"])
                 mark_game_updated(game)
                 supabase_store.update_game_record(job["game_id"], game)
                 payload = serialize_game(job["game_id"], game)
@@ -1058,6 +1272,7 @@ def make_socket_error(game_id, game, message):
         }
 
     payload = serialize_game(game_id, game)
+    payload["gameStatus"] = game["status"]
     payload["status"] = "invalid_move"
     payload["message"] = message
     return payload
@@ -1196,6 +1411,7 @@ def durable_multiplayer_room_error(room, profile_id, request_id):
 
     if (
         room.get("game_mode") != "multiplayer"
+        or room.get("game_difficulty") not in MULTIPLAYER_TIME_BANKS_MS
         or room.get("game_status") != "waiting"
         or room.get("player_count") != 1
         or room.get("owner_profile_id") != expected_profile_id
@@ -1216,7 +1432,12 @@ def rebuild_durable_multiplayer_room(room, bind_socket):
     with get_game_lock(game_id):
         game = get_stored_game(game_id)
         if game is None:
-            game = create_multiplayer_game_state(player_id, profile_id=profile_id, bind_socket=bind_socket)
+            game = create_multiplayer_game_state(
+                player_id,
+                profile_id=profile_id,
+                bind_socket=bind_socket,
+                difficulty=room["game_difficulty"],
+            )
             game["owner_name"] = sanitize_public_owner_name(room.get("owner_name"))
             game["players"][player_id]["display_name"] = game["owner_name"]
             game["creation_request_id"] = room["request_id"]
@@ -1307,6 +1528,7 @@ def public_game_payload(game_id, game):
     return {
         "gameId": game_id,
         "ownerName": sanitize_public_owner_name(game.get("owner_name")),
+        "difficulty": game.get("difficulty", "multiplayer"),
     }
 
 
@@ -1331,12 +1553,7 @@ def apply_human_and_ai_move(game, column, game_id=None):
     human_piece = get_human_piece(game)
     ai_piece = get_ai_piece(game)
     transposition_table = normalize_transposition_table(game.get("transposition_table"))
-
-    if not isinstance(column, int):
-        return None, "Invalid column"
-
-    if column < 0 or column >= COLS:
-        return None, "Column out of range"
+    move_received_at_ms = current_time_ms()
 
     if (
         game["status"] in FINISHED_STATUSES
@@ -1345,6 +1562,15 @@ def apply_human_and_ai_move(game, column, game_id=None):
         or is_draw(board)
     ):
         return None, "Game is already over"
+
+    if expire_active_timer_if_needed(game_id, game, move_received_at_ms):
+        return None, None
+
+    if not isinstance(column, int):
+        return None, "Invalid column"
+
+    if column < 0 or column >= COLS:
+        return None, "Column out of range"
 
     if game.get("current_player") != human_piece:
         return None, "Not your turn"
@@ -1359,14 +1585,14 @@ def apply_human_and_ai_move(game, column, game_id=None):
     if needs_ai_turn and not ai_reservation:
         return None, AI_BUSY_MESSAGE
 
+    pause_game_timer(game, move_received_at_ms)
     board_before = board_to_list(board)
     drop_piece(board, column, human_piece)
     if game_id:
         supabase_store.record_move(game_id, game, human_piece, column, board_before, board_to_list(board))
 
     if check_win(board, human_piece):
-        game["status"] = "human_win"
-        game["message"] = "You win"
+        finish_game(game, "human_win", "You win", "connect_four")
         game["transposition_table"] = transposition_table
         mark_game_updated(game)
         if game_id:
@@ -1374,8 +1600,7 @@ def apply_human_and_ai_move(game, column, game_id=None):
         return None, None
 
     if is_draw(board):
-        game["status"] = "draw"
-        game["message"] = "Draw"
+        finish_game(game, "draw", "Draw", "draw")
         game["transposition_table"] = transposition_table
         mark_game_updated(game)
         if game_id:
@@ -1392,6 +1617,7 @@ def apply_human_and_ai_move(game, column, game_id=None):
 def apply_multiplayer_move(game, player_id, column, game_id=None):
     board = game["board"]
     player = game["players"].get(player_id)
+    move_received_at_ms = current_time_ms()
 
     if player is None:
         return "Player does not have access to this game"
@@ -1401,6 +1627,9 @@ def apply_multiplayer_move(game, player_id, column, game_id=None):
 
     if game["status"] != "playing":
         return "Waiting for both players to enter the game"
+
+    if expire_active_timer_if_needed(game_id, game, move_received_at_ms):
+        return None
 
     if not isinstance(column, int):
         return "Invalid column"
@@ -1420,6 +1649,7 @@ def apply_multiplayer_move(game, player_id, column, game_id=None):
     if not is_valid_move(board, column):
         return "Column is full"
 
+    pause_game_timer(game, move_received_at_ms)
     board_before = board_to_list(board)
     drop_piece(board, column, player["piece"])
     if game_id:
@@ -1438,16 +1668,30 @@ def apply_multiplayer_move(game, player_id, column, game_id=None):
         )
 
     if check_win(board, player["piece"]):
-        game["status"] = "player1_win" if player["piece"] == HUMAN else "player2_win"
-        game["message"] = f"Player {player['piece']} wins"
+        finish_game(
+            game,
+            "player1_win" if player["piece"] == HUMAN else "player2_win",
+            f"{multiplayer_name_for_piece(game, player['piece'])} wins",
+            "connect_four",
+        )
         mark_game_updated(game)
         if game_id:
             supabase_store.update_game_record(game_id, game)
         return None
 
     if is_draw(board):
-        game["status"] = "draw"
-        game["message"] = "Draw"
+        player_one_time = game["time_banks_ms"][HUMAN]
+        player_two_time = game["time_banks_ms"][AI]
+        if player_one_time == player_two_time:
+            finish_game(game, "draw", "Draw", "draw")
+        else:
+            winning_piece = HUMAN if player_one_time > player_two_time else AI
+            finish_game(
+                game,
+                "player1_win" if winning_piece == HUMAN else "player2_win",
+                f"{multiplayer_name_for_piece(game, winning_piece)} won by timer tiebreak",
+                "time_tiebreak",
+            )
         mark_game_updated(game)
         if game_id:
             supabase_store.update_game_record(game_id, game)
@@ -1456,6 +1700,7 @@ def apply_multiplayer_move(game, player_id, column, game_id=None):
     game["current_player"] = AI if player["piece"] == HUMAN else HUMAN
     game["status"] = "playing"
     game["message"] = f"Player {game['current_player']} turn"
+    start_game_timer(game_id, game, game["current_player"])
     mark_game_updated(game)
     if game_id:
         supabase_store.update_game_record(game_id, game)
@@ -1512,16 +1757,19 @@ def start_multiplayer_disconnect_timer(game_id, player_id, disconnect_token):
 
         other_player = other_players[0]
         if not other_player.get("connected"):
-            game["status"] = "draw"
-            game["message"] = "Game abandoned"
+            finish_game(game, "draw", "Game abandoned", "abandoned")
             game["disconnect_deadline"] = None
             mark_game_updated(game)
             supabase_store.update_game_record(game_id, game)
             payload = serialize_game(game_id, game)
         else:
             winning_piece = other_player["piece"]
-            game["status"] = "player1_win" if winning_piece == HUMAN else "player2_win"
-            game["message"] = f"Player {winning_piece} wins by default"
+            finish_game(
+                game,
+                "player1_win" if winning_piece == HUMAN else "player2_win",
+                f"Player {winning_piece} wins by default",
+                "disconnect",
+            )
             game["disconnect_deadline"] = None
             mark_game_updated(game)
             supabase_store.update_game_record(game_id, game)
@@ -1554,6 +1802,12 @@ def reset_multiplayer_game(game):
     game["disconnect_deadline"] = None
     game["rematch_requests"] = set()
     game["move_number"] = 0
+    time_bank_ms = multiplayer_time_bank_ms(game.get("difficulty"))
+    game["time_banks_ms"] = {HUMAN: time_bank_ms, AI: time_bank_ms}
+    game["timer_active_player"] = None
+    game["timer_started_at_ms"] = None
+    game["timer_generation"] = game.get("timer_generation", 0) + 1
+    game["end_reason"] = None
     game["created_at"] = now
     mark_game_updated(game)
 
@@ -1744,6 +1998,8 @@ def create_admitted_ai_game(auth_context, difficulty):
     supabase_store.create_game_record(game_id, game)
     store_game(game_id, game)
     join_room(game_id)
+    if not ai_starts:
+        start_game_timer(game_id, game, get_human_piece(game))
     emit("game_created", serialize_game(game_id, game, include_player_id=True))
     emit_ai_turn_if_needed(game_id, game, ai_slot_reserved)
 
@@ -1863,11 +2119,14 @@ def socket_join_game(data):
 def socket_create_multiplayer_game(data=None):
     data = data or {}
     request_id, request_id_error = parse_multiplayer_create_request_id(data)
+    difficulty, difficulty_error = parse_multiplayer_difficulty(data)
     auth_context, auth_error = authenticate_payload(data or {})
     if auth_error:
         return multiplayer_create_rejection(auth_error, request_id, "authentication_failed")
     if request_id_error:
         return multiplayer_create_rejection(request_id_error, None, "invalid_request")
+    if difficulty_error:
+        return multiplayer_create_rejection(difficulty_error, request_id, "invalid_multiplayer_mode")
 
     profile_id = auth_context["profile_id"]
     game = None
@@ -1918,6 +2177,15 @@ def socket_create_multiplayer_game(data=None):
                         request_id,
                         persistence_result.get("code") or "persistence_unavailable",
                     )
+                elif (
+                    persistence_result.get("result") == "schema_missing"
+                    and difficulty in FAST_CONNECT_DIFFICULTIES
+                ):
+                    return multiplayer_create_rejection(
+                        "Fast Connect requires the latest Supabase multiplayer migration.",
+                        request_id,
+                        "fast_connect_schema_update_required",
+                    )
 
             if game is None:
                 error = check_create_allowed()
@@ -1937,6 +2205,7 @@ def socket_create_multiplayer_game(data=None):
                         proposed_game_id,
                         proposed_player_id,
                         owner_name,
+                        difficulty,
                     )
                     if claim_result.get("result") == "ok":
                         room = claim_result["room"]
@@ -1957,6 +2226,15 @@ def socket_create_multiplayer_game(data=None):
                             request_id,
                             claim_result.get("code") or "persistence_unavailable",
                         )
+                    elif (
+                        claim_result.get("result") == "schema_missing"
+                        and difficulty in FAST_CONNECT_DIFFICULTIES
+                    ):
+                        return multiplayer_create_rejection(
+                            "Fast Connect requires the latest Supabase multiplayer migration.",
+                            request_id,
+                            "fast_connect_schema_update_required",
+                        )
                     else:
                         persistence_result = claim_result
 
@@ -1965,7 +2243,11 @@ def socket_create_multiplayer_game(data=None):
                     # not installed. Preserve the original in-memory behavior.
                     game_id = proposed_game_id
                     player_id = proposed_player_id
-                    game = create_multiplayer_game_state(player_id, profile_id=profile_id)
+                    game = create_multiplayer_game_state(
+                        player_id,
+                        profile_id=profile_id,
+                        difficulty=difficulty,
+                    )
                     game["owner_name"] = owner_name
                     game["players"][player_id]["display_name"] = owner_name
                     if request_id is not None and profile_id is not None:
@@ -2242,6 +2524,7 @@ def socket_multiplayer_player_ready(data):
                     game["status"] = "playing"
                     game["message"] = f"Player {game['current_player']} turn"
                     game["disconnect_deadline"] = None
+                    start_game_timer(game_id, game, game["current_player"])
                     supabase_store.update_game_record(game_id, game)
                 elif game["status"] == "waiting":
                     game["message"] = (
@@ -2426,6 +2709,7 @@ def socket_play_again(data):
                 new_game_id = replace_game_id(game_id, game)
                 move_multiplayer_room(game_id, new_game_id, game)
                 supabase_store.create_game_record(new_game_id, game)
+                start_game_timer(new_game_id, game, game["current_player"])
                 reset_game_id = new_game_id
                 reset_game = game
                 event_name = "board_updated"
@@ -2533,6 +2817,8 @@ def socket_reset_game(data):
                 supabase_store.create_game_record(new_game_id, new_game)
                 leave_room(game_id)
                 join_room(new_game_id)
+                if not ai_starts:
+                    start_game_timer(new_game_id, new_game, get_human_piece(new_game))
                 payload = serialize_game(new_game_id, new_game, include_player_id=True)
 
     if error:

@@ -59,6 +59,12 @@ http://localhost:5000
 
 Gameplay uses Socket.IO on the same backend port.
 
+Standard multiplayer gives each player a 90-second total time bank. Fast
+Connect uses the same rules with either 60 or 30 seconds per player.
+Human-vs-AI runs only the human 90-second clock and pauses it during AI work. Timer state
+survives browser reconnects but remains in backend memory, so it does not
+survive a backend restart.
+
 ## Backend
 
 From the backend folder:
@@ -115,6 +121,13 @@ and preserve cancelled or expired request tombstones. Until it is installed,
 PvP still uses the in-memory fallback but cannot recover a pending creation
 after a backend restart.
 
+Existing projects must then run
+`docs/migrations/20260716_fast_connect_modes.sql`. This rerunnable migration
+adds the two Fast Connect difficulty values and upgrades the durable creation
+RPC to persist the selected preset. A configured Supabase deployment rejects
+Fast Connect creation with a schema-update message until this migration is
+installed; Standard 90-second rooms keep the compatibility fallback.
+
 After migration, `GET /api/profile/games/{gameId}/moves` reports
 `analysis_available: true` and `analysis_unavailable_reason: null`. Before the
 migration, the compatibility fallback still returns board history but disables
@@ -164,7 +177,10 @@ npm install
 npm run dev
 ```
 
-Vite opens the browser at `http://localhost:5173`. Pick `Vs Player` or a `Vs AI` difficulty, then click `Create game` to create a room and redirect to `/game/{id}`. The `/join` route supports manual room ID joins and refreshable public waiting-room discovery.
+Vite opens the browser at `http://localhost:5173`. Pick Standard Connect 90s,
+Fast Connect 60s, Fast Connect 30s, or a `Vs AI` difficulty, then click
+`Create game` to create a room and redirect to `/game/{id}`. The `/join` route
+supports manual room ID joins and refreshable public waiting-room discovery.
 
 Auth uses Supabase Auth. The app has `/login`, `/signup`, and `/profiles` routes, plus a nav popup. Users must be logged in to play or view completed profile games when `AUTH_REQUIRED=true`.
 

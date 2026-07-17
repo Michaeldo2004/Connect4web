@@ -26,6 +26,7 @@ class SocketGameTests(unittest.TestCase):
     def setUp(self):
         app_module.DISCONNECT_GRACE_SECONDS = 0.01
         app.config["AI_SEARCH_INLINE"] = True
+        app.config["GAME_CLOCK_TASKS_ENABLED"] = False
         app.config["AUTH_REQUIRED"] = False
         games.clear()
         app_module.reset_ai_job_queue()
@@ -62,6 +63,7 @@ class SocketGameTests(unittest.TestCase):
         app_module.reset_ai_admission_queue()
         app_module.create_attempts.clear()
         app.config["AI_SEARCH_INLINE"] = False
+        app.config.pop("GAME_CLOCK_TASKS_ENABLED", None)
         app.config.pop("AUTH_REQUIRED", None)
         app_module.DISCONNECT_GRACE_SECONDS = 15
         self.room_resolve_patch.stop()
@@ -89,7 +91,15 @@ class SocketGameTests(unittest.TestCase):
         second_updates = find_events(second_client, "board_updated")
         return first_updates[-1], second_updates[-1]
 
-    def durable_room_record(self, profile_id, request_id, state="active", game_status="waiting", created=False):
+    def durable_room_record(
+        self,
+        profile_id,
+        request_id,
+        state="active",
+        game_status="waiting",
+        created=False,
+        difficulty="multiplayer",
+    ):
         return {
             "profile_id": profile_id,
             "request_id": request_id,
@@ -100,14 +110,198 @@ class SocketGameTests(unittest.TestCase):
             "expires_at": "2099-01-01T00:00:00+00:00",
             "resolved_at": None,
             "game_mode": "multiplayer",
+            "game_difficulty": difficulty,
             "game_status": game_status,
             "player_count": 1,
             "owner_profile_id": profile_id,
             "created": created,
         }
 
+    def make_playing_multiplayer_game(self, starter_piece=1):
+        first_player_id = uuid.uuid4().hex
+        second_player_id = uuid.uuid4().hex
+        game_id = uuid.uuid4().hex
+        game = app_module.create_multiplayer_game_state(first_player_id, bind_socket=False)
+        game["players"][first_player_id].update(
+            {"display_name": "First Player", "connected": True, "ready": True}
+        )
+        game["players"][second_player_id] = {
+            "piece": 2,
+            "profile_id": None,
+            "display_name": "Second Player",
+            "socket_id": None,
+            "connected": True,
+            "ready": True,
+            "disconnect_token": None,
+        }
+        app_module.assign_multiplayer_pieces(game, first_player_id)
+        game["status"] = "playing"
+        game["current_player"] = starter_piece
+        app_module.store_game(game_id, game)
+        return game_id, game, first_player_id, second_player_id
+
     def test_socket_connects(self):
         self.assertTrue(self.client.is_connected())
+
+    def test_ai_game_clock_counts_only_the_human_turn(self):
+        with patch.object(app_module.random, "choice", return_value=app_module.HUMAN):
+            created = self.create_game()
+        game = games[created["gameId"]]
+        started_at_ms = game["timer_started_at_ms"]
+
+        with patch.object(app_module, "current_time_ms", return_value=started_at_ms + 10_000):
+            snapshot = app_module.serialize_game(created["gameId"], game)
+            job, error = app_module.apply_human_and_ai_move(game, 3, created["gameId"])
+
+        self.assertIsNone(error)
+        self.assertIsNotNone(job)
+        self.assertEqual(snapshot["timeBanksMs"], {"1": 80_000})
+        self.assertEqual(game["time_banks_ms"][app_module.HUMAN], 80_000)
+        self.assertIsNone(game["timer_active_player"])
+
+    def test_multiplayer_clock_switches_and_deducts_only_active_bank(self):
+        game_id, game, first_player_id, _ = self.make_playing_multiplayer_game()
+        with patch.object(app_module, "current_time_ms", return_value=1_000):
+            app_module.start_game_timer(game_id, game, app_module.HUMAN)
+        with patch.object(app_module, "current_time_ms", return_value=11_000):
+            error = app_module.apply_multiplayer_move(game, first_player_id, 3, game_id)
+
+        self.assertIsNone(error)
+        self.assertEqual(game["time_banks_ms"], {app_module.HUMAN: 80_000, app_module.AI: 90_000})
+        self.assertEqual(game["timer_active_player"], app_module.AI)
+        self.assertEqual(game["timer_started_at_ms"], 11_000)
+
+    def test_multiplayer_presets_initialize_exact_server_owned_banks(self):
+        expected_banks = {
+            "multiplayer": 90_000,
+            "fast_connect_60": 60_000,
+            "fast_connect_30": 30_000,
+        }
+        for difficulty, expected_ms in expected_banks.items():
+            with self.subTest(difficulty=difficulty):
+                game = app_module.create_multiplayer_game_state(
+                    bind_socket=False,
+                    difficulty=difficulty,
+                )
+                self.assertEqual(game["difficulty"], difficulty)
+                self.assertEqual(
+                    game["time_banks_ms"],
+                    {app_module.HUMAN: expected_ms, app_module.AI: expected_ms},
+                )
+
+    def test_fast_connect_rematch_resets_selected_preset_banks(self):
+        game = app_module.create_multiplayer_game_state(
+            bind_socket=False,
+            difficulty="fast_connect_30",
+        )
+        second_player_id = uuid.uuid4().hex
+        game["players"][second_player_id] = {
+            "piece": app_module.AI,
+            "profile_id": None,
+            "display_name": "Second Player",
+            "socket_id": None,
+            "connected": True,
+            "ready": True,
+            "disconnect_token": None,
+        }
+        game["time_banks_ms"] = {app_module.HUMAN: 1_000, app_module.AI: 2_000}
+
+        app_module.reset_multiplayer_game(game)
+
+        self.assertEqual(game["difficulty"], "fast_connect_30")
+        self.assertEqual(
+            game["time_banks_ms"],
+            {app_module.HUMAN: 30_000, app_module.AI: 30_000},
+        )
+
+    def test_multiplayer_create_rejects_unknown_preset(self):
+        ack = self.client.emit(
+            "create_multiplayer_game",
+            {"difficulty": "fast_connect_45"},
+            callback=True,
+        )
+
+        self.assertFalse(ack["ok"])
+        self.assertEqual(ack["code"], "invalid_multiplayer_mode")
+        self.assertEqual(games, {})
+
+    def test_multiplayer_timeout_awards_opponent_and_stale_task_is_ignored(self):
+        game_id, game, _, _ = self.make_playing_multiplayer_game()
+        with patch.object(app_module, "current_time_ms", return_value=1_000):
+            app_module.start_game_timer(game_id, game, app_module.HUMAN)
+        stale_generation = game["timer_generation"]
+        app_module.pause_game_timer(game, 1_000)
+        with patch.object(app_module, "current_time_ms", return_value=1_000):
+            app_module.start_game_timer(game_id, game, app_module.HUMAN)
+
+        app_module.run_game_timer(game_id, game, stale_generation, app_module.HUMAN, 0)
+        self.assertEqual(game["status"], "playing")
+
+        with patch.object(app_module, "current_time_ms", return_value=91_000):
+            expired = app_module.expire_active_timer_if_needed(game_id, game)
+        self.assertTrue(expired)
+        self.assertEqual(game["status"], "player2_win")
+        self.assertEqual(game["end_reason"], "timeout")
+        self.assertEqual(game["message"], "Second Player won by timer")
+
+    def test_full_multiplayer_board_uses_remaining_time_tiebreak(self):
+        game_id, game, _, second_player_id = self.make_playing_multiplayer_game(starter_piece=app_module.AI)
+        game["board"] = app_module.np.array(
+            [
+                [2, 0, 1, 2, 2, 2, 1],
+                [1, 1, 2, 1, 1, 2, 1],
+                [1, 1, 1, 2, 2, 1, 2],
+                [1, 2, 2, 2, 1, 1, 1],
+                [2, 1, 1, 2, 2, 2, 1],
+                [1, 2, 1, 1, 2, 2, 2],
+            ]
+        )
+        game["time_banks_ms"] = {app_module.HUMAN: 60_000, app_module.AI: 70_000}
+        with patch.object(app_module, "current_time_ms", return_value=1_000):
+            app_module.start_game_timer(game_id, game, app_module.AI)
+            error = app_module.apply_multiplayer_move(game, second_player_id, 1, game_id)
+
+        self.assertIsNone(error)
+        self.assertEqual(game["status"], "player2_win")
+        self.assertEqual(game["end_reason"], "time_tiebreak")
+        self.assertEqual(game["message"], "Second Player won by timer tiebreak")
+
+    def test_full_multiplayer_board_with_equal_banks_remains_draw(self):
+        game_id, game, _, second_player_id = self.make_playing_multiplayer_game(starter_piece=app_module.AI)
+        game["board"] = app_module.np.array(
+            [
+                [2, 0, 1, 2, 2, 2, 1],
+                [1, 1, 2, 1, 1, 2, 1],
+                [1, 1, 1, 2, 2, 1, 2],
+                [1, 2, 2, 2, 1, 1, 1],
+                [2, 1, 1, 2, 2, 2, 1],
+                [1, 2, 1, 1, 2, 2, 2],
+            ]
+        )
+        game["time_banks_ms"] = {app_module.HUMAN: 70_000, app_module.AI: 70_000}
+        with patch.object(app_module, "current_time_ms", return_value=1_000):
+            app_module.start_game_timer(game_id, game, app_module.AI)
+            error = app_module.apply_multiplayer_move(game, second_player_id, 1, game_id)
+
+        self.assertIsNone(error)
+        self.assertEqual(game["status"], "draw")
+        self.assertEqual(game["end_reason"], "draw")
+
+    def test_disconnected_multiplayer_clock_keeps_running_and_rejoin_does_not_reset_it(self):
+        game_id, game, first_player_id, _ = self.make_playing_multiplayer_game()
+        with patch.object(app_module, "current_time_ms", return_value=1_000):
+            app_module.start_game_timer(game_id, game, app_module.HUMAN)
+        game["players"][first_player_id]["connected"] = False
+
+        with patch.object(app_module, "current_time_ms", return_value=16_000):
+            disconnected_payload = app_module.serialize_game(game_id, game, player_id=first_player_id)
+        game["players"][first_player_id]["connected"] = True
+        with patch.object(app_module, "current_time_ms", return_value=21_000):
+            rejoined_payload = app_module.serialize_game(game_id, game, player_id=first_player_id)
+
+        self.assertEqual(disconnected_payload["timeBanksMs"]["1"], 75_000)
+        self.assertEqual(rejoined_payload["timeBanksMs"]["1"], 70_000)
+        self.assertEqual(game["time_banks_ms"][app_module.HUMAN], 90_000)
 
     def test_api_move_endpoint_is_removed(self):
         response = app.test_client().post(
@@ -816,6 +1010,37 @@ class SocketGameTests(unittest.TestCase):
         self.assertEqual(len(games), 1)
         legacy_create.assert_called_once()
 
+    def test_fast_connect_creation_requires_updated_configured_schema(self):
+        profile_id = str(uuid.uuid4())
+        app.config["AUTH_REQUIRED"] = True
+        with (
+            patch.object(
+                app_module,
+                "authenticate_payload",
+                return_value=({"profile_id": profile_id, "email": None}, None),
+            ),
+            patch.object(
+                app_module.supabase_store,
+                "fetch_multiplayer_room_request",
+                return_value={"result": "schema_missing"},
+            ),
+            patch.object(app_module.supabase_store, "create_game_record") as legacy_create,
+        ):
+            ack = self.client.emit(
+                "create_multiplayer_game",
+                {
+                    "requestId": "fast-missing-schema",
+                    "accessToken": "token",
+                    "difficulty": "fast_connect_60",
+                },
+                callback=True,
+            )
+
+        self.assertFalse(ack["ok"])
+        self.assertEqual(ack["code"], "fast_connect_schema_update_required")
+        self.assertEqual(games, {})
+        legacy_create.assert_not_called()
+
     def test_reconcile_restores_durable_waiting_room_then_join_binds_socket(self):
         profile_id = str(uuid.uuid4())
         room = self.durable_room_record(profile_id, "restart-recovery")
@@ -967,6 +1192,7 @@ class SocketGameTests(unittest.TestCase):
             "requestId": "lost-create-response",
             "accessToken": "profile-one-token",
             "ownerName": "Player One",
+            "difficulty": "fast_connect_60",
         }
 
         def authenticate(data):
@@ -991,7 +1217,7 @@ class SocketGameTests(unittest.TestCase):
             retry_client = socketio.test_client(app)
             retry_ack = retry_client.emit(
                 "create_multiplayer_game",
-                request_payload,
+                {**request_payload, "difficulty": "fast_connect_30"},
                 callback=True,
             )
             retry_event = find_event(retry_client, "multiplayer_game_created")
@@ -1008,6 +1234,11 @@ class SocketGameTests(unittest.TestCase):
             self.assertEqual(retry_event["gameId"], original_game_id)
             self.assertEqual(retry_event["playerId"], original_player_id)
             self.assertTrue(retry_event["recovered"])
+            self.assertEqual(retry_ack["difficulty"], "fast_connect_60")
+            self.assertEqual(
+                original_game["time_banks_ms"],
+                {app_module.HUMAN: 60_000, app_module.AI: 60_000},
+            )
             self.assertEqual(len(games), 1)
             self.assertTrue(original_game["players"][original_player_id]["connected"])
             self.assertIsNotNone(original_game["players"][original_player_id]["socket_id"])
@@ -1109,7 +1340,7 @@ class SocketGameTests(unittest.TestCase):
             second_client.disconnect()
 
     def test_public_multiplayer_room_can_be_listed_and_joined_once(self):
-        self.client.emit("create_multiplayer_game")
+        self.client.emit("create_multiplayer_game", {"difficulty": "fast_connect_60"})
         created = find_event(self.client, "multiplayer_game_created")
         self.client.emit(
             "set_room_public",
@@ -1128,6 +1359,7 @@ class SocketGameTests(unittest.TestCase):
             second_client.emit("list_public_games")
             public_games = find_event(second_client, "public_games")
             self.assertEqual(public_games["games"][0]["gameId"], created["gameId"])
+            self.assertEqual(public_games["games"][0]["difficulty"], "fast_connect_60")
 
             second_client.emit(
                 "join_multiplayer_game",

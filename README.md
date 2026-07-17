@@ -9,6 +9,7 @@ React frontend with a Flask-SocketIO backend for Human vs. Minimax AI Connect 4 
 - [Project Structure](docs/PROJECT_STRUCTURE.md)
 - [Supabase Schema](docs/supabase_schema.sql)
 - [Move-analysis Migration](docs/migrations/20260714_move_analysis_worst_move_and_ratings.sql)
+- [Fast Connect Migration](docs/migrations/20260716_fast_connect_modes.sql)
 
 ## Backend
 
@@ -151,6 +152,15 @@ After a two-player match ends, both players can vote `Play again`. The next game
 
 Every new AI game randomizes the starting side. Multiplayer rooms randomize the starter when the second player joins; that starter is assigned yellow/player 1. Status is green only for `Your turn`; opponent and AI waiting states are red.
 
+Every human player has a server-authoritative time bank. Standard PvP gives
+each player 90 seconds, while Fast Connect offers 60- and 30-second variants.
+Both PvP banks begin when both players are ready, only the active player's bank
+runs, and a timeout awards the game to the opponent. Against the AI, only the
+human has a 90-second clock and it pauses while the AI is queued or thinking.
+If a multiplayer board fills without four-in-a-row, the player with more time
+remaining wins the timer tiebreak; exactly equal banks remain a draw. Refreshes
+and disconnects do not pause or reset a running clock.
+
 ## Limitations
 
 - Database persistence is backend-only and optional. If Supabase env vars are missing, gameplay still works without saving.
@@ -158,6 +168,11 @@ Every new AI game randomizes the starting side. Multiplayer rooms randomize the 
 - Waiting-room creation can be recovered after a backend restart when the PvP
   request migration is installed. Active matches still require the original
   backend process.
+- Existing Supabase projects must apply
+  `docs/migrations/20260716_fast_connect_modes.sql` before Fast Connect rooms
+  can use durable creation and recovery.
+- Active game clocks are stored with the in-memory match and do not survive a
+  backend process restart.
 - Free backend hosting limited CPU resources to work with.
 - In-memory Socket.IO rooms are not safe for horizontal scaling without a message queue or shared store.
 - Move-analysis jobs are coordinated in memory and currently assume one backend process.

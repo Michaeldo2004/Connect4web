@@ -492,6 +492,11 @@ a {
   gap: 8px;
 }
 
+.mode-side-player {
+  justify-items: stretch;
+  gap: 8px;
+}
+
 .mode-side-label {
   color: var(--accent-text);
   font-size: 0.95rem;
@@ -522,6 +527,12 @@ a {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
   width: min(100%, 360px);
+}
+
+.multiplayer-preset-tabs {
+  display: grid;
+  gap: 8px;
+  width: 100%;
 }
 
 .difficulty-tab,
@@ -782,6 +793,20 @@ a {
   overflow-wrap: anywhere;
 }
 
+.public-game-row span {
+  display: grid;
+  gap: 2px;
+}
+
+.public-game-row span strong {
+  color: var(--ink);
+}
+
+.public-game-row span small {
+  color: var(--accent-text);
+  font-weight: 800;
+}
+
 .play-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
@@ -976,6 +1001,26 @@ a {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.player-chip > div {
+  min-width: 0;
+}
+
+.player-clock {
+  flex: 0 0 auto;
+  min-width: 3.4ch;
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 1.2rem;
+  font-variant-numeric: tabular-nums;
+  font-weight: 900;
+  letter-spacing: -0.03em;
+  text-align: right;
+}
+
+.player-clock.active {
+  color: var(--ink);
 }
 
 .match-turn-card {
@@ -1973,6 +2018,10 @@ input::placeholder {
     grid-template-columns: 1fr;
     gap: 8px;
     width: 100%;
+  }
+
+  .multiplayer-preset-tabs {
+    gap: 8px;
   }
 
   .difficulty-tab,

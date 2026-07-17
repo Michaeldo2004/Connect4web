@@ -305,6 +305,7 @@ def normalize_multiplayer_room_request(row):
     if isinstance(game_data, list):
         game_data = game_data[0] if game_data else {}
     game_mode = row.get("game_mode") or game_data.get("mode")
+    game_difficulty = row.get("game_difficulty") or game_data.get("difficulty") or "multiplayer"
     game_status = row.get("game_status") or game_data.get("status")
 
     game_players = game_data.get("game_players") or []
@@ -326,6 +327,7 @@ def normalize_multiplayer_room_request(row):
         "expires_at": row.get("expires_at"),
         "resolved_at": row.get("resolved_at"),
         "game_mode": game_mode,
+        "game_difficulty": game_difficulty,
         "game_status": game_status,
         "player_count": int(player_count or 0),
         "owner_profile_id": owner_profile_id,
@@ -333,7 +335,14 @@ def normalize_multiplayer_room_request(row):
     }
 
 
-def claim_multiplayer_room_request(profile_id, request_id, game_id, player_id, owner_name):
+def claim_multiplayer_room_request(
+    profile_id,
+    request_id,
+    game_id,
+    player_id,
+    owner_name,
+    difficulty="multiplayer",
+):
     profile_id = db_game_id(profile_id)
     game_id = db_game_id(game_id)
     player_id = db_game_id(player_id)
@@ -353,6 +362,7 @@ def claim_multiplayer_room_request(profile_id, request_id, game_id, player_id, o
                 "p_game_id": game_id,
                 "p_player_id": player_id,
                 "p_owner_name": owner_name or "Player",
+                "p_difficulty": difficulty,
             },
         ).execute()
     except Exception as error:
@@ -386,7 +396,7 @@ def fetch_multiplayer_room_request(profile_id, request_id):
             client.table("multiplayer_room_requests")
             .select(
                 "profile_id,request_id,game_id,player_id,owner_name,state,expires_at,resolved_at,"
-                "games!inner(mode,status,game_players(player_number,profile_id,is_ai))"
+                "games!inner(mode,difficulty,status,game_players(player_number,profile_id,is_ai))"
             )
             .eq("profile_id", profile_id)
             .eq("request_id", request_id)

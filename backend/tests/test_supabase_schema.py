@@ -9,6 +9,9 @@ MIGRATION_PATH = (
 MULTIPLAYER_RECOVERY_MIGRATION_PATH = (
     Path(__file__).resolve().parents[2] / "docs" / "migrations" / "20260715_multiplayer_room_requests.sql"
 )
+FAST_CONNECT_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[2] / "docs" / "migrations" / "20260716_fast_connect_modes.sql"
+)
 
 
 class SupabaseSchemaTests(unittest.TestCase):
@@ -17,6 +20,7 @@ class SupabaseSchemaTests(unittest.TestCase):
         cls.schema = SCHEMA_PATH.read_text(encoding="utf-8")
         cls.migration = MIGRATION_PATH.read_text(encoding="utf-8")
         cls.multiplayer_recovery_migration = MULTIPLAYER_RECOVERY_MIGRATION_PATH.read_text(encoding="utf-8")
+        cls.fast_connect_migration = FAST_CONNECT_MIGRATION_PATH.read_text(encoding="utf-8")
 
     def test_schema_file_exists(self):
         self.assertTrue(SCHEMA_PATH.exists())
@@ -84,6 +88,23 @@ class SupabaseSchemaTests(unittest.TestCase):
             self.schema,
             r"analysis_status in \('not_requested', 'processing', 'complete', 'failed'\)",
         )
+
+    def test_fast_connect_migration_is_rerunnable_and_updates_durable_creation(self):
+        migration = self.fast_connect_migration
+        self.assertTrue(FAST_CONNECT_MIGRATION_PATH.exists())
+        self.assertIn("begin;", migration)
+        self.assertIn("commit;", migration)
+        self.assertIn("drop constraint if exists games_difficulty_check", migration)
+        self.assertIn("'fast_connect_60', 'fast_connect_30'", migration)
+        self.assertIn(
+            "drop function if exists public.claim_multiplayer_room_request(uuid, text, uuid, uuid, text)",
+            migration,
+        )
+        self.assertIn("p_difficulty text", migration)
+        self.assertIn("game_difficulty text", migration)
+        self.assertIn("values (p_game_id, 'multiplayer', p_difficulty, 'waiting')", migration)
+        self.assertIn("game_record.difficulty", migration)
+        self.assertIn("to service_role", migration)
 
     def test_username_allows_letters_numbers_and_underscores(self):
         self.assertIn("constraint profiles_username_length check (char_length(username) between 3 and 32)", self.schema)

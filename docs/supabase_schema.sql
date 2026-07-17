@@ -28,7 +28,10 @@ create table public.games (
   constraint games_mode_check check (mode in ('ai', 'multiplayer')),
   constraint games_difficulty_check check (
     difficulty is null
-    or difficulty in ('very_easy', 'easy', 'medium', 'hard', 'multiplayer')
+    or difficulty in (
+      'very_easy', 'easy', 'medium', 'hard',
+      'multiplayer', 'fast_connect_60', 'fast_connect_30'
+    )
   ),
   constraint games_status_check check (
     status in (
@@ -225,12 +228,16 @@ create trigger player_stats_set_updated_at
 before update on public.player_stats
 for each row execute function public.set_updated_at();
 
-create or replace function public.claim_multiplayer_room_request(
+drop function if exists public.claim_multiplayer_room_request(uuid, text, uuid, uuid, text);
+drop function if exists public.claim_multiplayer_room_request(uuid, text, uuid, uuid, text, text);
+
+create function public.claim_multiplayer_room_request(
   p_profile_id uuid,
   p_request_id text,
   p_game_id uuid,
   p_player_id uuid,
-  p_owner_name text
+  p_owner_name text,
+  p_difficulty text
 )
 returns table (
   profile_id uuid,
@@ -242,6 +249,7 @@ returns table (
   expires_at timestamptz,
   resolved_at timestamptz,
   game_mode text,
+  game_difficulty text,
   game_status text,
   player_count bigint,
   owner_profile_id uuid,
@@ -261,7 +269,8 @@ begin
      or p_game_id is null
      or p_player_id is null
      or p_owner_name is null
-     or char_length(p_owner_name) not between 1 and 32 then
+     or char_length(p_owner_name) not between 1 and 32
+     or p_difficulty not in ('multiplayer', 'fast_connect_60', 'fast_connect_30') then
     raise exception 'invalid multiplayer room request';
   end if;
 
@@ -293,7 +302,7 @@ begin
 
   if not found then
     insert into public.games (id, mode, difficulty, status)
-    values (p_game_id, 'multiplayer', 'multiplayer', 'waiting');
+    values (p_game_id, 'multiplayer', p_difficulty, 'waiting');
 
     insert into public.game_players (
       game_id,
@@ -339,6 +348,7 @@ begin
     room_request.expires_at,
     room_request.resolved_at,
     game_record.mode,
+    game_record.difficulty,
     game_record.status,
     (select count(*) from public.game_players as participant where participant.game_id = room_request.game_id),
     (select participant.profile_id from public.game_players as participant
@@ -388,9 +398,9 @@ begin
 end;
 $$;
 
-revoke all on function public.claim_multiplayer_room_request(uuid, text, uuid, uuid, text)
+revoke all on function public.claim_multiplayer_room_request(uuid, text, uuid, uuid, text, text)
 from public, anon, authenticated;
-grant execute on function public.claim_multiplayer_room_request(uuid, text, uuid, uuid, text)
+grant execute on function public.claim_multiplayer_room_request(uuid, text, uuid, uuid, text, text)
 to service_role;
 revoke all on function public.resolve_multiplayer_room_request(uuid, text)
 from public, anon, authenticated;

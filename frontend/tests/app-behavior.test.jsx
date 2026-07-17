@@ -10,6 +10,7 @@ class FakeSocket {
   constructor() {
     this.connected = true;
     this.handlers = new Map();
+    this.callbacks = new Map();
     this.emitted = [];
     latestSocket = this;
   }
@@ -19,21 +20,30 @@ class FakeSocket {
     return this;
   }
 
-  emit(event, payload) {
+  emit(event, payload, callback) {
     this.emitted.push([event, payload]);
+    if (callback) {
+      this.callbacks.set(event, callback);
+    }
     return this;
   }
 
   timeout() {
     return {
-      emit: (event, payload) => {
-        this.emit(event, payload);
+      emit: (event, payload, callback) => {
+        this.emit(event, payload, callback);
       },
     };
   }
 
   trigger(event, payload) {
     this.handlers.get(event)?.(payload);
+  }
+
+  respond(event, payload) {
+    const callback = this.callbacks.get(event);
+    this.callbacks.delete(event);
+    callback?.(null, payload);
   }
 
   disconnect() {
@@ -188,6 +198,7 @@ describe("application behavior", () => {
           {
             id: "review-2",
             mode: "multiplayer",
+            difficulty: "fast_connect_30",
             status: "player2_win",
             result: "Loss",
             playerNumber: 1,
@@ -205,6 +216,7 @@ describe("application behavior", () => {
     expect(within(stats).getByText("Win rate").nextElementSibling).toHaveTextContent("50%");
     expect(await screen.findByRole("region", { name: "Completed games" })).toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: "Review Game" })).toHaveLength(2);
+    expect(screen.getByText("Fast Connect · 30s")).toBeInTheDocument();
     expect(fetch).toHaveBeenCalledWith(
       "http://localhost:5000/api/profile/games",
       expect.objectContaining({ headers: { Authorization: "Bearer token" } }),
@@ -231,6 +243,7 @@ describe("application behavior", () => {
       {
         id: "review-1",
         mode: "multiplayer",
+        difficulty: "fast_connect_60",
         status: "player1_win",
         result: "Win",
         playerNumber: 1,
@@ -268,6 +281,7 @@ describe("application behavior", () => {
 
     renderApp("/game/review-1/review");
     expect(await screen.findByRole("grid", { name: "Board after move 1" })).toBeInTheDocument();
+    expect(screen.getByText("Fast Connect · 60s")).toBeInTheDocument();
     expect(latestSocket).toBeUndefined();
     const aliceSummary = screen.getByRole("region", { name: "Alice move evaluation summary" });
     const bobSummary = screen.getByRole("region", { name: "Bob move evaluation summary" });
@@ -288,7 +302,7 @@ describe("application behavior", () => {
     session = authenticatedSession();
     const user = userEvent.setup();
     renderApp();
-    await user.click(await screen.findByRole("button", { name: /Vs Player/ }));
+    await user.click(await screen.findByRole("tab", { name: /Standard Connect/ }));
     await user.click(screen.getByRole("button", { name: "Create game" }));
     const pending = JSON.parse(window.sessionStorage.getItem("connect4_pending_game"));
     expect(pending).toMatchObject({ mode: "multiplayer", profileId: "profile-1" });
@@ -305,13 +319,56 @@ describe("application behavior", () => {
     ).toBe(true);
   });
 
+  test("offers all PvP presets and preserves the selected Fast Connect variant", async () => {
+    session = authenticatedSession();
+    const user = userEvent.setup();
+    renderApp();
+
+    const playerModes = await screen.findByRole("tablist", { name: "Player game mode" });
+    const playerModeTabs = within(playerModes).getAllByRole("tab");
+    expect(playerModeTabs).toHaveLength(3);
+    expect(within(playerModeTabs[0]).getByText("90 seconds per player")).toBeInTheDocument();
+    expect(within(playerModeTabs[1]).getByText("60 seconds per player")).toBeInTheDocument();
+    expect(within(playerModeTabs[2]).getByText("30 seconds per player")).toBeInTheDocument();
+
+    await user.click(playerModeTabs[2]);
+    expect(screen.getByText("Fast Connect · 30s")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Create game" }));
+
+    const pendingGame = JSON.parse(window.sessionStorage.getItem("connect4_pending_game"));
+    expect(pendingGame).toMatchObject({
+      mode: "multiplayer",
+      difficulty: "fast_connect_30",
+    });
+    act(() =>
+      latestSocket.respond("reconcile_multiplayer_creation", {
+        ok: true,
+        status: "not_found",
+        requestId: pendingGame.requestId,
+      }),
+    );
+    expect(
+      latestSocket.emitted.some(
+        ([event, payload]) =>
+          event === "create_multiplayer_game" &&
+          payload.requestId === pendingGame.requestId &&
+          payload.difficulty === "fast_connect_30",
+      ),
+    ).toBe(true);
+  });
+
   test("shows public rooms and joins the selected room with an authenticated socket payload", async () => {
     session = authenticatedSession();
     const user = userEvent.setup();
     renderApp("/join");
     await waitFor(() => expect(latestSocket.emitted.some(([event]) => event === "list_public_games")).toBe(true));
-    act(() => latestSocket.trigger("public_games", { games: [{ gameId: "public-1", ownerName: "Alice" }] }));
+    act(() =>
+      latestSocket.trigger("public_games", {
+        games: [{ gameId: "public-1", ownerName: "Alice", difficulty: "fast_connect_60" }],
+      }),
+    );
     expect(await screen.findByText("Alice's room")).toBeInTheDocument();
+    expect(screen.getByText("Fast Connect · 60s")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Join room" }));
     expect(
       latestSocket.emitted.some(
@@ -363,6 +420,105 @@ describe("application behavior", () => {
     const matchDetails = document.querySelector(".match-details");
     expect(within(matchDetails).getAllByText("new-room")).toHaveLength(2);
     expect(screen.getByRole("gridcell", { name: "Row 6, column 4: Red piece" })).toBeInTheDocument();
+  });
+
+  test("renders both multiplayer clocks and counts down only the active player", async () => {
+    session = authenticatedSession();
+    renderApp();
+    await screen.findByRole("button", { name: "Create game" });
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-16T20:00:00Z"));
+
+    try {
+      act(() =>
+        latestSocket.trigger(
+          "multiplayer_game_joined",
+          createdGame({
+            mode: "multiplayer",
+            playersConnected: 2,
+            playerNames: { 1: "Alice", 2: "Bob" },
+            timeBanksMs: { 1: 90_000, 2: 90_000 },
+            activeTimerPlayer: 1,
+            timerRunning: true,
+            serverTimeMs: Date.now(),
+          }),
+        ),
+      );
+
+      expect(screen.getByLabelText("Player 1 time remaining 1:30")).toHaveClass("active");
+      expect(screen.getByLabelText("Player 2 time remaining 1:30")).not.toHaveClass("active");
+      act(() => vi.advanceTimersByTime(1_000));
+      expect(screen.getByLabelText("Player 1 time remaining 1:29")).toBeInTheDocument();
+      expect(screen.getByLabelText("Player 2 time remaining 1:30")).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("renders the Fast Connect preset and its authoritative 60-second clocks", async () => {
+    session = authenticatedSession();
+    renderApp();
+    await screen.findByRole("button", { name: "Create game" });
+
+    act(() =>
+      latestSocket.trigger(
+        "multiplayer_game_joined",
+        createdGame({
+          mode: "multiplayer",
+          difficulty: "fast_connect_60",
+          playersConnected: 2,
+          playerNames: { 1: "Alice", 2: "Bob" },
+          timeBanksMs: { 1: 60_000, 2: 60_000 },
+          activeTimerPlayer: 1,
+          timerRunning: true,
+          serverTimeMs: Date.now(),
+        }),
+      ),
+    );
+
+    expect(screen.getByText("Fast Connect · 60s")).toBeInTheDocument();
+    expect(screen.getByLabelText("Player 1 time remaining 1:00")).toBeInTheDocument();
+    expect(screen.getByLabelText("Player 2 time remaining 1:00")).toBeInTheDocument();
+  });
+
+  test("shows only the human clock against AI and preserves a timer result message", async () => {
+    session = authenticatedSession();
+    renderApp();
+    await screen.findByRole("button", { name: "Create game" });
+    act(() =>
+      latestSocket.trigger(
+        "game_created",
+        createdGame({
+          playerNumber: 2,
+          aiNumber: 1,
+          currentPlayer: 2,
+          timeBanksMs: { 2: 90_000 },
+          activeTimerPlayer: 2,
+          timerRunning: true,
+          serverTimeMs: Date.now(),
+        }),
+      ),
+    );
+
+    expect(screen.queryByLabelText(/Player 1 time remaining/)).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Player 2 time remaining 1:30")).toBeInTheDocument();
+
+    act(() =>
+      latestSocket.trigger("board_updated", {
+        ...createdGame({
+          mode: "multiplayer",
+          status: "player1_win",
+          message: "Alice won by timer",
+          playersConnected: 2,
+          playerNames: { 1: "Alice", 2: "Bob" },
+          timeBanksMs: { 1: 12_000, 2: 0 },
+          activeTimerPlayer: null,
+          timerRunning: false,
+          endReason: "timeout",
+        }),
+      }),
+    );
+    expect(screen.getByRole("heading", { name: "Alice won by timer" })).toBeInTheDocument();
   });
 
   test("sanitizes signup inputs and supports password visibility", async () => {
@@ -562,7 +718,7 @@ describe("application behavior", () => {
     session = authenticatedSession();
     const user = userEvent.setup();
     renderApp();
-    await user.click(await screen.findByRole("button", { name: /Vs Player/ }));
+    await user.click(await screen.findByRole("tab", { name: /Standard Connect/ }));
     await user.click(screen.getByRole("button", { name: "Create game" }));
     const pending = JSON.parse(window.sessionStorage.getItem("connect4_pending_game"));
     act(() =>

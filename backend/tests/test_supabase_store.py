@@ -259,6 +259,7 @@ class SupabaseStoreTests(unittest.TestCase):
             "expires_at": "2099-01-01T00:00:00+00:00",
             "resolved_at": None,
             "game_mode": "multiplayer",
+            "game_difficulty": "fast_connect_60",
             "game_status": "waiting",
             "player_count": 1,
             "owner_profile_id": profile_id,
@@ -273,6 +274,7 @@ class SupabaseStoreTests(unittest.TestCase):
                 game_id,
                 player_id,
                 "Player One",
+                "fast_connect_60",
             )
 
         self.assertEqual(result, {"result": "ok", "room": row})
@@ -287,6 +289,7 @@ class SupabaseStoreTests(unittest.TestCase):
                         "p_game_id": str(uuid.UUID(game_id)),
                         "p_player_id": str(uuid.UUID(player_id)),
                         "p_owner_name": "Player One",
+                        "p_difficulty": "fast_connect_60",
                     },
                 )
             ],
@@ -355,6 +358,7 @@ class SupabaseStoreTests(unittest.TestCase):
                 "resolved_at": None,
                 "games": {
                     "mode": "multiplayer",
+                    "difficulty": "fast_connect_30",
                     "status": "waiting",
                     "game_players": [{"player_number": 1, "profile_id": profile_id, "is_ai": False}],
                 },
@@ -370,6 +374,7 @@ class SupabaseStoreTests(unittest.TestCase):
         self.assertEqual(result["room"]["state"], "active")
         self.assertEqual(result["room"]["player_count"], 1)
         self.assertEqual(result["room"]["owner_profile_id"], profile_id)
+        self.assertEqual(result["room"]["game_difficulty"], "fast_connect_30")
 
     def test_resolve_multiplayer_room_request_calls_server_only_rpc(self):
         game_id = str(uuid.uuid4())

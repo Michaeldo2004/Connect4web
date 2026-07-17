@@ -64,6 +64,11 @@ const DIFFICULTIES = [
   { key: "medium", label: "Medium", hint: "A fair challenge", depth: 5, timeLimit: "3s" },
   { key: "hard", label: "Hard", hint: "Plan every move", depth: 7, timeLimit: "4s" },
 ];
+const MULTIPLAYER_PRESETS = [
+  { key: "multiplayer", label: "Standard Connect", hint: "90 seconds per player", badge: "90s" },
+  { key: "fast_connect_60", label: "Fast Connect", hint: "60 seconds per player", badge: "60s" },
+  { key: "fast_connect_30", label: "Fast Connect", hint: "30 seconds per player", badge: "30s" },
+];
 const USERNAME_MAX_LENGTH = 32;
 const EMAIL_MAX_LENGTH = 254;
 const PASSWORD_MAX_LENGTH = 128;
@@ -523,7 +528,19 @@ function takePendingMultiplayerJoin() {
 }
 
 function formatDifficulty(difficulty) {
-  return difficulty.replace("_", " ");
+  return String(difficulty || "").replaceAll("_", " ");
+}
+
+function multiplayerPreset(difficulty) {
+  return (
+    MULTIPLAYER_PRESETS.find((preset) => preset.key === difficulty) ||
+    MULTIPLAYER_PRESETS[0]
+  );
+}
+
+function formatMultiplayerMode(difficulty) {
+  const preset = multiplayerPreset(difficulty);
+  return `${preset.label} · ${preset.badge}`;
 }
 
 function formatDateTime(value) {
@@ -580,6 +597,13 @@ function formatRoomCode(roomId) {
   return roomId.length > 16 ? `${roomId.slice(0, 8)}…${roomId.slice(-4)}` : roomId;
 }
 
+function formatGameClock(remainingMs) {
+  const totalSeconds = Math.max(0, Math.ceil((Number(remainingMs) || 0) / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
 function getPieceLabel(piece) {
   if (piece === PLAYER) {
     return "Yellow piece";
@@ -632,6 +656,7 @@ function App({ authClient = supabaseClient }) {
   const [busy, setBusy] = useState(false);
   const [gameStarted, setGameStarted] = useState(false);
   const [selectedDifficulty, setSelectedDifficulty] = useState(DEFAULT_DIFFICULTY);
+  const [selectedMultiplayerDifficulty, setSelectedMultiplayerDifficulty] = useState("multiplayer");
   const [animatedPieces, setAnimatedPieces] = useState([]);
   const [animationRun, setAnimationRun] = useState(0);
   const [playerMoves, setPlayerMoves] = useState([]);
@@ -653,6 +678,15 @@ function App({ authClient = supabaseClient }) {
   const [joinGameId, setJoinGameId] = useState("");
   const [disconnectDeadline, setDisconnectDeadline] = useState(null);
   const [disconnectSecondsLeft, setDisconnectSecondsLeft] = useState(null);
+  const [gameTimer, setGameTimer] = useState({
+    timeBanksMs: {},
+    activeTimerPlayer: null,
+    timerRunning: false,
+    receivedAtMs: Date.now(),
+    serverTimeMs: null,
+  });
+  const [gameTimerNowMs, setGameTimerNowMs] = useState(() => Date.now());
+  const [endReason, setEndReason] = useState(null);
   const [playAgainAccepted, setPlayAgainAccepted] = useState(0);
   const [playAgainRequested, setPlayAgainRequested] = useState(false);
   const [otherPlayerLeftMessage, setOtherPlayerLeftMessage] = useState("");
@@ -732,6 +766,24 @@ function App({ authClient = supabaseClient }) {
     }, 3500);
   }, []);
 
+  const syncGameTimer = useCallback((data) => {
+    if (!data?.timeBanksMs) {
+      return;
+    }
+    const receivedAtMs = Date.now();
+    setGameTimer({
+      timeBanksMs: Object.fromEntries(
+        Object.entries(data.timeBanksMs).map(([piece, remainingMs]) => [piece, Math.max(0, Number(remainingMs) || 0)]),
+      ),
+      activeTimerPlayer: data.activeTimerPlayer ?? null,
+      timerRunning: Boolean(data.timerRunning),
+      receivedAtMs,
+      serverTimeMs: data.serverTimeMs ?? null,
+    });
+    setGameTimerNowMs(receivedAtMs);
+    setEndReason(data.endReason || null);
+  }, []);
+
   useEffect(
     () => () => {
       if (toastTimerRef.current) {
@@ -745,6 +797,15 @@ function App({ authClient = supabaseClient }) {
   const gameOver = useMemo(() => {
     return ["human_win", "ai_win", "player1_win", "player2_win", "draw"].includes(status);
   }, [status]);
+  const displayedTimeBanksMs = useMemo(() => {
+    const banks = { ...gameTimer.timeBanksMs };
+    const activeKey = String(gameTimer.activeTimerPlayer ?? "");
+    if (gameTimer.timerRunning && activeKey in banks) {
+      const elapsedMs = Math.max(0, gameTimerNowMs - gameTimer.receivedAtMs);
+      banks[activeKey] = Math.max(0, banks[activeKey] - elapsedMs);
+    }
+    return banks;
+  }, [gameTimer, gameTimerNowMs]);
   const profileStats = useMemo(() => {
     const stats = profileGames.reduce(
       (currentStats, game) => {
@@ -959,6 +1020,15 @@ function App({ authClient = supabaseClient }) {
     setCurrentPlayer(PLAYER);
     setDisconnectDeadline(null);
     setDisconnectSecondsLeft(null);
+    setGameTimer({
+      timeBanksMs: {},
+      activeTimerPlayer: null,
+      timerRunning: false,
+      receivedAtMs: Date.now(),
+      serverTimeMs: null,
+    });
+    setGameTimerNowMs(Date.now());
+    setEndReason(null);
     setPlayAgainAccepted(0);
     setPlayAgainRequested(false);
     setOtherPlayerLeftMessage("");
@@ -967,6 +1037,7 @@ function App({ authClient = supabaseClient }) {
   }, []);
 
   const applyServerBoard = useCallback(async (data) => {
+    syncGameTimer(data);
     const pendingMove = pendingMoveRef.current;
     // The server acknowledges the optimistic human move before the AI search
     // finishes. Keep that acknowledgement from racing the final AI result and
@@ -1035,7 +1106,7 @@ function App({ authClient = supabaseClient }) {
     if (opponentColumn !== null) {
       setAiMoves((currentMoves) => [opponentColumn, ...currentMoves]);
     }
-  }, []);
+  }, [syncGameTimer]);
 
   const authPayload = useCallback(
     (payload = {}) => {
@@ -1445,6 +1516,7 @@ function App({ authClient = supabaseClient }) {
     }
 
     function handleGameCreated(data) {
+      syncGameTimer(data);
       clearAiWaitingSession();
       setAiWaitingQueueId("");
       setAiWaitingPosition(0);
@@ -1481,6 +1553,7 @@ function App({ authClient = supabaseClient }) {
     }
 
     function handleGameJoined(data) {
+      syncGameTimer(data);
       const storedSession = loadSession();
       const joinedPlayerId = data.playerId || storedSession?.playerId || null;
       if (data.mode !== GAME_MODE_MULTIPLAYER && joinedPlayerId) {
@@ -1502,7 +1575,7 @@ function App({ authClient = supabaseClient }) {
       setAnimatedPieces([]);
       setWinningPieces(findWinningPieces(data.board));
       setBoard(data.board);
-      setStatus(data.status);
+      setStatus(data.gameStatus || data.status);
       setMessage(data.message);
       setSelectedDifficulty(data.difficulty || DEFAULT_DIFFICULTY);
       setPlayerMoves([]);
@@ -1513,6 +1586,7 @@ function App({ authClient = supabaseClient }) {
     }
 
     function applyMultiplayerGameStarted(data) {
+      syncGameTimer(data);
       clearSession();
       saveMultiplayerSession(data.gameId, data.playerId);
       setGameId(data.gameId);
@@ -1532,6 +1606,7 @@ function App({ authClient = supabaseClient }) {
       setBoard(data.board);
       setStatus(data.status);
       setMessage(data.message);
+      setSelectedDifficulty(data.difficulty || "multiplayer");
       setPlayerMoves([]);
       setAiMoves([]);
       setGameStarted(true);
@@ -1681,7 +1756,7 @@ function App({ authClient = supabaseClient }) {
 
       const persistedGame = savePendingGame(
         GAME_MODE_MULTIPLAYER,
-        null,
+        multiplayerPreset(pendingGame.difficulty).key,
         pendingGame.ownerName || "Account",
         requestId,
         pendingGame.profileId || authSession?.user?.id || "",
@@ -1696,7 +1771,11 @@ function App({ authClient = supabaseClient }) {
         .timeout(MULTIPLAYER_CREATE_TIMEOUT_MS)
         .emit(
           "create_multiplayer_game",
-          authPayload({ ownerName: persistedGame.ownerName, requestId }),
+          authPayload({
+            ownerName: persistedGame.ownerName,
+            requestId,
+            difficulty: persistedGame.difficulty,
+          }),
           (timeoutError, response) => {
             if (multiplayerCreateInFlightRequestRef.current === requestId) {
               multiplayerCreateInFlightRequestRef.current = "";
@@ -1792,7 +1871,7 @@ function App({ authClient = supabaseClient }) {
 
       const persistedGame = savePendingGame(
         GAME_MODE_MULTIPLAYER,
-        null,
+        multiplayerPreset(pendingGame.difficulty).key,
         pendingGame.ownerName || "Account",
         requestId,
         pendingGame.profileId || authSession?.user?.id || "",
@@ -1927,6 +2006,7 @@ function App({ authClient = supabaseClient }) {
     }
 
     function handleInvalidMove(data) {
+      syncGameTimer(data);
       const hadPendingMove = Boolean(pendingMoveRef.current);
       pendingMoveRef.current = null;
       setAnimatedPieces([]);
@@ -2018,6 +2098,7 @@ function App({ authClient = supabaseClient }) {
     resetMultiplayerCreationTracking,
     showToast,
     socketRouteActive,
+    syncGameTimer,
   ]);
 
   useEffect(() => {
@@ -2078,7 +2159,17 @@ function App({ authClient = supabaseClient }) {
       existingPendingGame?.mode === GAME_MODE_MULTIPLAYER && existingPendingGame.requestId
         ? existingPendingGame.requestId
         : createMultiplayerRequestId();
-    const pendingGame = savePendingGame(GAME_MODE_MULTIPLAYER, null, accountName, requestId, profileId);
+    const difficulty =
+      existingPendingGame?.mode === GAME_MODE_MULTIPLAYER
+        ? multiplayerPreset(existingPendingGame.difficulty).key
+        : selectedMultiplayerDifficulty;
+    const pendingGame = savePendingGame(
+      GAME_MODE_MULTIPLAYER,
+      difficulty,
+      accountName,
+      requestId,
+      profileId,
+    );
 
     if (!socketClient?.connected || !reconcilePendingMultiplayerCreateRef.current) {
       setMessage("Connecting to create multiplayer room...");
@@ -2252,7 +2343,7 @@ function App({ authClient = supabaseClient }) {
     setSelectedSetupMode(GAME_MODE_AI);
   }
 
-  function chooseMultiplayerMode() {
+  function chooseMultiplayerMode(difficulty) {
     if (busy) {
       return;
     }
@@ -2262,6 +2353,7 @@ function App({ authClient = supabaseClient }) {
     clearPendingGame();
     resetMultiplayerCreationTracking();
     clearLocalGame();
+    setSelectedMultiplayerDifficulty(multiplayerPreset(difficulty).key);
     setSelectedSetupMode(GAME_MODE_MULTIPLAYER);
   }
 
@@ -2376,6 +2468,17 @@ function App({ authClient = supabaseClient }) {
       window.clearInterval(timerId);
     };
   }, [disconnectDeadline]);
+
+  useEffect(() => {
+    if (!gameTimer.timerRunning) {
+      return undefined;
+    }
+
+    const updateTimer = () => setGameTimerNowMs(Date.now());
+    updateTimer();
+    const timerId = window.setInterval(updateTimer, 250);
+    return () => window.clearInterval(timerId);
+  }, [gameTimer.timerRunning, gameTimer.receivedAtMs]);
 
   function returnToMainMenu() {
     clearSession();
@@ -2602,9 +2705,21 @@ function App({ authClient = supabaseClient }) {
     status === "playing" &&
     ((gameMode === GAME_MODE_AI && currentPlayer === (playerNumber || PLAYER)) ||
       (gameMode === GAME_MODE_MULTIPLAYER && playerNumber === currentPlayer && playersConnected === 2));
+  const showPlayerOneClock =
+    gameStarted && (gameMode === GAME_MODE_MULTIPLAYER || (gameMode === GAME_MODE_AI && playerNumber === PLAYER));
+  const showPlayerTwoClock =
+    gameStarted && (gameMode === GAME_MODE_MULTIPLAYER || (gameMode === GAME_MODE_AI && playerNumber === AI));
+  const playerOneClockActive =
+    gameTimer.timerRunning && Number(gameTimer.activeTimerPlayer) === PLAYER && !gameOver;
+  const playerTwoClockActive = gameTimer.timerRunning && Number(gameTimer.activeTimerPlayer) === AI && !gameOver;
   const showingGame = routePath === GAME_PATH;
   let displayMessage = message;
-  if (gameOver && gameMode === GAME_MODE_MULTIPLAYER && status !== "draw") {
+  if (
+    gameOver &&
+    gameMode === GAME_MODE_MULTIPLAYER &&
+    status !== "draw" &&
+    !["timeout", "time_tiebreak", "disconnect"].includes(endReason)
+  ) {
     const winnerNumber = status === "player1_win" ? 1 : status === "player2_win" ? 2 : null;
     if (winnerNumber === playerNumber) {
       displayMessage = "You Won!";
@@ -2837,16 +2952,31 @@ function App({ authClient = supabaseClient }) {
       </header>
       <div className="mode-select-layout">
         <div className="mode-side mode-side-player">
-          <button
-            type="button"
-            aria-pressed={selectedSetupMode === GAME_MODE_MULTIPLAYER}
-            className={`setup-mode-card vs-player-button${selectedSetupMode === GAME_MODE_MULTIPLAYER ? " selected" : ""}`}
-            onClick={chooseMultiplayerMode}
-            disabled={busy}
-          >
-            <span>Vs Player</span>
-            <small>Share a room and play live</small>
-          </button>
+          <span className="mode-side-label">Vs Player</span>
+          <div className="multiplayer-preset-tabs" role="tablist" aria-label="Player game mode">
+            {MULTIPLAYER_PRESETS.map((preset) => (
+              <button
+                key={preset.key}
+                type="button"
+                role="tab"
+                aria-selected={
+                  selectedSetupMode === GAME_MODE_MULTIPLAYER &&
+                  selectedMultiplayerDifficulty === preset.key
+                }
+                className={`setup-mode-card vs-player-button${
+                  selectedSetupMode === GAME_MODE_MULTIPLAYER &&
+                  selectedMultiplayerDifficulty === preset.key
+                    ? " selected"
+                    : ""
+                }`}
+                onClick={() => chooseMultiplayerMode(preset.key)}
+                disabled={busy}
+              >
+                <span>{preset.label}</span>
+                <small>{preset.hint}</small>
+              </button>
+            ))}
+          </div>
         </div>
 
         <div className="setup-create-column">
@@ -2854,7 +2984,7 @@ function App({ authClient = supabaseClient }) {
             <span>Your selection</span>
             <strong>
               {selectedSetupMode === GAME_MODE_MULTIPLAYER
-                ? "Vs Player"
+                ? formatMultiplayerMode(selectedMultiplayerDifficulty)
                 : `Vs AI · ${DIFFICULTIES.find((difficulty) => difficulty.key === selectedDifficulty)?.label || "Medium"}`}
             </strong>
           </div>
@@ -2934,7 +3064,10 @@ function App({ authClient = supabaseClient }) {
           <div className="public-games-list">
             {publicGames.map((publicGame) => (
               <div className="public-game-row" key={publicGame.gameId}>
-                <span>{publicGame.ownerName}'s room</span>
+                <span>
+                  <strong>{publicGame.ownerName}'s room</strong>
+                  <small>{formatMultiplayerMode(publicGame.difficulty)}</small>
+                </span>
                 <button
                   type="button"
                   onClick={() => joinPublicGame(publicGame.gameId)}
@@ -2999,7 +3132,7 @@ function App({ authClient = supabaseClient }) {
           <strong>
             {reviewGame
               ? reviewGame.mode === GAME_MODE_MULTIPLAYER
-                ? "Vs Player"
+                ? formatMultiplayerMode(reviewGame.difficulty)
                 : `AI - ${formatDifficulty(reviewGame.difficulty || DEFAULT_DIFFICULTY)}`
               : "-"}
           </strong>
@@ -3235,7 +3368,7 @@ function App({ authClient = supabaseClient }) {
               <div>
                 <span>
                   {game.mode === GAME_MODE_MULTIPLAYER
-                    ? "Vs Player"
+                    ? formatMultiplayerMode(game.difficulty)
                     : `AI - ${formatDifficulty(game.difficulty || DEFAULT_DIFFICULTY)}`}
                 </span>
                 <strong>{game.result}</strong>
@@ -3268,6 +3401,14 @@ function App({ authClient = supabaseClient }) {
             <small>Player 1{playerNumber === PLAYER ? " · You" : ""}</small>
             <strong>{playerOneName}</strong>
           </div>
+          {showPlayerOneClock ? (
+            <time
+              className={`player-clock${playerOneClockActive ? " active" : ""}`}
+              aria-label={`Player 1 time remaining ${formatGameClock(displayedTimeBanksMs[String(PLAYER)])}`}
+            >
+              {formatGameClock(displayedTimeBanksMs[String(PLAYER)])}
+            </time>
+          ) : null}
         </article>
         <div className={`match-turn-card ${statusClassName}`} aria-live="polite">
           <span>{gameOver ? "Match complete" : status === "waiting" ? "Waiting room" : "Current turn"}</span>
@@ -3279,6 +3420,14 @@ function App({ authClient = supabaseClient }) {
             <small>Player 2{playerNumber === AI ? " · You" : ""}</small>
             <strong>{playerTwoName}</strong>
           </div>
+          {showPlayerTwoClock ? (
+            <time
+              className={`player-clock${playerTwoClockActive ? " active" : ""}`}
+              aria-label={`Player 2 time remaining ${formatGameClock(displayedTimeBanksMs[String(AI)])}`}
+            >
+              {formatGameClock(displayedTimeBanksMs[String(AI)])}
+            </time>
+          ) : null}
         </article>
       </section>
 
@@ -3291,7 +3440,9 @@ function App({ authClient = supabaseClient }) {
           <div>
             <span>Mode</span>
             <strong>
-              {gameMode === GAME_MODE_MULTIPLAYER ? "Vs Player" : `AI · ${formatDifficulty(selectedDifficulty)}`}
+              {gameMode === GAME_MODE_MULTIPLAYER
+                ? formatMultiplayerMode(selectedDifficulty)
+                : `AI · ${formatDifficulty(selectedDifficulty)}`}
             </strong>
           </div>
           <div>
