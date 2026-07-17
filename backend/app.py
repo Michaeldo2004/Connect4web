@@ -2177,10 +2177,7 @@ def socket_create_multiplayer_game(data=None):
                         request_id,
                         persistence_result.get("code") or "persistence_unavailable",
                     )
-                elif (
-                    persistence_result.get("result") == "schema_missing"
-                    and difficulty in FAST_CONNECT_DIFFICULTIES
-                ):
+                elif persistence_result.get("result") == "schema_missing" and difficulty in FAST_CONNECT_DIFFICULTIES:
                     return multiplayer_create_rejection(
                         "Fast Connect requires the latest Supabase multiplayer migration.",
                         request_id,
@@ -2226,10 +2223,7 @@ def socket_create_multiplayer_game(data=None):
                             request_id,
                             claim_result.get("code") or "persistence_unavailable",
                         )
-                    elif (
-                        claim_result.get("result") == "schema_missing"
-                        and difficulty in FAST_CONNECT_DIFFICULTIES
-                    ):
+                    elif claim_result.get("result") == "schema_missing" and difficulty in FAST_CONNECT_DIFFICULTIES:
                         return multiplayer_create_rejection(
                             "Fast Connect requires the latest Supabase multiplayer migration.",
                             request_id,

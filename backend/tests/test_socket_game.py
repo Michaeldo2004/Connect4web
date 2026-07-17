@@ -122,9 +122,7 @@ class SocketGameTests(unittest.TestCase):
         second_player_id = uuid.uuid4().hex
         game_id = uuid.uuid4().hex
         game = app_module.create_multiplayer_game_state(first_player_id, bind_socket=False)
-        game["players"][first_player_id].update(
-            {"display_name": "First Player", "connected": True, "ready": True}
-        )
+        game["players"][first_player_id].update({"display_name": "First Player", "connected": True, "ready": True})
         game["players"][second_player_id] = {
             "piece": 2,
             "profile_id": None,

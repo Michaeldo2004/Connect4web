@@ -532,10 +532,7 @@ function formatDifficulty(difficulty) {
 }
 
 function multiplayerPreset(difficulty) {
-  return (
-    MULTIPLAYER_PRESETS.find((preset) => preset.key === difficulty) ||
-    MULTIPLAYER_PRESETS[0]
-  );
+  return MULTIPLAYER_PRESETS.find((preset) => preset.key === difficulty) || MULTIPLAYER_PRESETS[0];
 }
 
 function formatMultiplayerMode(difficulty) {
@@ -1036,77 +1033,80 @@ function App({ authClient = supabaseClient }) {
     setBusy(false);
   }, []);
 
-  const applyServerBoard = useCallback(async (data) => {
-    syncGameTimer(data);
-    const pendingMove = pendingMoveRef.current;
-    // The server acknowledges the optimistic human move before the AI search
-    // finishes. Keep that acknowledgement from racing the final AI result and
-    // overwriting the newer board after both async handlers resume.
-    if (pendingMove && data.mode !== GAME_MODE_MULTIPLAYER && data.aiThinking) {
+  const applyServerBoard = useCallback(
+    async (data) => {
+      syncGameTimer(data);
+      const pendingMove = pendingMoveRef.current;
+      // The server acknowledges the optimistic human move before the AI search
+      // finishes. Keep that acknowledgement from racing the final AI result and
+      // overwriting the newer board after both async handlers resume.
+      if (pendingMove && data.mode !== GAME_MODE_MULTIPLAYER && data.aiThinking) {
+        setStatus(data.status);
+        setMessage(data.message);
+        setCurrentPlayer(data.currentPlayer);
+        setAiQueuePosition(data.aiQueuePosition || 0);
+        setBusy(true);
+        return;
+      }
+
+      if (pendingMove && data.mode !== GAME_MODE_MULTIPLAYER) {
+        const elapsed = Date.now() - pendingMove.startedAt;
+        if (elapsed < MIN_AI_RESPONSE_MS) {
+          await wait(MIN_AI_RESPONSE_MS - elapsed);
+        }
+      }
+
+      const previousBoard = pendingMove?.board || boardRef.current;
+      const changedPieces = findChangedPieces(previousBoard, data.board);
+      const nextPlayerNumber = data.playerNumber || playerNumberRef.current || PLAYER;
+      const nextAiNumber = data.aiNumber || aiNumberRef.current || AI;
+      const playerColumn = findMoveColumn(previousBoard, data.board, nextPlayerNumber);
+      const opponentNumber = nextPlayerNumber === PLAYER ? AI : PLAYER;
+      const opponentColumn = findMoveColumn(
+        previousBoard,
+        data.board,
+        data.mode === GAME_MODE_MULTIPLAYER ? opponentNumber : nextAiNumber,
+      );
+      const winningLine = findWinningPieces(data.board);
+
+      pendingMoveRef.current = null;
+      setAnimatedPieces(changedPieces);
+      setWinningPieces(winningLine);
+      setAnimationRun((currentRun) => currentRun + 1);
+      setBoard(data.board);
       setStatus(data.status);
       setMessage(data.message);
-      setCurrentPlayer(data.currentPlayer);
-      setAiQueuePosition(data.aiQueuePosition || 0);
-      setBusy(true);
-      return;
-    }
-
-    if (pendingMove && data.mode !== GAME_MODE_MULTIPLAYER) {
-      const elapsed = Date.now() - pendingMove.startedAt;
-      if (elapsed < MIN_AI_RESPONSE_MS) {
-        await wait(MIN_AI_RESPONSE_MS - elapsed);
+      setSelectedDifficulty(data.difficulty || DEFAULT_DIFFICULTY);
+      setGameMode(data.mode || GAME_MODE_AI);
+      setCurrentPlayer(data.currentPlayer || PLAYER);
+      if (data.playerNumber) {
+        setPlayerNumber(data.playerNumber);
       }
-    }
+      if (data.aiNumber) {
+        setAiNumber(data.aiNumber);
+      }
+      setAiQueuePosition(data.aiQueuePosition || 0);
+      setPlayersConnected(data.playersConnected || 0);
+      setMultiplayerPlayerNames(data.playerNames || {});
+      setDisconnectDeadline(data.disconnectDeadline || null);
+      setPlayAgainAccepted(data.playAgainAccepted || 0);
+      setIsRoomPublic(Boolean(data.publicRoom));
+      if (data.status === "playing") {
+        setPlayAgainRequested(false);
+      }
+      setGameStarted(true);
+      setBusy(data.mode !== GAME_MODE_MULTIPLAYER && Boolean(data.aiThinking) && data.status === "playing");
 
-    const previousBoard = pendingMove?.board || boardRef.current;
-    const changedPieces = findChangedPieces(previousBoard, data.board);
-    const nextPlayerNumber = data.playerNumber || playerNumberRef.current || PLAYER;
-    const nextAiNumber = data.aiNumber || aiNumberRef.current || AI;
-    const playerColumn = findMoveColumn(previousBoard, data.board, nextPlayerNumber);
-    const opponentNumber = nextPlayerNumber === PLAYER ? AI : PLAYER;
-    const opponentColumn = findMoveColumn(
-      previousBoard,
-      data.board,
-      data.mode === GAME_MODE_MULTIPLAYER ? opponentNumber : nextAiNumber,
-    );
-    const winningLine = findWinningPieces(data.board);
+      if (data.mode === GAME_MODE_MULTIPLAYER && playerColumn !== null) {
+        setPlayerMoves((currentMoves) => [playerColumn, ...currentMoves]);
+      }
 
-    pendingMoveRef.current = null;
-    setAnimatedPieces(changedPieces);
-    setWinningPieces(winningLine);
-    setAnimationRun((currentRun) => currentRun + 1);
-    setBoard(data.board);
-    setStatus(data.status);
-    setMessage(data.message);
-    setSelectedDifficulty(data.difficulty || DEFAULT_DIFFICULTY);
-    setGameMode(data.mode || GAME_MODE_AI);
-    setCurrentPlayer(data.currentPlayer || PLAYER);
-    if (data.playerNumber) {
-      setPlayerNumber(data.playerNumber);
-    }
-    if (data.aiNumber) {
-      setAiNumber(data.aiNumber);
-    }
-    setAiQueuePosition(data.aiQueuePosition || 0);
-    setPlayersConnected(data.playersConnected || 0);
-    setMultiplayerPlayerNames(data.playerNames || {});
-    setDisconnectDeadline(data.disconnectDeadline || null);
-    setPlayAgainAccepted(data.playAgainAccepted || 0);
-    setIsRoomPublic(Boolean(data.publicRoom));
-    if (data.status === "playing") {
-      setPlayAgainRequested(false);
-    }
-    setGameStarted(true);
-    setBusy(data.mode !== GAME_MODE_MULTIPLAYER && Boolean(data.aiThinking) && data.status === "playing");
-
-    if (data.mode === GAME_MODE_MULTIPLAYER && playerColumn !== null) {
-      setPlayerMoves((currentMoves) => [playerColumn, ...currentMoves]);
-    }
-
-    if (opponentColumn !== null) {
-      setAiMoves((currentMoves) => [opponentColumn, ...currentMoves]);
-    }
-  }, [syncGameTimer]);
+      if (opponentColumn !== null) {
+        setAiMoves((currentMoves) => [opponentColumn, ...currentMoves]);
+      }
+    },
+    [syncGameTimer],
+  );
 
   const authPayload = useCallback(
     (payload = {}) => {
@@ -1767,52 +1767,50 @@ function App({ authClient = supabaseClient }) {
       setMessage("Creating multiplayer room...");
       setBusy(true);
 
-      nextSocket
-        .timeout(MULTIPLAYER_CREATE_TIMEOUT_MS)
-        .emit(
-          "create_multiplayer_game",
-          authPayload({
-            ownerName: persistedGame.ownerName,
-            requestId,
-            difficulty: persistedGame.difficulty,
-          }),
-          (timeoutError, response) => {
-            if (multiplayerCreateInFlightRequestRef.current === requestId) {
-              multiplayerCreateInFlightRequestRef.current = "";
-            }
+      nextSocket.timeout(MULTIPLAYER_CREATE_TIMEOUT_MS).emit(
+        "create_multiplayer_game",
+        authPayload({
+          ownerName: persistedGame.ownerName,
+          requestId,
+          difficulty: persistedGame.difficulty,
+        }),
+        (timeoutError, response) => {
+          if (multiplayerCreateInFlightRequestRef.current === requestId) {
+            multiplayerCreateInFlightRequestRef.current = "";
+          }
 
-            const currentPendingGame = loadCurrentPendingGame();
+          const currentPendingGame = loadCurrentPendingGame();
+          if (
+            !currentPendingGame ||
+            currentPendingGame.mode !== GAME_MODE_MULTIPLAYER ||
+            currentPendingGame.requestId !== requestId
+          ) {
+            return;
+          }
+
+          if (timeoutError) {
             if (
-              !currentPendingGame ||
-              currentPendingGame.mode !== GAME_MODE_MULTIPLAYER ||
-              currentPendingGame.requestId !== requestId
+              multiplayerReconcileInFlightRequestRef.current === requestId ||
+              multiplayerJoinInFlightRef.current?.requestId === requestId
             ) {
               return;
             }
+            releasePendingMultiplayerCreation("Room creation timed out. Try Create game again.");
+            return;
+          }
 
-            if (timeoutError) {
-              if (
-                multiplayerReconcileInFlightRequestRef.current === requestId ||
-                multiplayerJoinInFlightRef.current?.requestId === requestId
-              ) {
-                return;
-              }
-              releasePendingMultiplayerCreation("Room creation timed out. Try Create game again.");
-              return;
-            }
+          if (response?.ok === false) {
+            handleCreateRejected({
+              ...response,
+              requestId: response.requestId || requestId,
+              message: response.message || "Could not create game",
+            });
+            return;
+          }
 
-            if (response?.ok === false) {
-              handleCreateRejected({
-                ...response,
-                requestId: response.requestId || requestId,
-                message: response.message || "Could not create game",
-              });
-              return;
-            }
-
-            reconcilePendingMultiplayerCreate(currentPendingGame);
-          },
-        );
+          reconcilePendingMultiplayerCreate(currentPendingGame);
+        },
+      );
       return true;
     }
 
@@ -2163,13 +2161,7 @@ function App({ authClient = supabaseClient }) {
       existingPendingGame?.mode === GAME_MODE_MULTIPLAYER
         ? multiplayerPreset(existingPendingGame.difficulty).key
         : selectedMultiplayerDifficulty;
-    const pendingGame = savePendingGame(
-      GAME_MODE_MULTIPLAYER,
-      difficulty,
-      accountName,
-      requestId,
-      profileId,
-    );
+    const pendingGame = savePendingGame(GAME_MODE_MULTIPLAYER, difficulty, accountName, requestId, profileId);
 
     if (!socketClient?.connected || !reconcilePendingMultiplayerCreateRef.current) {
       setMessage("Connecting to create multiplayer room...");
@@ -2709,8 +2701,7 @@ function App({ authClient = supabaseClient }) {
     gameStarted && (gameMode === GAME_MODE_MULTIPLAYER || (gameMode === GAME_MODE_AI && playerNumber === PLAYER));
   const showPlayerTwoClock =
     gameStarted && (gameMode === GAME_MODE_MULTIPLAYER || (gameMode === GAME_MODE_AI && playerNumber === AI));
-  const playerOneClockActive =
-    gameTimer.timerRunning && Number(gameTimer.activeTimerPlayer) === PLAYER && !gameOver;
+  const playerOneClockActive = gameTimer.timerRunning && Number(gameTimer.activeTimerPlayer) === PLAYER && !gameOver;
   const playerTwoClockActive = gameTimer.timerRunning && Number(gameTimer.activeTimerPlayer) === AI && !gameOver;
   const showingGame = routePath === GAME_PATH;
   let displayMessage = message;
@@ -2960,12 +2951,10 @@ function App({ authClient = supabaseClient }) {
                 type="button"
                 role="tab"
                 aria-selected={
-                  selectedSetupMode === GAME_MODE_MULTIPLAYER &&
-                  selectedMultiplayerDifficulty === preset.key
+                  selectedSetupMode === GAME_MODE_MULTIPLAYER && selectedMultiplayerDifficulty === preset.key
                 }
                 className={`setup-mode-card vs-player-button${
-                  selectedSetupMode === GAME_MODE_MULTIPLAYER &&
-                  selectedMultiplayerDifficulty === preset.key
+                  selectedSetupMode === GAME_MODE_MULTIPLAYER && selectedMultiplayerDifficulty === preset.key
                     ? " selected"
                     : ""
                 }`}
